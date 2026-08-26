@@ -4,6 +4,8 @@
 /// order/market-specific type.
 module tiny_clob::price_tree;
 
+use sui::balance::{Self, Balance};
+use sui::linked_table::{Self, LinkedTable};
 use sui::table::{Self, Table};
 
 // === Errors ===
@@ -23,6 +25,14 @@ const EKeyAlreadyExists: u64 = 1;
 /// still aborts via `sui::table`'s own missing-key check, not this one —
 /// `Table` exposes no cheap existence check that would be worth adding here.
 const EInvalidLeafPtr: u64 = 2;
+
+/// `destroy_empty_price_level` was called on a `PriceLevel` whose
+/// `total_size` is nonzero. Since `linked_table::destroy_empty` already
+/// aborts if `orders` is non-empty, a nonzero `total_size` here can only
+/// mean the `total_size` invariant was already broken elsewhere — this
+/// assertion exists purely to fail loudly at that point instead of
+/// silently discarding the evidence.
+const EPriceLevelNotEmpty: u64 = 3;
 
 // === Constants (Pointer encoding + sentinels) ===
 
@@ -75,6 +85,193 @@ public struct PriceTree<V: store> has store {
     max_leaf: u64,
     next_internal_index: u64,
     next_leaf_index: u64,
+}
+
+// === Order / PriceLevel ===
+
+/// A resting order held in a price level's FIFO queue.
+public struct Order<phantom Base, phantom Quote> has store {
+    order_id: u64,
+    owner: address,
+    remaining_size: u64,
+    escrow_base: Option<Balance<Base>>,
+    escrow_quote: Option<Balance<Quote>>,
+    maker_fee_bps: u64,
+}
+
+/// One price level's FIFO queue of resting orders, with an incrementally
+/// maintained running total of `remaining_size` across every order in it —
+/// kept correct by construction: every function in this module that can
+/// change the order set or an order's `remaining_size` updates `total_size`
+/// in the same call, and neither `orders` nor `Order.remaining_size` is
+/// reachable from outside this module, so `total_size` can never drift.
+public struct PriceLevel<phantom Base, phantom Quote> has store {
+    orders: LinkedTable<u64, Order<Base, Quote>>,
+    total_size: u64,
+}
+
+public(package) fun new_order<Base, Quote>(
+    order_id: u64,
+    owner: address,
+    remaining_size: u64,
+    escrow_base: Option<Balance<Base>>,
+    escrow_quote: Option<Balance<Quote>>,
+    maker_fee_bps: u64,
+): Order<Base, Quote> {
+    Order { order_id, owner, remaining_size, escrow_base, escrow_quote, maker_fee_bps }
+}
+
+/// The ONLY function in this module that may write `remaining_size`
+/// directly. Deliberately module-private (not `public(package)`): the only
+/// sanctioned way to reduce a resting order's `remaining_size` from outside
+/// this module is `level_decrease_order_remaining_size`, which calls this
+/// and updates `PriceLevel.total_size` atomically in the same call — that
+/// is what keeps `total_size` from ever drifting out of sync.
+fun order_decrease_remaining_size<Base, Quote>(o: &mut Order<Base, Quote>, amount: u64) {
+    o.remaining_size = o.remaining_size - amount;
+}
+
+fun order_split_escrow_base<Base, Quote>(
+    o: &mut Order<Base, Quote>,
+    amount: u64,
+): Balance<Base> {
+    balance::split(o.escrow_base.borrow_mut(), amount)
+}
+
+fun order_split_escrow_quote<Base, Quote>(
+    o: &mut Order<Base, Quote>,
+    amount: u64,
+): Balance<Quote> {
+    balance::split(o.escrow_quote.borrow_mut(), amount)
+}
+
+public(package) fun destroy_order<Base, Quote>(
+    o: Order<Base, Quote>,
+): (Option<Balance<Base>>, Option<Balance<Quote>>) {
+    let Order { order_id: _, owner: _, remaining_size: _, escrow_base, escrow_quote, maker_fee_bps: _ } = o;
+    (escrow_base, escrow_quote)
+}
+
+public(package) fun new_price_level<Base, Quote>(ctx: &mut TxContext): PriceLevel<Base, Quote> {
+    PriceLevel { orders: linked_table::new(ctx), total_size: 0 }
+}
+
+public(package) fun destroy_empty_price_level<Base, Quote>(level: PriceLevel<Base, Quote>) {
+    let PriceLevel { orders, total_size } = level;
+    assert!(total_size == 0, EPriceLevelNotEmpty);
+    linked_table::destroy_empty(orders);
+}
+
+/// Field accessors for `Order` so `tiny_clob.move` can read what it needs
+/// without a raw reference to private fields.
+public(package) fun order_id<Base, Quote>(o: &Order<Base, Quote>): u64 { o.order_id }
+public(package) fun order_owner<Base, Quote>(o: &Order<Base, Quote>): address { o.owner }
+public(package) fun order_remaining_size<Base, Quote>(o: &Order<Base, Quote>): u64 { o.remaining_size }
+public(package) fun order_maker_fee_bps<Base, Quote>(o: &Order<Base, Quote>): u64 { o.maker_fee_bps }
+
+/// The maintained running total — O(1), replaces a linear-scan sum.
+public(package) fun level_total_size<Base, Quote>(level: &PriceLevel<Base, Quote>): u64 {
+    level.total_size
+}
+
+public(package) fun level_is_empty<Base, Quote>(level: &PriceLevel<Base, Quote>): bool {
+    level.orders.is_empty()
+}
+
+public(package) fun level_contains_order<Base, Quote>(level: &PriceLevel<Base, Quote>, order_id: u64): bool {
+    level.orders.contains(order_id)
+}
+
+/// The order_id at the front of the FIFO queue, or none if empty.
+public(package) fun level_front_order_id<Base, Quote>(level: &PriceLevel<Base, Quote>): Option<u64> {
+    *level.orders.front()
+}
+
+public(package) fun level_borrow_order<Base, Quote>(level: &PriceLevel<Base, Quote>, order_id: u64): &Order<Base, Quote> {
+    level.orders.borrow(order_id)
+}
+
+/// Splits `amount` off the base-side escrow of the order at `order_id` and
+/// returns it. Combines the (module-private) `orders.borrow_mut` and
+/// `order_split_escrow_base` into one call so no raw `&mut Order` ever
+/// leaves this module — escrow splitting doesn't touch `remaining_size`, so
+/// this needs no `total_size` bookkeeping.
+public(package) fun level_split_order_escrow_base<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+    amount: u64,
+): Balance<Base> {
+    order_split_escrow_base(level.orders.borrow_mut(order_id), amount)
+}
+
+/// Quote-side counterpart of `level_split_order_escrow_base`.
+public(package) fun level_split_order_escrow_quote<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+    amount: u64,
+): Balance<Quote> {
+    order_split_escrow_quote(level.orders.borrow_mut(order_id), amount)
+}
+
+/// Inserts `order` into `level`'s FIFO queue and adds its `remaining_size`
+/// to `level.total_size` in the same call — the only way to add an order.
+public(package) fun level_insert_order<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+    order: Order<Base, Quote>,
+) {
+    level.total_size = level.total_size + order.remaining_size;
+    level.orders.push_back(order_id, order);
+}
+
+/// Removes and returns the order at `order_id`, decrementing
+/// `level.total_size` by its `remaining_size` in the same call. Aborts if
+/// `order_id` isn't present (matches `linked_table::remove`'s own behavior
+/// — callers must check `level_contains_order` first if they need a
+/// non-aborting not-found path, exactly as the existing call sites already do).
+public(package) fun level_remove_order<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+): Order<Base, Quote> {
+    let order = level.orders.remove(order_id);
+    level.total_size = level.total_size - order.remaining_size;
+    order
+}
+
+/// Pops the front order off the FIFO queue, decrementing `level.total_size`
+/// by its `remaining_size` in the same call. Aborts if empty (matches
+/// `linked_table::pop_front`'s own behavior — callers must check
+/// `level_is_empty` first, exactly as the existing call sites already do).
+public(package) fun level_pop_front_order<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+): (u64, Order<Base, Quote>) {
+    let (order_id, order) = level.orders.pop_front();
+    level.total_size = level.total_size - order.remaining_size;
+    (order_id, order)
+}
+
+/// The ONLY way to reduce a resting order's `remaining_size` — decreases
+/// both the order's own field and `level.total_size` by `amount` in the
+/// same call, so they can never drift apart. Aborts if `order_id` isn't
+/// present.
+public(package) fun level_decrease_order_remaining_size<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+    amount: u64,
+) {
+    let o = level.orders.borrow_mut(order_id);
+    order_decrease_remaining_size(o, amount);
+    level.total_size = level.total_size - amount;
+}
+
+/// Overwrites the `owner` field of the order at `order_id` — does not
+/// touch `remaining_size`/`total_size` at all, so no aggregate update needed.
+public(package) fun level_set_order_owner<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    order_id: u64,
+    new_owner: address,
+) {
+    level.orders.borrow_mut(order_id).owner = new_owner;
 }
 
 // === Construction ===
