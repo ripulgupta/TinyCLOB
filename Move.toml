@@ -1,0 +1,10 @@
+[package]
+name = "tiny_clob"
+edition = "2024" # edition = "legacy" to use legacy (pre-2024) Move
+
+[dependencies]
+# No `[addresses]` section here, deliberately: `sui move build`'s resolver
+# treats a manifest as "legacy" only if it has an `[addresses]`/
+# `[dev-addresses]`/`[dev-dependencies]` section. Omit it and let the modern
+# package system auto-assign the address and resolve the Sui framework
+# implicitly.
