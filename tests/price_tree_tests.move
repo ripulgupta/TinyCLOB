@@ -343,6 +343,75 @@ fun insert_duplicate_key_aborts() {
     teardown(scenario, tree);
 }
 
+// === Invalid leaf pointer aborts (M-1) ===
+
+/// Builds a 2-leaf tree (so exactly one internal node exists), then passes
+/// that internal node's raw numeric index — which is `< PARTITION_INDEX`,
+/// i.e. not a leaf pointer at all — to `borrow`. Must abort with
+/// `EInvalidLeafPtr`, not `sui::table`'s generic missing-key abort.
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun borrow_with_internal_node_index_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    price_tree::insert(&mut tree, 8_800_000, mock(2));
+
+    // The tree now has exactly one internal node, allocated at index 0
+    // (internal-node indices are allocated bottom-up from 0). Index 0 is
+    // `< PARTITION_INDEX`, so it is not a leaf pointer.
+    let bad_ptr: u64 = 0;
+    let _v = price_tree::borrow(&tree, bad_ptr);
+
+    cleanup(&mut tree, vector[5_000_000, 8_800_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun remove_with_internal_node_index_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    price_tree::insert(&mut tree, 8_800_000, mock(2));
+
+    let bad_ptr: u64 = 0;
+    let _v = price_tree::remove(&mut tree, bad_ptr);
+
+    cleanup(&mut tree, vector[5_000_000, 8_800_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun key_with_internal_node_index_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    price_tree::insert(&mut tree, 8_800_000, mock(2));
+
+    let bad_ptr: u64 = 0;
+    let _k = price_tree::key(&tree, bad_ptr);
+
+    cleanup(&mut tree, vector[5_000_000, 8_800_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun borrow_mut_with_internal_node_index_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    price_tree::insert(&mut tree, 8_800_000, mock(2));
+
+    let bad_ptr: u64 = 0;
+    let _v = price_tree::borrow_mut(&mut tree, bad_ptr);
+
+    cleanup(&mut tree, vector[5_000_000, 8_800_000]);
+    teardown(scenario, tree);
+}
+
 // === test helpers ===
 
 fun setup(): (ts::Scenario, PriceTree<MockLevel>) {

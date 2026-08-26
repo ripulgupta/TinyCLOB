@@ -12,7 +12,17 @@ use sui::table::{Self, Table};
 /// A second order resting at an already-present price must be applied via
 /// `find` + `borrow_mut` on the existing leaf's value, never by calling
 /// `insert` again for the same key.
-const EKeyAlreadyExists: u64 = 0;
+const EKeyAlreadyExists: u64 = 1;
+
+/// `remove`/`borrow`/`key`/`borrow_mut` was called with a `leaf_ptr` that is
+/// not leaf-shaped (i.e. `< PARTITION_INDEX`, so it would actually address
+/// `internal_nodes` rather than `leaves`) — e.g. an internal-node index
+/// passed by mistake, or other garbage input. Note this check is narrower
+/// than "pointer is valid": a leaf-shaped pointer whose `leaf_idx` is no
+/// longer present in the table (e.g. reuse of an already-`remove`d pointer)
+/// still aborts via `sui::table`'s own missing-key check, not this one —
+/// `Table` exposes no cheap existence check that would be worth adding here.
+const EInvalidLeafPtr: u64 = 2;
 
 // === Constants (Pointer encoding + sentinels) ===
 
@@ -144,8 +154,13 @@ fun descend_to_leaf<V: store>(tree: &PriceTree<V>, key: u64): u64 {
     ptr
 }
 
-fun descend_extreme<V: store>(tree: &PriceTree<V>, want_min: bool): u64 {
-    let mut ptr = tree.root;
+/// Descends from `start_ptr` (an internal-node or leaf pointer) always
+/// taking the `left` (if `want_min`) or `right` child, until reaching a
+/// leaf. If `start_ptr` is already a leaf pointer, the loop body never runs
+/// and `start_ptr` is returned unchanged — correct, since a single leaf is
+/// trivially its own min and max.
+fun descend_extreme<V: store>(tree: &PriceTree<V>, start_ptr: u64, want_min: bool): u64 {
+    let mut ptr = start_ptr;
     while (!is_leaf_ptr(ptr)) {
         let node = table::borrow(&tree.internal_nodes, ptr);
         ptr = if (want_min) node.left else node.right;
@@ -239,6 +254,7 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
 ///
 /// Cost: O(log distinct_price_count).
 public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
+    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
     let leaf_idx = leaf_index_of(leaf_ptr);
     let Leaf { key: _, value, parent } = table::remove(&mut tree.leaves, leaf_idx);
 
@@ -267,11 +283,15 @@ public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
         };
     };
 
+    // `sibling_ptr` is the subtree that replaces the removed leaf's parent;
+    // when the removed leaf WAS the tracked extreme, its sibling subtree
+    // provably contains the new extreme, so descend from there rather than
+    // re-descending the whole tree from `tree.root`.
     if (leaf_ptr == tree.min_leaf) {
-        tree.min_leaf = descend_extreme(tree, true);
+        tree.min_leaf = descend_extreme(tree, sibling_ptr, true);
     };
     if (leaf_ptr == tree.max_leaf) {
-        tree.max_leaf = descend_extreme(tree, false);
+        tree.max_leaf = descend_extreme(tree, sibling_ptr, false);
     };
 
     value
@@ -288,16 +308,19 @@ public fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
 }
 
 public fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
+    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
     &table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).value
 }
 
 /// Returns the price `key` a leaf pointer (as returned by `find`/
 /// `min_leaf`/`max_leaf`) was inserted under.
 public fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
+    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
     table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).key
 }
 
 public fun borrow_mut<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): &mut V {
+    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
     &mut table::borrow_mut(&mut tree.leaves, leaf_index_of(leaf_ptr)).value
 }
 
