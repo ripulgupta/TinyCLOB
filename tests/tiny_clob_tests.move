@@ -21,7 +21,7 @@ const MIN_SIZE: u64 = 100;
 const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
 
 fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
-    tiny_clob::new<BTC, USDC>(MIN_SIZE, option::none(), scenario.ctx())
+    tiny_clob::new<BTC, USDC>(MIN_SIZE, scenario.ctx())
 }
 
 fun destroy_book_and_cap(book: OrderBook<BTC, USDC>, cap: ClobAdminCap) {
@@ -83,7 +83,7 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
 #[expected_failure(abort_code = 1, location = tiny_clob)] // tiny_clob::EZeroMinSize
 fun new_zero_min_size_aborts() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(0, option::none(), scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(0, scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -92,7 +92,7 @@ fun new_zero_min_size_aborts() {
 #[expected_failure(abort_code = 3, location = tiny_clob)] // tiny_clob::EMinSizeTooLarge
 fun new_min_size_too_large_aborts() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE + 1, option::none(), scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE + 1, scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -100,7 +100,7 @@ fun new_min_size_too_large_aborts() {
 #[test]
 fun new_size_at_max_boundary_succeeds() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE, option::none(), scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE, scenario.ctx());
     assert!(tiny_clob::min_size(&book) == MAX_MIN_SIZE, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -313,9 +313,10 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
 #[test]
 fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     let mut scenario = ts::begin(ADMIN);
-    let override_id = object::id_from_address(@0xFACE);
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        MIN_SIZE, option::some(override_id), scenario.ctx(),
+    let wrapper_uid = object::new(scenario.ctx());
+    let override_id = object::uid_to_inner(&wrapper_uid);
+    let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
+        MIN_SIZE, &wrapper_uid, scenario.ctx(),
     );
 
     let true_book_id = tiny_clob::id_for_testing(&book);
@@ -334,15 +335,18 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     assert!(deleted_order_book_id == override_id, 3);
     assert!(deleted_order_book_id != deleted_id, 4);
 
+    object::delete(wrapper_uid);
     sui::test_utils::destroy(cap);
     scenario.end();
 }
 
-// `clob_admin_finalize` destroys the book's fee_accumulator legs via
-// `balance::destroy_zero`, which aborts (`ENonZero`) if either leg is
-// nonzero. The clob_admin_finalize tests above only ever exercise resting-order-only
-// scenarios where fee_accumulator stays (0, 0), so that abort path is
-// never actually hit. These two tests close that gap: the first generates
+// `clob_admin_finalize`'s precondition assert now also checks the book's
+// fee_accumulator is empty, so an unclaimed-fees book fails fast with the
+// module's own clear `ENotFullyDrained` instead of aborting deep inside
+// `balance::destroy_zero` with a generic Sui-framework-level abort. The
+// clob_admin_finalize tests above only ever exercise resting-order-only
+// scenarios where fee_accumulator stays (0, 0), so that path is never
+// actually hit there. These two tests close that gap: the first generates
 // a genuine fee-bearing fill, retires+drains the book, and confirms
 // clob_admin_finalize aborts on the unclaimed fees; the second repeats the setup but
 // claims the fees first, confirming the claim-then-clob_admin_finalize path succeeds.
@@ -371,7 +375,7 @@ fun generate_one_fee_bearing_fill(
     (taker_fee_base, maker_fee_quote)
 }
 
-#[test, expected_failure(abort_code = sui::balance::ENonZero, location = sui::balance)]
+#[test, expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
 fun finalize_aborts_when_fee_accumulator_nonzero() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
@@ -426,39 +430,70 @@ fun finalize_succeeds_after_fees_claimed() {
     scenario.end();
 }
 
-// --- unpause_after_retire_clears_retiring_gate (accepted design) ---
+// --- `retiring` is a sticky, separate flag from `paused` (see `OrderBook`
+// --- doc comment): `clob_admin_retire` sets both `paused` and `retiring`
+// --- to `true`, but `retiring` is never cleared by any function.
+// --- `clob_admin_unpause_book` now refuses to run on a retiring book —
+// --- there is no way to reverse retirement once started, so allowing an
+// --- unpause to clear `paused` while `retiring` stayed `true` would let
+// --- new orders resume on a book that's supposedly being torn down.
 
 #[test]
-fun unpause_after_retire_clears_retiring_gate() {
+#[expected_failure(abort_code = 18, location = tiny_clob)] // tiny_clob::EBookRetiring
+fun unpause_after_retire_aborts_with_ebookretiring() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
 
     tiny_clob::clob_admin_retire(&cap, &mut book);
+    // Retiring is sticky and irreversible: unpausing a retiring book must
+    // abort instead of un-retiring it.
     tiny_clob::clob_admin_unpause_book(&cap, &mut book);
-
-    // `paused` (the merged field) was cleared — `clob_admin_drain_step`'s abort on this
-    // state is exercised separately by
-    // `drain_step_aborts_after_unpause_clears_retiring_gate` below
-    // (Move's `#[expected_failure]` needs its own dedicated test function).
-    assert!(!tiny_clob::is_paused(&book), 0);
-
-    // Calling clob_admin_retire again restores the gate.
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    assert!(tiny_clob::is_paused(&book), 1);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
 
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
 #[test]
-#[expected_failure]
-fun drain_step_aborts_after_unpause_clears_retiring_gate() {
+fun drain_step_remains_callable_after_failed_unpause_attempt() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
+
     tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_unpause_book(&cap, &mut book);
+    // An unpause attempt against a retiring book aborts before mutating
+    // anything (see unpause_after_retire_aborts_with_ebookretiring above),
+    // so `retiring` stays sticky regardless of any such attempt —
+    // clob_admin_drain_step remains callable exactly as if no unpause had
+    // ever been attempted.
     tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
+    assert!(tiny_clob::is_book_retiring(&book), 0);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// This is the property that had zero test coverage before `retiring` was
+// split out from `paused`: a plain, reversible `clob_admin_pause_book` call
+// alone — never having called `clob_admin_retire` — must NOT unlock the
+// destructive `clob_admin_drain_step` force-drain path.
+#[test]
+#[expected_failure(abort_code = 6, location = tiny_clob)] // tiny_clob::ENotRetiring
+fun drain_step_aborts_when_only_paused_not_retiring() {
+    let price = 50_000;
+    let size = 100;
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id = tiny_clob::next_order_id(&mut book);
+    let escrow = balance::create_for_testing<USDC>(price * size);
+    let order = order::new<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
+
+    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    assert!(tiny_clob::is_paused(&book), 0);
+    assert!(!tiny_clob::is_book_retiring(&book), 1);
+    // Plain pause alone must not unlock draining.
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
+
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -1244,21 +1279,22 @@ fun cancel_order_with_zero_proceeds_does_not_emit_proceeds_claimed() {
 }
 
 // `event_id` is write-once, fixed at construction time via
-// `event_id_override`, with no setter that could change it afterward.
-// `event_id_override` affects ONLY what gets stamped on emitted events —
-// it has zero bearing on ticket/cancellation identity, which always
-// follows the book's own immutable object id (`id: UID`), regardless of
-// any override. This test confirms the override mechanism stamps events
-// correctly and stays stable across placement/fill/cancel, while ticket
-// authentication (`order_book_id`) tracks the book's own id, not the
-// override.
+// `new_with_event_id_override`, with no setter that could change it
+// afterward. The override affects ONLY what gets stamped on emitted
+// events — it has zero bearing on ticket/cancellation identity, which
+// always follows the book's own immutable object id (`id: UID`),
+// regardless of any override. This test confirms the override mechanism
+// stamps events correctly and stays stable across placement/fill/cancel,
+// while ticket authentication (`order_book_id`) tracks the book's own id,
+// not the override.
 
 #[test]
 fun new_event_id_override_is_used_and_stable_across_placement_and_cancel() {
     let mut scenario = ts::begin(ADMIN);
-    let override_id = object::id_from_address(@0xFACE);
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        MIN_SIZE, option::some(override_id), scenario.ctx(),
+    let wrapper_uid = object::new(scenario.ctx());
+    let override_id = object::uid_to_inner(&wrapper_uid);
+    let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
+        MIN_SIZE, &wrapper_uid, scenario.ctx(),
     );
 
     // The override, not the book's own internal id, is what got stamped
@@ -1286,6 +1322,7 @@ fun new_event_id_override_is_used_and_stable_across_placement_and_cancel() {
     assert!(coin::burn_for_testing(refund_base) == 0, 4);
     assert!(coin::burn_for_testing(refund_quote) == escrow_amount, 5);
 
+    object::delete(wrapper_uid);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -1594,37 +1631,47 @@ fun update_resting_order_rejects_ticket_from_wrong_book() {
     scenario.end();
 }
 
-// Regression tests for the event_id/order_book_id confusion vulnerability:
-// `event_id` is fully attacker-controllable via `new`'s `event_id_override`
-// (permissionless construction, zero validation on the supplied id). Before
-// the fix, `OrderTicket.order_book_id` was set to `book.event_id` at
+// Regression tests for the event_id/order_book_id confusion vulnerability.
+// Historically, `OrderTicket.order_book_id` was set to `book.event_id` at
 // minting time and checked against `book.event_id` in `cancel_order` /
-// `update_resting_order`. An attacker could construct a forged book
-// B with `event_id_override = some(victim_book.event_id)` (or, as tested
-// here, the strongest form: colliding with the victim's own *object* id),
-// rest a throwaway order on B to mint a legitimate ticket, and then use
-// that ticket against the victim's real book to steal escrow via
-// `cancel_order` or hijack proceeds via `update_resting_order`. The
-// fix anchors ticket authentication to the book's own immutable object id
-// (`object::uid_to_inner(&book.id)`) instead, which no caller can forge.
+// `update_resting_order`. Since `event_id` used to be settable at
+// construction to any caller-supplied `ID` with zero validation, an
+// attacker could construct a forged book B whose `event_id` collided with
+// a victim book A's own object id, rest a throwaway order on B to mint a
+// legitimate ticket, and then use that ticket against the victim's real
+// book to steal escrow via `cancel_order` or hijack proceeds via
+// `update_resting_order`.
+//
+// This was already fixed once at the value-authentication level: ticket
+// authentication is anchored to the book's own immutable object id
+// (`object::uid_to_inner(&book.id)`), never to `event_id` or its override,
+// so these tests' security property — a ticket minted on book B can never
+// authenticate against book A — holds regardless of what `event_id` book B
+// carries. It has since been fixed a second time at the type level: the
+// override is only reachable via `new_with_event_id_override`, which takes
+// a borrowed `&UID` rather than a bare `ID`. There is no way to obtain a
+// `&UID` reference to another book's private internal `id` field from
+// outside this module (no accessor exposes one, and none should be added —
+// that would defeat the point of the fix), so the original "collide with
+// the victim's id via event_id_override" attack this test was written
+// against can no longer even be expressed as compiling code. This is a
+// compile-time guarantee, not something a runtime test can exercise (a
+// test file that doesn't compile can't be part of the same test suite) —
+// similar in spirit to `order.move`'s own compile-time-enforced
+// guarantees. These tests are simplified accordingly to construct book B
+// normally (no override), since the ticket-authentication property they
+// actually check never depended on the override in the first place.
 #[test]
 #[expected_failure(abort_code = 16, location = tiny_clob)] // tiny_clob::EWrongBook
 fun forged_event_id_ticket_cannot_cancel_victim_order() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book_a, cap_a) = new_book(&mut scenario);
-    let victim_id = tiny_clob::id_for_testing(&book_a);
-
-    // Attacker deliberately overrides book B's event_id to collide with
-    // victim book A's own object id — the strongest collision attempt.
-    let (mut book_b, cap_b) = tiny_clob::new<BTC, USDC>(
-        MIN_SIZE, option::some(victim_id), scenario.ctx(),
-    );
-    assert!(tiny_clob::event_id_for_testing(&book_b) == victim_id, 0);
+    let (mut book_b, cap_b) = new_book(&mut scenario);
 
     let ticket_b = rest_bid(&mut book_b, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
 
     // Must abort with EWrongBook: ticket_b's order_book_id is book_b's own
-    // id, not victim_id, regardless of book_b's event_id override.
+    // id, not book_a's.
     let (refund_base, refund_quote) = tiny_clob::cancel_order(&mut book_a, ticket_b, scenario.ctx());
     coin::burn_for_testing(refund_base);
     coin::burn_for_testing(refund_quote);
@@ -1639,20 +1686,15 @@ fun forged_event_id_ticket_cannot_cancel_victim_order() {
 fun forged_event_id_ticket_cannot_hijack_victim_order_owner() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book_a, cap_a) = new_book(&mut scenario);
-    let victim_id = tiny_clob::id_for_testing(&book_a);
+    let (mut book_b, cap_b) = new_book(&mut scenario);
 
-    // Same forged-collision setup as the cancel_order regression test
-    // above, but exercising update_resting_order instead, which
-    // takes the ticket by reference rather than consuming it.
-    let (mut book_b, cap_b) = tiny_clob::new<BTC, USDC>(
-        MIN_SIZE, option::some(victim_id), scenario.ctx(),
-    );
-    assert!(tiny_clob::event_id_for_testing(&book_b) == victim_id, 0);
-
+    // Same setup as the cancel_order regression test above, but exercising
+    // update_resting_order instead, which takes the ticket by reference
+    // rather than consuming it.
     let ticket_b = rest_bid(&mut book_b, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
 
     // Must abort with EWrongBook: ticket_b's order_book_id is book_b's own
-    // id, not victim_id, regardless of book_b's event_id override.
+    // id, not book_a's.
     tiny_clob::update_resting_order(&mut book_a, &ticket_b, OTHER);
 
     unit_test::destroy(ticket_b);
@@ -1860,7 +1902,7 @@ fun cancel_and_claim_never_block_on_pause_or_retiring() {
     assert!(coin::burn_for_testing(cancel_base) == 0, 0);
     assert!(coin::burn_for_testing(cancel_quote) == tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 1);
 
-    // claim_proceeds also succeeds while retiring (paused merged field).
+    // claim_proceeds also succeeds while retiring.
     // The order was never resting for this order_id, so use a synthetic
     // ticket (bypassing the placement path, which isn't needed here) — the
     // claim finds nothing, and since the "order" isn't resting, the ticket

@@ -32,6 +32,7 @@ const EZeroPrice: u64 = 14;
 const EBookPaused: u64 = 15;
 const EWrongBook: u64 = 16;
 const ESlippageExceeded: u64 = 17;
+const EBookRetiring: u64 = 18;
 
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
@@ -131,12 +132,18 @@ public(package) fun credit_fee_accumulator<Base, Quote>(
 
 // === OrderBook<Base, Quote> ===
 
-/// The only deliberate structural quirk relative to a naive book layout: there
-/// is no separate `retiring: bool` field — `paused` serves both the local
-/// soft-pause flag and the deletion-lifecycle "has `clob_admin_retire` been called"
-/// gate. This means `clob_admin_unpause_book` also un-retires a book that
-/// was mid-retirement; a caller that relies on `clob_admin_retire` being irreversible
-/// must track that separately.
+/// `retiring` is a genuinely separate, sticky flag from `paused`. It is set
+/// to `true` only by `clob_admin_retire`, and there is no function anywhere
+/// in this module that ever clears it back to `false` — once a book starts
+/// retiring, it is retiring forever. `clob_admin_drain_step` and
+/// `clob_admin_finalize` both gate on `retiring` (not `paused`), so a plain
+/// `clob_admin_pause_book` call is no longer sufficient to unlock the
+/// destructive drain/finalize path. `paused` still independently gates new
+/// order placement and can be freely toggled via `clob_admin_pause_book` /
+/// `clob_admin_unpause_book` — but only until retirement begins:
+/// `clob_admin_unpause_book` refuses to run on a retiring book (there is no
+/// way to reverse retirement once started), so once `retiring` is set,
+/// `paused` can never be cleared again either.
 ///
 /// `has store` only — deliberately no `key`. This makes it structurally
 /// impossible for `OrderBook` to ever become a Sui shared object via
@@ -159,6 +166,9 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     asks: PriceTree<PriceLevel<Base, Quote>>,
     proceeds: LinkedTable<u64, MakerBalance<Base, Quote>>,
     paused: bool,
+    /// Sticky: set to `true` only by `clob_admin_retire`, never cleared back
+    /// to `false` by any function. See the struct doc comment above.
+    retiring: bool,
     next_order_id: u64,
     clob_admin_cap_id: ID,
     version: u64,
@@ -166,20 +176,34 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     maker_fee_bps: u64,
     fee_accumulator: FeeAccumulator<Base, Quote>,
     /// The id every event this module emits stamps as `order_book_id`.
-    /// Write-once: fixed at construction time by `new`'s
-    /// `event_id_override` parameter (defaults to the book's own internal
-    /// id when `option::none()` is passed) and never mutable afterward. A
+    /// Write-once: fixed at construction time (defaults to the book's own
+    /// internal id via plain `new`, or to a caller-supplied override via
+    /// `new_with_event_id_override`) and never mutable afterward. A
     /// wrapping object whose own outer id is what external
-    /// callers/indexers actually query by should pass that id in via
-    /// `option::some(id)` at construction time instead.
+    /// callers/indexers actually query by should use
+    /// `new_with_event_id_override`, passing a borrow of that object's own
+    /// `UID`, instead of plain `new`.
     ///
-    /// This field exists SOLELY to be stamped on emitted events. Since
-    /// `event_id_override` accepts any caller-supplied `ID` with zero
-    /// validation, `event_id` is attacker-controllable and must never be
-    /// relied on for any authentication/identity check. The book's own
-    /// object id (`id: UID` above, via `object::uid_to_inner(&book.id)`)
-    /// is what's unforgeable and must be used for that purpose instead
-    /// (see `OrderTicket.order_book_id`).
+    /// This field exists SOLELY to be stamped on emitted events. Because
+    /// `new_with_event_id_override` requires a live `&UID` reference rather
+    /// than a bare `ID` value, a caller can no longer forge this to an
+    /// arbitrary id merely copied off a public event or explorer — that no
+    /// longer compiles. This does NOT, however, guarantee the caller
+    /// controls the referenced object: any object that is genuinely shared
+    /// and whose module exposes a public `&UID` accessor (e.g.
+    /// `sui::kiosk::uid(&Kiosk)`, `sui::transfer_policy::uid(&TransferPolicy)`)
+    /// can have its `&UID` borrowed by any address, not just its owner, so
+    /// `event_id` can in principle still be pointed at an id the caller
+    /// doesn't own when such an accessor exists. This narrows the attack
+    /// surface; it does not eliminate it. Regardless, `event_id` is NEVER
+    /// used for authentication anywhere in this module and must never be
+    /// relied on for any authentication/identity check — the residual risk
+    /// above is scoped strictly to event/indexer spoofing (an off-chain
+    /// consumer trusting `order_book_id` without independently verifying its
+    /// true origin), never fund safety or access control. The book's own
+    /// object id (`id: UID` above, via `object::uid_to_inner(&book.id)`) is
+    /// what's unforgeable and must be used for authentication instead (see
+    /// `OrderTicket.order_book_id`).
     event_id: ID,
 }
 
@@ -208,7 +232,50 @@ public fun discard_clob_admin_cap(cap: ClobAdminCap) {
 
 /// Callable by any address — no capability is required to create a book,
 /// and it is never registered anywhere by this call.
+///
+/// The book's `event_id` (stamped on every emitted event) defaults to the
+/// book's own object id. Use `new_with_event_id_override` instead of this
+/// function if a wrapping object's own id should be stamped there instead.
 public fun new<Base, Quote>(
+    min_size: u64,
+    ctx: &mut TxContext,
+): (OrderBook<Base, Quote>, ClobAdminCap) {
+    new_impl(min_size, option::none(), ctx)
+}
+
+/// Same as `new`, except the book's `event_id` (stamped on every emitted
+/// event) is set to `object::uid_to_inner(event_id_override)` instead of
+/// defaulting to the book's own id — for a wrapping object whose own outer
+/// id is what external callers/indexers actually query by.
+///
+/// `event_id_override` is a borrowed `&UID` rather than a bare `ID`
+/// specifically to rule out the naive attack of pointing `event_id` at an
+/// arbitrary id (e.g. copied off a public event for an unrelated book) that
+/// the caller merely knows but doesn't hold a live reference to — passing a
+/// bare `ID` copied that way no longer compiles. This does NOT fully
+/// guarantee the caller controls the referenced object: any object that is
+/// genuinely shared and whose module exposes a public `&UID` accessor (e.g.
+/// `sui::kiosk::uid(&Kiosk)`, `sui::transfer_policy::uid(&TransferPolicy)`)
+/// can have its `&UID` borrowed by any address, not just its owner — so a
+/// caller can still legitimately obtain and pass in a live `&UID` for an
+/// object they don't own if such an accessor exists for it. This narrows
+/// the attack surface; it does not eliminate id spoofing outright. As
+/// documented on `OrderBook.event_id`, this is never a fund-safety or
+/// authentication concern — `event_id` is never used for authentication
+/// anywhere in this module — only an event/indexer spoofing concern. Note:
+/// `Option<&UID>` is not a legal Move type (generic type parameters,
+/// including `Option`'s, cannot be references), which is why this is a
+/// separate function rather than an `Option<&UID>` parameter on `new`
+/// itself.
+public fun new_with_event_id_override<Base, Quote>(
+    min_size: u64,
+    event_id_override: &UID,
+    ctx: &mut TxContext,
+): (OrderBook<Base, Quote>, ClobAdminCap) {
+    new_impl(min_size, option::some(object::uid_to_inner(event_id_override)), ctx)
+}
+
+fun new_impl<Base, Quote>(
     min_size: u64,
     event_id_override: Option<ID>,
     ctx: &mut TxContext,
@@ -234,6 +301,7 @@ public fun new<Base, Quote>(
         asks: price_tree::new(ctx),
         proceeds: linked_table::new(ctx),
         paused: false,
+        retiring: false,
         next_order_id: 0,
         clob_admin_cap_id: cap_id,
         version: CURRENT_VERSION,
@@ -330,6 +398,11 @@ public fun is_book_paused<Base, Quote>(book: &OrderBook<Base, Quote>): bool {
     book.paused
 }
 
+/// Sticky: once `true`, stays `true` forever (see `OrderBook`'s doc comment).
+public fun is_book_retiring<Base, Quote>(book: &OrderBook<Base, Quote>): bool {
+    book.retiring
+}
+
 public fun best_bid<Base, Quote>(book: &OrderBook<Base, Quote>): Option<u64> {
     let ptr = price_tree::max_leaf(&book.bids);
     if (ptr.is_none()) {
@@ -388,6 +461,7 @@ public fun clob_admin_pause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut Ord
 public fun clob_admin_unpause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
+    assert!(!book.retiring, EBookRetiring);
     let event_book_id = book.event_id;
     book.paused = false;
     event::emit(Unpaused { order_book_id: event_book_id });
@@ -524,6 +598,7 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
     assert_clob_admin(cap, book);
     let event_book_id = book.event_id;
     book.paused = true;
+    book.retiring = true;
     event::emit(OrderBookRetired { order_book_id: event_book_id });
 }
 
@@ -535,7 +610,7 @@ public fun clob_admin_drain_step<Base, Quote>(
 ) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    assert!(book.paused, ENotRetiring);
+    assert!(book.retiring, ENotRetiring);
     let mut remaining = max_items;
     drain_side(&mut book.bids, &mut remaining, /* want_max */ true, ctx);
     drain_side(&mut book.asks, &mut remaining, /* want_max */ false, ctx);
@@ -640,15 +715,17 @@ public fun clob_admin_finalize<Base, Quote>(
 ): ID {
     assert_book_version(&mut book);
     assert_clob_admin(cap, &book);
-    assert!(book.paused, ENotRetiring);
+    assert!(book.retiring, ENotRetiring);
+    let (fee_base, fee_quote) = fee_accumulator_balances(&book);
     assert!(
-        price_tree::size(&book.bids) == 0 && price_tree::size(&book.asks) == 0 && book.proceeds.is_empty(),
+        price_tree::size(&book.bids) == 0 && price_tree::size(&book.asks) == 0 && book.proceeds.is_empty()
+            && fee_base == 0 && fee_quote == 0,
         ENotFullyDrained,
     );
 
     let OrderBook {
         id, min_size: _, bids, asks, proceeds,
-        paused: _, next_order_id: _, clob_admin_cap_id: _, version: _,
+        paused: _, retiring: _, next_order_id: _, clob_admin_cap_id: _, version: _,
         taker_fee_bps: _, maker_fee_bps: _, fee_accumulator, event_id,
     } = book;
     let event_book_id = event_id;
