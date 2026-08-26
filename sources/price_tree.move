@@ -1,9 +1,7 @@
-/// Generic critbit price-level tree. See `docs/spec/price_tree.md`.
-///
-/// Zero dependency on `Base`/`Quote` or on `market`/`order` — this module
-/// is generic over the leaf value type `V` only (REQ-MARKET-010). Borrowed
-/// from DeepBook's table-indexed crit-bit tree design
-/// (`docs/research/RS-001-clob-design/findings.md` Q1).
+/// Generic critbit price-level tree, indexed by `Table` rather than a
+/// vector so leaves and internal nodes can be added/removed independently.
+/// Generic over the leaf value type `V`, with no dependency on any
+/// order/market-specific type.
 module tiny_clob::price_tree;
 
 use sui::table::{Self, Table};
@@ -11,12 +9,9 @@ use sui::table::{Self, Table};
 // === Errors ===
 
 /// `insert` was called with a `key` that already has a leaf in the tree.
-/// Per `docs/research/RS-001-clob-design/findings.md` Q1 ("existing-key
-/// inserts only touch the existing leaf's already-linked queue"), a
-/// second order resting at an already-present price is handled by the
-/// caller via `find` + `borrow_mut` on the existing leaf's value, never by
-/// calling `insert` again for the same key — see Q-IMPL-001 in
-/// `docs/spec/price_tree.md`.
+/// A second order resting at an already-present price must be applied via
+/// `find` + `borrow_mut` on the existing leaf's value, never by calling
+/// `insert` again for the same key.
 const EKeyAlreadyExists: u64 = 0;
 
 // === Constants (Pointer encoding + sentinels) ===
@@ -27,8 +22,8 @@ const PARTITION_INDEX: u64 = 0x8000000000000000;
 
 /// Sentinel for "this tree currently has zero leaves" — used by `root`,
 /// `min_leaf`, `max_leaf`. Numerically `PARTITION_INDEX - 1`, distinct from
-/// `NO_PARENT`/`PARTITION_INDEX` itself (see `price_tree.md`'s Types
-/// section for the full collision-safety argument).
+/// `NO_PARENT`/`PARTITION_INDEX` itself so it can never collide with a real
+/// pointer.
 const EMPTY_TREE: u64 = 0x7FFFFFFFFFFFFFFF;
 
 /// Sentinel for "this node/leaf has no parent because it is the root".
@@ -87,10 +82,8 @@ public fun new<V: store>(ctx: &mut TxContext): PriceTree<V> {
 }
 
 /// Consumes an empty `PriceTree`. Aborts (via `table::destroy_empty`) if
-/// either table is non-empty. Not part of `price_tree.md`'s Operations
-/// list — see Q-IMPL-002 in `docs/spec/price_tree.md` (needed so callers,
-/// including this module's own tests, have a way to tear down a tree whose
-/// `Table` fields have no `drop`).
+/// either table is non-empty. Needed because `Table` has no `drop`, so a
+/// tree can only go out of scope once both of its tables are empty.
 public fun destroy_empty<V: store>(tree: PriceTree<V>) {
     let PriceTree {
         root: _,
@@ -121,9 +114,8 @@ fun encode_leaf_ptr(leaf_index: u64): u64 {
 
 /// Returns a `u64` with only the highest set bit of `x` set. `x` must be
 /// non-zero (only ever called on an XOR of two distinct keys). A bounded
-/// 64-iteration bit scan — O(1), not a `Table` operation — substituting
-/// for a native leading-zero-count primitive, which the `std::u64` module
-/// does not expose (see `docs/plan-m1.md`'s Risks section).
+/// 64-iteration bit scan substituting for a native leading-zero-count
+/// primitive, which `std::u64` does not expose.
 fun highest_set_bit_mask(x: u64): u64 {
     let mut mask = 0x8000000000000000u64;
     while (mask > 0) {
@@ -165,10 +157,9 @@ fun descend_extreme<V: store>(tree: &PriceTree<V>, want_min: bool): u64 {
 
 /// Inserts `value` under `key`. Aborts with `EKeyAlreadyExists` if `key` is
 /// already present — a second order resting at an already-present price
-/// must be applied via `find` + `borrow_mut`, not a second `insert` (see
-/// Q-IMPL-001).
+/// must be applied via `find` + `borrow_mut`, not a second `insert`.
 ///
-/// Cost: O(log distinct_price_count) `Table` reads/writes (REQ-PERF-001).
+/// Cost: O(log distinct_price_count) `Table` reads/writes.
 public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     if (tree.root == EMPTY_TREE) {
         let leaf_idx = tree.next_leaf_index;
@@ -181,18 +172,17 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
         return
     };
 
-    // Step 2: find the closest existing key by descending from root.
     let closest_ptr = descend_to_leaf(tree, key);
     let closest_leaf_idx = leaf_index_of(closest_ptr);
     let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
     assert!(closest_key != key, EKeyAlreadyExists);
 
-    // Step 3: critical bit between `key` and `closest_key`.
     let xor = closest_key ^ key;
     let new_mask = highest_set_bit_mask(xor);
 
-    // Step 4: re-descend, stopping where the existing node's mask is lower
-    // than `new_mask` (masks strictly decrease root-to-leaf).
+    // Re-descend, stopping where the existing node's mask is lower than
+    // `new_mask` — masks strictly decrease root-to-leaf, so this finds the
+    // correct insertion point for the new critical bit.
     let mut parent_ptr = NO_PARENT;
     let mut current_ptr = tree.root;
     while (!is_leaf_ptr(current_ptr)) {
@@ -234,7 +224,6 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
         };
     };
 
-    // Step 5: O(1) min/max update.
     let min_key = table::borrow(&tree.leaves, leaf_index_of(tree.min_leaf)).key;
     if (key < min_key) {
         tree.min_leaf = leaf_ptr;
@@ -248,13 +237,13 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
 /// Removes and returns the leaf's value. `leaf_ptr` is a leaf pointer as
 /// returned by `find`/`min_leaf`/`max_leaf` (not a raw price key).
 ///
-/// Cost: O(log distinct_price_count) (REQ-PERF-001).
+/// Cost: O(log distinct_price_count).
 public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
     let leaf_idx = leaf_index_of(leaf_ptr);
     let Leaf { key: _, value, parent } = table::remove(&mut tree.leaves, leaf_idx);
 
     if (parent == NO_PARENT) {
-        // Special case: the removed leaf was the tree's only leaf.
+        // The removed leaf was the tree's only leaf.
         tree.root = EMPTY_TREE;
         tree.min_leaf = EMPTY_TREE;
         tree.max_leaf = EMPTY_TREE;
@@ -303,12 +292,7 @@ public fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
 }
 
 /// Returns the price `key` a leaf pointer (as returned by `find`/
-/// `min_leaf`/`max_leaf`) was inserted under. Added in M2 for
-/// `market.md`'s `best_bid`/`best_ask`/`depth_at_price`, which need the
-/// actual price value at the tracked min/max pointer, not just the
-/// pointer itself — M1's Operations list exposed pointers and values but
-/// not this. Read-only, no behavior change to any M1 operation; see
-/// Q-IMPL-005 in `docs/spec/price_tree.md`.
+/// `min_leaf`/`max_leaf`) was inserted under.
 public fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
     table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).key
 }
@@ -327,9 +311,7 @@ public fun max_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
     if (tree.max_leaf == EMPTY_TREE) option::none() else option::some(tree.max_leaf)
 }
 
-/// Number of distinct keys (leaves) currently in the tree. Not part of
-/// `price_tree.md`'s Operations list — see Q-IMPL-002 (introspection helper
-/// needed by this module's own structural unit tests).
+/// Number of distinct keys (leaves) currently in the tree.
 public fun size<V: store>(tree: &PriceTree<V>): u64 {
     table::length(&tree.leaves)
 }

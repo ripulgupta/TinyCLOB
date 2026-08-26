@@ -1,12 +1,9 @@
-/// M1 ("Foundation") test module — `price_tree.md`'s full Verification /
-/// Automated test list (excluding `compare_bytes_orders_correctly`, which
-/// is `market.md`-owned per `price_tree.md`'s own "Canonical byte-compare
-/// helper" note and `docs/plan-m1.md`'s Risks section — deferred to M2).
+/// Tests for `price_tree`.
 ///
-/// `MockLevel` stands in for `market.md`/`order.md`'s real `PriceLevel`
-/// (a FIFO queue of resting orders); `price_tree` treats it as fully
-/// opaque, so a `vector<u64>` of order ids is enough to exercise the tree
-/// mechanics without pulling in any order-domain type.
+/// `MockLevel` stands in for a real order-book price level (a FIFO queue of
+/// resting orders); `price_tree` treats it as fully opaque, so a
+/// `vector<u64>` of order ids is enough to exercise the tree mechanics
+/// without pulling in any order-domain type.
 #[test_only]
 module tiny_clob::price_tree_tests;
 
@@ -44,17 +41,11 @@ fun insert_single_key_becomes_root_min_max() {
 
 // === insert_ascending_keys_updates_max_leaf_incrementally ===
 
-/// Scope note: this test verifies `max_leaf`'s *correctness* after each
-/// insert (the returned pointer is the right one) — it does NOT verify the
-/// spec's O(1)-without-descent *cost* claim (`price_tree.md`'s Verification
-/// section literally says "without re-deriving it by descent"). Move's
-/// standard test harness has no built-in way to count `Table` reads or
-/// measure gas from inside a unit test, so that cost property is instead
-/// verified separately by structural code review — see
-/// `docs/plan-m1.md`'s Chunk 3 task 5, which confirms `insert`'s min/max
-/// update reads the tracked `min_leaf`/`max_leaf` field directly rather
-/// than calling `descend_extreme`. Do not read this test's passing as
-/// evidence of that cost property; it only checks the value.
+/// Verifies `max_leaf`'s *correctness* after each insert (the returned
+/// pointer is the right one). This does not verify that the update is O(1)
+/// without re-descending — Move's test harness has no way to count `Table`
+/// reads or measure gas from inside a unit test, so that cost property can
+/// only be confirmed by reading `insert`'s implementation.
 #[test]
 fun insert_ascending_keys_updates_max_leaf_incrementally() {
     let (mut scenario, mut tree) = setup();
@@ -85,12 +76,8 @@ fun insert_ascending_keys_updates_max_leaf_incrementally() {
 
 // === insert_descending_keys_updates_min_leaf_incrementally ===
 
-/// Scope note: symmetric to `insert_ascending_keys_updates_max_leaf_incrementally`
-/// above — this verifies `min_leaf`'s *correctness* after each insert, not
-/// the O(1)-without-descent *cost* property (no Table-read counter or gas
-/// measurement is available in Move's unit-test harness). That cost
-/// property is verified separately by structural code review, per
-/// `docs/plan-m1.md`'s Chunk 3 task 5.
+/// Symmetric to `insert_ascending_keys_updates_max_leaf_incrementally`
+/// above, for `min_leaf`.
 #[test]
 fun insert_descending_keys_updates_min_leaf_incrementally() {
     let (mut scenario, mut tree) = setup();
@@ -114,13 +101,11 @@ fun insert_descending_keys_updates_min_leaf_incrementally() {
 
 // === insert_middle_key_leaves_min_max_unchanged ===
 
-/// Exercises the FALSE branch of both min/max update guards in `insert`
-/// (`sources/price_tree.move`'s "Step 5: O(1) min/max update"): a low key
-/// then a high key establish min and max, and a subsequent MIDDLE key is
-/// neither a new min nor a new max, so both `if (key < min_key)` and
-/// `if (key > max_key)` must NOT fire. All other insert tests in this file
-/// are monotonic (strictly ascending or descending), so this is the only
-/// test that inserts a key strictly between the current min and max.
+/// Exercises the FALSE branch of both min/max update guards in `insert`: a
+/// low key then a high key establish min and max, and a subsequent MIDDLE
+/// key is neither a new min nor a new max. All other insert tests in this
+/// file are monotonic (strictly ascending or descending), so this is the
+/// only test that inserts a key strictly between the current min and max.
 #[test]
 fun insert_middle_key_leaves_min_max_unchanged() {
     let (mut scenario, mut tree) = setup();
@@ -308,10 +293,9 @@ fun insert_same_price_repeatedly_leaves_tree_depth_unchanged() {
     price_tree::insert(&mut tree, 7_500_000, mock(1));
     assert!(price_tree::size(&tree) == 1, 0);
 
-    // Additional orders at the *same already-present* price never call
-    // `insert` again (see Q-IMPL-001) — they mutate the existing leaf's
-    // FIFO queue in place via `borrow_mut`, exactly as REQ-PERF-002
-    // describes ("only the value's internal FIFO queue changes").
+    // Additional orders at the same already-present price never call
+    // `insert` again — they mutate the existing leaf's FIFO queue in place
+    // via `borrow_mut`.
     let ptr = price_tree::find(&tree, 7_500_000).destroy_some();
     let mut n = 2;
     while (n <= 5) {
@@ -334,8 +318,8 @@ fun no_tick_divisibility_check() {
     let (mut scenario, mut tree) = setup();
 
     // 7 and 13 share no common divisor beyond 1 — no tick-size/divisibility
-    // check exists anywhere in price_tree (REQ-MARKET-009/010): both
-    // inserts succeed with no abort.
+    // check exists anywhere in price_tree, so both inserts succeed with no
+    // abort.
     price_tree::insert(&mut tree, 7, mock(1));
     price_tree::insert(&mut tree, 13, mock(2));
     assert!(price_tree::find(&tree, 7).is_some(), 0);
@@ -345,7 +329,7 @@ fun no_tick_divisibility_check() {
     teardown(scenario, tree);
 }
 
-// === Duplicate-key insert aborts (Q-IMPL-001) ===
+// === Duplicate-key insert aborts ===
 
 #[test]
 #[expected_failure(abort_code = price_tree::EKeyAlreadyExists)]
