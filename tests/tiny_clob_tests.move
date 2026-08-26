@@ -7,12 +7,15 @@ use sui::coin;
 use sui::event;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsClaimed};
-use tiny_clob::price_tree;
+use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC};
 
 const ADMIN: address = @0xA11CE;
 const OTHER: address = @0xB0B;
 const TAKER: address = @0x2002;
+const MAKER_A: address = @0xA001;
+const MAKER_B: address = @0xA002;
+const MAKER_C: address = @0xA003;
 
 const LOT_SIZE: u64 = 100;
 const MIN_SIZE: u64 = 100;
@@ -288,7 +291,7 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
 
     let order_id = tiny_clob::next_order_id(&mut book);
     let escrow = balance::create_for_testing<USDC>(price * size);
-    let order = price_tree::new_order<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
+    let order = order::new<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
     tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
 
     tiny_clob::clob_admin_retire(&cap, &mut book);
@@ -307,7 +310,7 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
 
     let order_id = tiny_clob::next_order_id(&mut book);
     let escrow = balance::create_for_testing<USDC>(price * size);
-    let order = price_tree::new_order<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
+    let order = order::new<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
     tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
 
     tiny_clob::clob_admin_retire(&cap, &mut book);
@@ -629,7 +632,7 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     // suite already uses elsewhere.
     let order_id = tiny_clob::next_order_id(&mut book);
     let escrow = balance::create_for_testing<BTC>(FEE_TEST_RESTING_SIZE);
-    let ask = price_tree::new_order<BTC, USDC>(
+    let ask = order::new<BTC, USDC>(
         order_id, OTHER, FEE_TEST_RESTING_SIZE, option::some(escrow), option::none(), FEE_TEST_MAKER_FEE_BPS,
     );
     tiny_clob::insert_resting_order_for_testing(&mut book, false, FEE_TEST_PRICE, ask, scenario.ctx());
@@ -678,7 +681,7 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // Resting bid.
     let order_id = tiny_clob::next_order_id(&mut book);
     let escrow = balance::create_for_testing<USDC>(FEE_TEST_PRICE * FEE_TEST_RESTING_SIZE);
-    let bid = price_tree::new_order<BTC, USDC>(
+    let bid = order::new<BTC, USDC>(
         order_id, OTHER, FEE_TEST_RESTING_SIZE, option::none(), option::some(escrow), FEE_TEST_MAKER_FEE_BPS,
     );
     tiny_clob::insert_resting_order_for_testing(&mut book, true, FEE_TEST_PRICE, bid, scenario.ctx());
@@ -717,6 +720,278 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     scenario.end();
 }
 
+// === Price-time priority across partial fills ===
+//
+// A partially-filled maker order is detached from its price level
+// (`price_tree::level_remove_order`), mutated off-tree, then reinserted at
+// the FRONT of the same level's FIFO queue via
+// `price_tree::level_insert_order_front` (`LinkedTable::push_front`) — this
+// is what keeps a partially-filled order at the head of the line instead of
+// letting it get shuffled behind orders that arrived later. A genuinely new
+// order at the same price, by contrast, goes through the ordinary
+// `price_tree::level_insert_order` (`push_back`) path and lands at the back.
+//
+// These four tests exist specifically to guard that distinction: flipping
+// `push_front` to `push_back` (or vice versa) in either of those two
+// functions must cause at least one of them to fail. Without tests like
+// these, that mutation is invisible to the suite — a partially-filled
+// maker order silently demoted to the back of its queue is a serious
+// real-world correctness bug that produces no build or type error.
+
+#[test]
+fun ask_side_partial_fill_keeps_fifo_priority() {
+    let price = 50_000;
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_a = tiny_clob::next_order_id(&mut book);
+    let ask_a = order::new<BTC, USDC>(
+        order_id_a, MAKER_A, 300, option::some(balance::create_for_testing<BTC>(300)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_a, scenario.ctx());
+
+    let order_id_b = tiny_clob::next_order_id(&mut book);
+    let ask_b = order::new<BTC, USDC>(
+        order_id_b, MAKER_B, 200, option::some(balance::create_for_testing<BTC>(200)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_b, scenario.ctx());
+
+    let order_id_c = tiny_clob::next_order_id(&mut book);
+    let ask_c = order::new<BTC, USDC>(
+        order_id_c, MAKER_C, 200, option::some(balance::create_for_testing<BTC>(200)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_c, scenario.ctx());
+
+    // First taker partially fills A by 100, leaving 200 resting — A must be
+    // reinserted at the FRONT of the queue, ahead of B and C.
+    scenario.next_tx(TAKER);
+    let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 100), scenario.ctx());
+    let (matched_base1, remaining_budget1, remaining_size1, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base1);
+    coin::burn_for_testing(remaining_budget1);
+    assert!(remaining_size1 == 0, 0);
+
+    // Second taker buys 500 more: must drain A's remaining 200 first, then
+    // B's full 200, then C's partial 100 — in that order.
+    let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 500), scenario.ctx());
+    let (matched_base2, remaining_budget2, remaining_size2, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base2);
+    coin::burn_for_testing(remaining_budget2);
+    assert!(remaining_size2 == 0, 1);
+
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    // 1 event from the first taker + 3 from the second.
+    assert!(fills.length() == 4, 2);
+
+    let (id_1, _, _, size_1, maker_1, _) = tiny_clob::order_filled_fields_for_testing(&fills[1]);
+    assert!(id_1 == order_id_a, 3);
+    assert!(size_1 == 200, 4);
+    assert!(maker_1 == MAKER_A, 5);
+
+    let (id_2, _, _, size_2, maker_2, _) = tiny_clob::order_filled_fields_for_testing(&fills[2]);
+    assert!(id_2 == order_id_b, 6);
+    assert!(size_2 == 200, 7);
+    assert!(maker_2 == MAKER_B, 8);
+
+    let (id_3, _, _, size_3, maker_3, _) = tiny_clob::order_filled_fields_for_testing(&fills[3]);
+    assert!(id_3 == order_id_c, 9);
+    assert!(size_3 == 100, 10);
+    assert!(maker_3 == MAKER_C, 11);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun bid_side_partial_fill_keeps_fifo_priority() {
+    let price = 50_000;
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_a = tiny_clob::next_order_id(&mut book);
+    let bid_a = order::new<BTC, USDC>(
+        order_id_a, MAKER_A, 300, option::none(), option::some(balance::create_for_testing<USDC>(price * 300)), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, bid_a, scenario.ctx());
+
+    let order_id_b = tiny_clob::next_order_id(&mut book);
+    let bid_b = order::new<BTC, USDC>(
+        order_id_b, MAKER_B, 200, option::none(), option::some(balance::create_for_testing<USDC>(price * 200)), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, bid_b, scenario.ctx());
+
+    let order_id_c = tiny_clob::next_order_id(&mut book);
+    let bid_c = order::new<BTC, USDC>(
+        order_id_c, MAKER_C, 200, option::none(), option::some(balance::create_for_testing<USDC>(price * 200)), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, bid_c, scenario.ctx());
+
+    // First taker partially fills A by 100, leaving 200 resting — A must be
+    // reinserted at the FRONT of the queue, ahead of B and C.
+    scenario.next_tx(TAKER);
+    let payment1 = coin::mint_for_testing<BTC>(100, scenario.ctx());
+    let (matched_quote1, remaining_escrow1, remaining_size1, _) =
+        tiny_clob::match_ask_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_quote1);
+    coin::burn_for_testing(remaining_escrow1);
+    assert!(remaining_size1 == 0, 0);
+
+    // Second taker sells 500 more: must drain A's remaining 200 first, then
+    // B's full 200, then C's partial 100 — in that order.
+    let payment2 = coin::mint_for_testing<BTC>(500, scenario.ctx());
+    let (matched_quote2, remaining_escrow2, remaining_size2, _) =
+        tiny_clob::match_ask_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_quote2);
+    coin::burn_for_testing(remaining_escrow2);
+    assert!(remaining_size2 == 0, 1);
+
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    // 1 event from the first taker + 3 from the second.
+    assert!(fills.length() == 4, 2);
+
+    let (id_1, _, _, size_1, maker_1, _) = tiny_clob::order_filled_fields_for_testing(&fills[1]);
+    assert!(id_1 == order_id_a, 3);
+    assert!(size_1 == 200, 4);
+    assert!(maker_1 == MAKER_A, 5);
+
+    let (id_2, _, _, size_2, maker_2, _) = tiny_clob::order_filled_fields_for_testing(&fills[2]);
+    assert!(id_2 == order_id_b, 6);
+    assert!(size_2 == 200, 7);
+    assert!(maker_2 == MAKER_B, 8);
+
+    let (id_3, _, _, size_3, maker_3, _) = tiny_clob::order_filled_fields_for_testing(&fills[3]);
+    assert!(id_3 == order_id_c, 9);
+    assert!(size_3 == 100, 10);
+    assert!(maker_3 == MAKER_C, 11);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun repeated_partial_fills_of_head_never_reorder() {
+    let price = 50_000;
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_a = tiny_clob::next_order_id(&mut book);
+    let ask_a = order::new<BTC, USDC>(
+        order_id_a, MAKER_A, 500, option::some(balance::create_for_testing<BTC>(500)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_a, scenario.ctx());
+
+    let order_id_b = tiny_clob::next_order_id(&mut book);
+    let ask_b = order::new<BTC, USDC>(
+        order_id_b, MAKER_B, 100, option::some(balance::create_for_testing<BTC>(100)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_b, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    // Five separate 100-unit takers, each landing on A alone (500 total),
+    // proving A stays at the front of the queue across five consecutive
+    // partial-fill/reinsert cycles rather than drifting behind B.
+    let mut i = 0;
+    while (i < 5) {
+        let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 100), scenario.ctx());
+        let (matched_base, remaining_budget, remaining_size, _) =
+            tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment, 1_000_000, scenario.ctx());
+        coin::burn_for_testing(matched_base);
+        coin::burn_for_testing(remaining_budget);
+        assert!(remaining_size == 0, i);
+        assert!(tiny_clob::depth_at_price(&book, false, price) == 500 - (i + 1) * 100 + 100, 20 + i);
+        i = i + 1;
+    };
+
+    // A is now fully drained, so the sixth fill must land on B.
+    let payment6 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 100), scenario.ctx());
+    let (matched_base6, remaining_budget6, remaining_size6, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment6, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base6);
+    coin::burn_for_testing(remaining_budget6);
+    assert!(remaining_size6 == 0, 10);
+    assert!(tiny_clob::depth_at_price(&book, false, price) == 0, 11);
+
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    assert!(fills.length() == 6, 12);
+
+    let mut j = 0;
+    while (j < 5) {
+        let (fid, _, _, fsize, fmaker, _) = tiny_clob::order_filled_fields_for_testing(&fills[j]);
+        assert!(fid == order_id_a, 30 + j);
+        assert!(fsize == 100, 40 + j);
+        assert!(fmaker == MAKER_A, 50 + j);
+        j = j + 1;
+    };
+
+    let (id_6, _, _, size_6, maker_6, _) = tiny_clob::order_filled_fields_for_testing(&fills[5]);
+    assert!(id_6 == order_id_b, 60);
+    assert!(size_6 == 100, 61);
+    assert!(maker_6 == MAKER_B, 62);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun new_order_at_same_price_goes_behind_partially_filled_one() {
+    let price = 50_000;
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_a = tiny_clob::next_order_id(&mut book);
+    let ask_a = order::new<BTC, USDC>(
+        order_id_a, MAKER_A, 300, option::some(balance::create_for_testing<BTC>(300)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, price, ask_a, scenario.ctx());
+
+    // Partially fill A by 100, leaving 200 resting, reinserted at the front.
+    scenario.next_tx(TAKER);
+    let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 100), scenario.ctx());
+    let (matched_base1, remaining_budget1, remaining_size1, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base1);
+    coin::burn_for_testing(remaining_budget1);
+    assert!(remaining_size1 == 0, 0);
+
+    // A brand-new maker rests at the same price via the ordinary placement
+    // path (`level_insert_order`, appends to the back) — it must not jump
+    // ahead of A's already-reinserted 200-unit remainder.
+    scenario.next_tx(MAKER_B);
+    let ticket_b = rest_ask(&mut book, price, 300, 10, scenario.ctx());
+    let (order_id_b, _, _, _) = tiny_clob::ticket_fields_for_testing(&ticket_b);
+
+    // `event::events_by_type` only sees events emitted in the *current*
+    // transaction (test_scenario clears its recorded events on every
+    // `next_tx`), so the final sweep's own two `OrderFilled` events are
+    // freshly numbered [0, 1] here, independent of the earlier partial fill.
+    scenario.next_tx(TAKER);
+    let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(price, 500), scenario.ctx());
+    let (matched_base2, remaining_budget2, remaining_size2, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base2);
+    coin::burn_for_testing(remaining_budget2);
+    assert!(remaining_size2 == 0, 1);
+
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    assert!(fills.length() == 2, 2);
+
+    let (id_1, _, _, size_1, maker_1, _) = tiny_clob::order_filled_fields_for_testing(&fills[0]);
+    assert!(id_1 == order_id_a, 3);
+    assert!(size_1 == 200, 4);
+    assert!(maker_1 == MAKER_A, 5);
+
+    let (id_2, _, _, size_2, maker_2, _) = tiny_clob::order_filled_fields_for_testing(&fills[1]);
+    assert!(id_2 == order_id_b, 6);
+    assert!(size_2 == 300, 7);
+    assert!(maker_2 == MAKER_B, 8);
+
+    unit_test::destroy(ticket_b);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 #[test]
 fun force_cancel_refunds_owner_not_caller() {
     let price = 50_000;
@@ -730,7 +1005,7 @@ fun force_cancel_refunds_owner_not_caller() {
     // functions entirely.
     let order_id = tiny_clob::next_order_id(&mut book);
     let escrow = balance::create_for_testing<USDC>(price * size);
-    let order = price_tree::new_order<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
+    let order = order::new<BTC, USDC>(order_id, OTHER, size, option::none(), option::some(escrow), 0);
     tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
 
     tiny_clob::clob_admin_cancel_order(&cap, &mut book, true, price, order_id, scenario.ctx());

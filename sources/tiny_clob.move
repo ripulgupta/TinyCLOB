@@ -11,7 +11,8 @@ use sui::coin::{Self, Coin};
 use sui::event;
 use sui::linked_table::{Self, LinkedTable};
 use std::type_name::{Self, TypeName};
-use tiny_clob::price_tree::{Self, PriceTree, PriceLevel, Order};
+use tiny_clob::order::{Self, Order};
+use tiny_clob::price_tree::{Self, PriceTree, PriceLevel};
 
 // === Error constants ===
 
@@ -502,8 +503,8 @@ public fun clob_admin_cancel_order<Base, Quote>(
         let level = price_tree::borrow_mut(tree, leaf_ptr);
         if (price_tree::level_contains_order(level, order_id)) {
             let live_order = price_tree::level_remove_order(level, order_id);
-            let owner = price_tree::order_owner(&live_order);
-            let (eb, eq) = price_tree::destroy_order(live_order);
+            let owner = order::owner(&live_order);
+            let (eb, eq) = order::destroy(live_order);
             (true, owner, eb, eq, price_tree::level_is_empty(level))
         } else {
             (false, @0x0, option::none(), option::none(), price_tree::level_is_empty(level))
@@ -570,8 +571,8 @@ fun drain_side<Base, Quote>(
                 if (*remaining == 0) break;
                 if (price_tree::level_is_empty(level)) break;
                 let (_, order) = price_tree::level_pop_front_order(level);
-                let owner = price_tree::order_owner(&order);
-                let (escrow_base, escrow_quote) = price_tree::destroy_order(order);
+                let owner = order::owner(&order);
+                let (escrow_base, escrow_quote) = order::destroy(order);
                 refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
                 *remaining = *remaining - 1;
             };
@@ -750,7 +751,7 @@ fun insert_resting_order<Base, Quote>(
     order: Order<Base, Quote>,
     ctx: &mut TxContext,
 ) {
-    let order_id = price_tree::order_id(&order);
+    let order_id = order::id(&order);
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
     let existing = price_tree::find(tree, price);
@@ -796,7 +797,7 @@ fun fill_level_bid<Base, Quote>(
             if (price_tree::level_is_empty(level)) break;
             let head_key = price_tree::level_front_order_id(level).destroy_some();
             *fills_consumed = *fills_consumed + 1;
-            let maker_remaining = price_tree::order_remaining_size(price_tree::level_borrow_order(level, head_key));
+            let maker_remaining = order::remaining_size(price_tree::level_borrow_order(level, head_key));
             let natural_fill_qty = std::u64::min(*remaining_size, maker_remaining);
             let affordable_qty = balance::value(budget) / best_price;
             let fill_qty = std::u64::min(natural_fill_qty, affordable_qty);
@@ -806,13 +807,13 @@ fun fill_level_bid<Base, Quote>(
             };
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            price_tree::level_decrease_order_remaining_size(level, head_key, fill_qty);
-            let mut base_out = price_tree::level_split_order_escrow_base(level, head_key, fill_qty);
-            let maker_order = price_tree::level_borrow_order(level, head_key);
-            let maker_fee_bps = price_tree::order_maker_fee_bps(maker_order);
-            let maker_addr = price_tree::order_owner(maker_order);
-            let maker_order_id = price_tree::order_id(maker_order);
-            let maker_remaining_after = price_tree::order_remaining_size(maker_order);
+            let mut maker_order = price_tree::level_remove_order(level, head_key);
+            order::decrease_remaining_size(&mut maker_order, fill_qty);
+            let mut base_out = order::split_escrow_base(&mut maker_order, fill_qty);
+            let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_addr = order::owner(&maker_order);
+            let maker_order_id = order::id(&maker_order);
+            let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_base = fee_amount(fill_qty, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut base_out, taker_fee_base);
@@ -836,9 +837,10 @@ fun fill_level_bid<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                let (_, drained) = price_tree::level_pop_front_order(level);
-                let (eb, eq) = price_tree::destroy_order(drained);
+                let (eb, eq) = order::destroy(maker_order);
                 destroy_drained_ask_escrow(eb, eq);
+            } else {
+                price_tree::level_insert_order_front(level, head_key, maker_order);
             };
 
             if (fill_qty < natural_fill_qty) {
@@ -938,17 +940,17 @@ fun fill_level_ask<Base, Quote>(
             if (price_tree::level_is_empty(level)) break;
             let head_key = price_tree::level_front_order_id(level).destroy_some();
             *fills_consumed = *fills_consumed + 1;
-            let maker_remaining = price_tree::order_remaining_size(price_tree::level_borrow_order(level, head_key));
+            let maker_remaining = order::remaining_size(price_tree::level_borrow_order(level, head_key));
             let fill_qty = std::u64::min(*remaining_size, maker_remaining);
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            price_tree::level_decrease_order_remaining_size(level, head_key, fill_qty);
-            let mut quote_out = price_tree::level_split_order_escrow_quote(level, head_key, quote_cost);
-            let maker_order = price_tree::level_borrow_order(level, head_key);
-            let maker_fee_bps = price_tree::order_maker_fee_bps(maker_order);
-            let maker_addr = price_tree::order_owner(maker_order);
-            let maker_order_id = price_tree::order_id(maker_order);
-            let maker_remaining_after = price_tree::order_remaining_size(maker_order);
+            let mut maker_order = price_tree::level_remove_order(level, head_key);
+            order::decrease_remaining_size(&mut maker_order, fill_qty);
+            let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
+            let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_addr = order::owner(&maker_order);
+            let maker_order_id = order::id(&maker_order);
+            let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_quote = fee_amount(quote_cost, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
@@ -972,9 +974,10 @@ fun fill_level_ask<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                let (_, drained) = price_tree::level_pop_front_order(level);
-                let (eb, eq) = price_tree::destroy_order(drained);
+                let (eb, eq) = order::destroy(maker_order);
                 destroy_drained_bid_escrow(eb, eq);
+            } else {
+                price_tree::level_insert_order_front(level, head_key, maker_order);
             };
         };
         is_empty_now = price_tree::level_is_empty(level);
@@ -1132,7 +1135,7 @@ public fun place_limit_order_bid<Base, Quote>(
         // this resting order is constructed; later fee-rate changes never
         // retroactively affect an already-resting order.
         let maker_fee_bps_snapshot = maker_fee_bps(book);
-        let resting = price_tree::new_order(
+        let resting = order::new(
             order_id,
             taker,
             remaining_size,
@@ -1191,7 +1194,7 @@ public fun place_limit_order_ask<Base, Quote>(
         // this resting order is constructed; later fee-rate changes never
         // retroactively affect an already-resting order.
         let maker_fee_bps_snapshot = maker_fee_bps(book);
-        let resting = price_tree::new_order(
+        let resting = order::new(
             order_id,
             taker,
             remaining_size,
@@ -1386,8 +1389,8 @@ public fun cancel_order<Base, Quote>(
             let level = price_tree::borrow_mut(tree, leaf_ptr);
             if (price_tree::level_contains_order(level, order_id)) {
                 let live_order = price_tree::level_remove_order(level, order_id);
-                let owner = price_tree::order_owner(&live_order);
-                let (eb, eq) = price_tree::destroy_order(live_order);
+                let owner = order::owner(&live_order);
+                let (eb, eq) = order::destroy(live_order);
                 (true, owner, eb, eq, price_tree::level_is_empty(level))
             } else {
                 (false, @0x0, option::none(), option::none(), price_tree::level_is_empty(level))
