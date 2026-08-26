@@ -17,12 +17,11 @@ const MAKER_A: address = @0xA001;
 const MAKER_B: address = @0xA002;
 const MAKER_C: address = @0xA003;
 
-const LOT_SIZE: u64 = 100;
 const MIN_SIZE: u64 = 100;
-const MAX_LOT_OR_MIN_SIZE: u64 = 1_000_000_000_000_000;
+const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
 
 fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
-    tiny_clob::new<BTC, USDC>(LOT_SIZE, MIN_SIZE, option::none(), scenario.ctx())
+    tiny_clob::new<BTC, USDC>(MIN_SIZE, option::none(), scenario.ctx())
 }
 
 fun destroy_book_and_cap(book: OrderBook<BTC, USDC>, cap: ClobAdminCap) {
@@ -69,7 +68,6 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
     let mut scenario = ts::begin(ADMIN);
     let (book, cap) = new_book(&mut scenario);
 
-    assert!(tiny_clob::lot_size(&book) == LOT_SIZE, 0);
     assert!(tiny_clob::min_size(&book) == MIN_SIZE, 1);
     assert!(!tiny_clob::is_paused(&book), 2);
     assert!(tiny_clob::clob_admin_cap_id_for_testing(&book) == object::id(&cap), 3);
@@ -82,51 +80,19 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
 }
 
 #[test]
-#[expected_failure(abort_code = 0, location = tiny_clob)] // tiny_clob::EZeroLotSize
-fun new_zero_lot_size_aborts() {
-    let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(0, MIN_SIZE, option::none(), scenario.ctx());
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-#[test]
 #[expected_failure(abort_code = 1, location = tiny_clob)] // tiny_clob::EZeroMinSize
 fun new_zero_min_size_aborts() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(LOT_SIZE, 0, option::none(), scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(0, option::none(), scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
 #[test]
-#[expected_failure(abort_code = 2, location = tiny_clob)] // tiny_clob::EMinSizeNotMultipleOfLotSize
-fun new_min_size_not_multiple_of_lot_size_aborts() {
+#[expected_failure(abort_code = 3, location = tiny_clob)] // tiny_clob::EMinSizeTooLarge
+fun new_min_size_too_large_aborts() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(100, 150, option::none(), scenario.ctx());
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-#[test]
-#[expected_failure(abort_code = 3, location = tiny_clob)] // tiny_clob::ELotOrMinSizeTooLarge
-fun new_lot_size_too_large_aborts() {
-    let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_LOT_OR_MIN_SIZE + 1, MAX_LOT_OR_MIN_SIZE + 1, option::none(), scenario.ctx());
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-#[test]
-#[expected_failure(abort_code = 3, location = tiny_clob)] // tiny_clob::ELotOrMinSizeTooLarge
-fun new_min_size_too_large_aborts_lot_size_valid() {
-    let mut scenario = ts::begin(ADMIN);
-    // lot_size is within bounds and min_size is a valid multiple of lot_size,
-    // but min_size itself exceeds MAX_LOT_OR_MIN_SIZE — isolates the
-    // min_size-only branch of the too-large check from the lot_size-only
-    // branch already covered by `new_lot_size_too_large_aborts`.
-    let (book, cap) =
-        tiny_clob::new<BTC, USDC>(LOT_SIZE, MAX_LOT_OR_MIN_SIZE + LOT_SIZE, option::none(), scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE + 1, option::none(), scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -134,8 +100,8 @@ fun new_min_size_too_large_aborts_lot_size_valid() {
 #[test]
 fun new_size_at_max_boundary_succeeds() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_LOT_OR_MIN_SIZE, MAX_LOT_OR_MIN_SIZE, option::none(), scenario.ctx());
-    assert!(tiny_clob::lot_size(&book) == MAX_LOT_OR_MIN_SIZE, 0);
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MAX_MIN_SIZE, option::none(), scenario.ctx());
+    assert!(tiny_clob::min_size(&book) == MAX_MIN_SIZE, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -349,7 +315,7 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     let mut scenario = ts::begin(ADMIN);
     let override_id = object::id_from_address(@0xFACE);
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        LOT_SIZE, MIN_SIZE, option::some(override_id), scenario.ctx(),
+        MIN_SIZE, option::some(override_id), scenario.ctx(),
     );
 
     let true_book_id = tiny_clob::id_for_testing(&book);
@@ -1292,7 +1258,7 @@ fun new_event_id_override_is_used_and_stable_across_placement_and_cancel() {
     let mut scenario = ts::begin(ADMIN);
     let override_id = object::id_from_address(@0xFACE);
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        LOT_SIZE, MIN_SIZE, option::some(override_id), scenario.ctx(),
+        MIN_SIZE, option::some(override_id), scenario.ctx(),
     );
 
     // The override, not the book's own internal id, is what got stamped
@@ -1651,7 +1617,7 @@ fun forged_event_id_ticket_cannot_cancel_victim_order() {
     // Attacker deliberately overrides book B's event_id to collide with
     // victim book A's own object id — the strongest collision attempt.
     let (mut book_b, cap_b) = tiny_clob::new<BTC, USDC>(
-        LOT_SIZE, MIN_SIZE, option::some(victim_id), scenario.ctx(),
+        MIN_SIZE, option::some(victim_id), scenario.ctx(),
     );
     assert!(tiny_clob::event_id_for_testing(&book_b) == victim_id, 0);
 
@@ -1679,7 +1645,7 @@ fun forged_event_id_ticket_cannot_hijack_victim_order_owner() {
     // above, but exercising update_resting_order instead, which
     // takes the ticket by reference rather than consuming it.
     let (mut book_b, cap_b) = tiny_clob::new<BTC, USDC>(
-        LOT_SIZE, MIN_SIZE, option::some(victim_id), scenario.ctx(),
+        MIN_SIZE, option::some(victim_id), scenario.ctx(),
     );
     assert!(tiny_clob::event_id_for_testing(&book_b) == victim_id, 0);
 

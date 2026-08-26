@@ -16,17 +16,14 @@ use tiny_clob::price_tree::{Self, PriceTree, PriceLevel};
 
 // === Error constants ===
 
-const EZeroLotSize: u64 = 0;
 const EZeroMinSize: u64 = 1;
-const EMinSizeNotMultipleOfLotSize: u64 = 2;
-const ELotOrMinSizeTooLarge: u64 = 3;
+const EMinSizeTooLarge: u64 = 3;
 const EWrongClobAdminCap: u64 = 4;
 const ENewVersionMismatch: u64 = 5;
 const ENotRetiring: u64 = 6;
 const ENotFullyDrained: u64 = 7;
 const ETakerFeeRateTooHigh: u64 = 8;
 const EMakerFeeRateTooHigh: u64 = 9;
-const ESizeNotMultipleOfLotSize: u64 = 11;
 const ESizeBelowMinSize: u64 = 12;
 /// A `price * size`-style multiplication's `u128` intermediate exceeded
 /// `u64::MAX`.
@@ -38,7 +35,7 @@ const ESlippageExceeded: u64 = 17;
 
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
-const MAX_LOT_OR_MIN_SIZE: u64 = 1_000_000_000_000_000;
+const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
 const U64_MAX: u128 = 0xFFFFFFFFFFFFFFFF;
 
 /// Bumped whenever a published version of this package introduces a
@@ -157,7 +154,6 @@ public(package) fun credit_fee_accumulator<Base, Quote>(
 #[allow(lint(missing_key))]
 public struct OrderBook<phantom Base, phantom Quote> has store {
     id: UID,
-    lot_size: u64,
     min_size: u64,
     bids: PriceTree<PriceLevel<Base, Quote>>,
     asks: PriceTree<PriceLevel<Base, Quote>>,
@@ -213,15 +209,12 @@ public fun discard_clob_admin_cap(cap: ClobAdminCap) {
 /// Callable by any address — no capability is required to create a book,
 /// and it is never registered anywhere by this call.
 public fun new<Base, Quote>(
-    lot_size: u64,
     min_size: u64,
     event_id_override: Option<ID>,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
-    assert!(lot_size != 0, EZeroLotSize);
     assert!(min_size != 0, EZeroMinSize);
-    assert!(min_size % lot_size == 0, EMinSizeNotMultipleOfLotSize);
-    assert!(lot_size <= MAX_LOT_OR_MIN_SIZE && min_size <= MAX_LOT_OR_MIN_SIZE, ELotOrMinSizeTooLarge);
+    assert!(min_size <= MAX_MIN_SIZE, EMinSizeTooLarge);
 
     let book_uid = object::new(ctx);
     let book_id = object::uid_to_inner(&book_uid);
@@ -236,7 +229,6 @@ public fun new<Base, Quote>(
 
     let book = OrderBook<Base, Quote> {
         id: book_uid,
-        lot_size,
         min_size,
         bids: price_tree::new(ctx),
         asks: price_tree::new(ctx),
@@ -254,10 +246,6 @@ public fun new<Base, Quote>(
 }
 
 // === Package-private field accessors ===
-
-public(package) fun lot_size<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
-    book.lot_size
-}
 
 public(package) fun min_size<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.min_size
@@ -659,7 +647,7 @@ public fun clob_admin_finalize<Base, Quote>(
     );
 
     let OrderBook {
-        id, lot_size: _, min_size: _, bids, asks, proceeds,
+        id, min_size: _, bids, asks, proceeds,
         paused: _, next_order_id: _, clob_admin_cap_id: _, version: _,
         taker_fee_bps: _, maker_fee_bps: _, fee_accumulator, event_id,
     } = book;
@@ -714,13 +702,12 @@ fun fee_amount(receive_amount: u64, rate_bps: u64): u64 {
     (((receive_amount as u128) * (rate_bps as u128)) / 10_000) as u64
 }
 
-fun validate_size_raw(lot_size: u64, min_size: u64, size: u64) {
-    assert!(size % lot_size == 0, ESizeNotMultipleOfLotSize);
+fun validate_size_raw(min_size: u64, size: u64) {
     assert!(size >= min_size, ESizeBelowMinSize);
 }
 
 fun validate_size<Base, Quote>(book: &OrderBook<Base, Quote>, size: u64) {
-    validate_size_raw(lot_size(book), min_size(book), size);
+    validate_size_raw(min_size(book), size);
 }
 
 // Once a maker's `Order` is fully consumed by matching, its escrow `Option`s
