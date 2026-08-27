@@ -862,12 +862,11 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
     scenario.end();
 }
 
-// === Fix 4: fill-path gas — collapsed detach-mutate-reinsert into one
-// in-place mutation (`level_fill_front_order_base`/`_quote` in
-// price_tree.move). `fill_level_bid`/`fill_level_ask` now call those
-// directly instead of front -> borrow -> remove -> mutate -> (destroy |
-// reinsert); these tests exercise that path through the public matching
-// entry points and confirm behavior is unchanged. ===
+// === fill_level_bid/fill_level_ask: detach-mutate-reinsert fill path.
+// `price_tree::level_remove_order` + `order::decrease_remaining_size` +
+// `price_tree::level_insert_order_front` (or `order::destroy` on full
+// drain). These tests exercise that path through the public matching
+// entry points and confirm FIFO order and total_size bookkeeping. ===
 
 const FILL_INPLACE_PRICE: u64 = 25_000;
 

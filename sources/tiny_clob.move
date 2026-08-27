@@ -928,8 +928,13 @@ fun fill_level_bid<Base, Quote>(
             };
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            let (maker_order_id, maker_addr, maker_fee_bps, maker_remaining_after, mut base_out, drained_extra_base, drained_extra_quote) =
-                price_tree::level_fill_front_order_base(level, fill_qty);
+            let mut maker_order = price_tree::level_remove_order(level, head_key);
+            order::decrease_remaining_size(&mut maker_order, fill_qty);
+            let mut base_out = order::split_escrow_base(&mut maker_order, fill_qty);
+            let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_addr = order::owner(&maker_order);
+            let maker_order_id = order::id(&maker_order);
+            let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_base = fee_amount(fill_qty, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut base_out, taker_fee_base);
@@ -953,10 +958,10 @@ fun fill_level_bid<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                destroy_drained_ask_escrow(drained_extra_base, drained_extra_quote);
+                let (eb, eq) = order::destroy(maker_order);
+                destroy_drained_ask_escrow(eb, eq);
             } else {
-                drained_extra_base.destroy_none();
-                drained_extra_quote.destroy_none();
+                price_tree::level_insert_order_front(level, head_key, maker_order);
             };
 
             if (fill_qty < natural_fill_qty) {
@@ -1060,8 +1065,13 @@ fun fill_level_ask<Base, Quote>(
             let fill_qty = std::u64::min(*remaining_size, maker_remaining);
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            let (maker_order_id, maker_addr, maker_fee_bps, maker_remaining_after, mut quote_out, drained_extra_base, drained_extra_quote) =
-                price_tree::level_fill_front_order_quote(level, fill_qty, quote_cost);
+            let mut maker_order = price_tree::level_remove_order(level, head_key);
+            order::decrease_remaining_size(&mut maker_order, fill_qty);
+            let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
+            let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_addr = order::owner(&maker_order);
+            let maker_order_id = order::id(&maker_order);
+            let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_quote = fee_amount(quote_cost, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
@@ -1085,10 +1095,10 @@ fun fill_level_ask<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                destroy_drained_bid_escrow(drained_extra_base, drained_extra_quote);
+                let (eb, eq) = order::destroy(maker_order);
+                destroy_drained_bid_escrow(eb, eq);
             } else {
-                drained_extra_base.destroy_none();
-                drained_extra_quote.destroy_none();
+                price_tree::level_insert_order_front(level, head_key, maker_order);
             };
         };
         is_empty_now = price_tree::level_is_empty(level);

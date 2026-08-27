@@ -4,7 +4,6 @@
 /// order/market-specific type.
 module tiny_clob::price_tree;
 
-use sui::balance::Balance;
 use sui::linked_table::{Self, LinkedTable};
 use sui::table::{Self, Table};
 use tiny_clob::order::{Self, Order};
@@ -200,92 +199,6 @@ public(package) fun level_set_order_owner<Base, Quote>(
     new_owner: address,
 ) {
     order::set_owner(level.orders.borrow_mut(order_id), new_owner);
-}
-
-/// Applies a fill to the level's front order IN PLACE — no detach, no
-/// reinsert. Decrements the order's `remaining_size` (by `fill_qty`, always
-/// Base-denominated) and the level's `total_size` in the same call, splits
-/// `fill_qty` of `Balance<Base>` escrow out of the order (for an order
-/// resting on the ask side, whose escrow is held in `Base`), and returns
-/// everything the caller needs to settle the fill. If the fill fully drains
-/// the order, it is popped and destroyed here (the order's own `destroy()`
-/// residual-balance `Option`s are surfaced unchanged as the last two return
-/// values); otherwise it stays at the front of the queue — FIFO is preserved
-/// trivially since nothing is detached.
-///
-/// Returns: `(order_id, owner, maker_fee_bps, remaining_after, base_out,
-/// drained_extra_base, drained_extra_quote)`. `drained_extra_base`/
-/// `drained_extra_quote` are `option::none()` unless the fill fully drained
-/// the order, in which case they hold exactly what `order::destroy` returned.
-///
-/// Aborts if `level` is empty, or if `fill_qty` exceeds the front order's
-/// `remaining_size` (same underflow abort `order::decrease_remaining_size`
-/// already provides) — callers must have already computed a valid
-/// `fill_qty`, exactly as required by the call sites that use this today.
-public(package) fun level_fill_front_order_base<Base, Quote>(
-    level: &mut PriceLevel<Base, Quote>,
-    fill_qty: u64,
-): (u64, address, u64, u64, Balance<Base>, Option<Balance<Base>>, Option<Balance<Quote>>) {
-    let order_id = (*level.orders.front()).destroy_some();
-    let base_out = {
-        let order_mut = level.orders.borrow_mut(order_id);
-        order::decrease_remaining_size(order_mut, fill_qty);
-        order::split_escrow_base(order_mut, fill_qty)
-    };
-    let (owner, maker_fee_bps, remaining_after) = {
-        let order_ref = level.orders.borrow(order_id);
-        (order::owner(order_ref), order::maker_fee_bps(order_ref), order::remaining_size(order_ref))
-    };
-    level.total_size = level.total_size - fill_qty;
-
-    let (drained_extra_base, drained_extra_quote) = if (remaining_after == 0) {
-        let order = level.orders.remove(order_id);
-        order::destroy(order)
-    } else {
-        (option::none(), option::none())
-    };
-    (order_id, owner, maker_fee_bps, remaining_after, base_out, drained_extra_base, drained_extra_quote)
-}
-
-/// Symmetric counterpart to `level_fill_front_order_base` for the bid side —
-/// splits `Balance<Quote>` escrow (a resting bid's escrow currency) instead
-/// of `Balance<Base>`. `fill_qty` (Base-denominated) still drives
-/// `remaining_size`/`total_size` accounting exactly like the base version;
-/// `quote_cost` is the separate, price-derived amount of `Balance<Quote>` to
-/// split out of the order's escrow (equal to `price * fill_qty`, computed by
-/// the caller) — unlike the base version, the escrow-split amount and the
-/// `remaining_size` decrement amount are denominated in different units on
-/// this side, so both must be passed in.
-///
-/// Same abort conditions as `level_fill_front_order_base`, adapted:
-/// `fill_qty` exceeding `remaining_size` aborts via
-/// `order::decrease_remaining_size`; `quote_cost` exceeding the order's
-/// remaining quote escrow aborts via `order::split_escrow_quote`'s own
-/// underflow check.
-public(package) fun level_fill_front_order_quote<Base, Quote>(
-    level: &mut PriceLevel<Base, Quote>,
-    fill_qty: u64,
-    quote_cost: u64,
-): (u64, address, u64, u64, Balance<Quote>, Option<Balance<Base>>, Option<Balance<Quote>>) {
-    let order_id = (*level.orders.front()).destroy_some();
-    let quote_out = {
-        let order_mut = level.orders.borrow_mut(order_id);
-        order::decrease_remaining_size(order_mut, fill_qty);
-        order::split_escrow_quote(order_mut, quote_cost)
-    };
-    let (owner, maker_fee_bps, remaining_after) = {
-        let order_ref = level.orders.borrow(order_id);
-        (order::owner(order_ref), order::maker_fee_bps(order_ref), order::remaining_size(order_ref))
-    };
-    level.total_size = level.total_size - fill_qty;
-
-    let (drained_extra_base, drained_extra_quote) = if (remaining_after == 0) {
-        let order = level.orders.remove(order_id);
-        order::destroy(order)
-    } else {
-        (option::none(), option::none())
-    };
-    (order_id, owner, maker_fee_bps, remaining_after, quote_out, drained_extra_base, drained_extra_quote)
 }
 
 // === Construction ===
