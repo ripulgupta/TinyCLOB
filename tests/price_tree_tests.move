@@ -824,6 +824,72 @@ fun mixed_insert_paths_with_removals_stay_consistent() {
     teardown(scenario, tree);
 }
 
+// === NO_PARENT blind-spot guard (Fix 6) ===
+//
+// `NO_PARENT` numerically equals `PARTITION_INDEX`, so `is_leaf_ptr(NO_PARENT)`
+// (`ptr >= PARTITION_INDEX`) incorrectly evaluates to `true`. Before the
+// guard was tightened, passing `NO_PARENT` to `remove`/`borrow`/`borrow_mut`/
+// `key`/`insert_at` would skip the leaf-shape check and fall through to
+// `leaf_index_of(NO_PARENT)` — an out-of-range leaf index that only aborted
+// via `sui::table`'s generic missing-key error, not a purpose-built one.
+// These five tests confirm each function now aborts immediately, with its
+// own clear error code, when passed `NO_PARENT` explicitly.
+
+/// Numerically identical to the private `NO_PARENT`/`PARTITION_INDEX`
+/// constants in `price_tree.move` (`0x8000000000000000`) — duplicated here
+/// since those constants aren't exported.
+const NO_PARENT_FOR_TESTING: u64 = 0x8000000000000000;
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun remove_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    let _v = price_tree::remove(&mut tree, NO_PARENT_FOR_TESTING);
+    cleanup(&mut tree, vector[5_000_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun borrow_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    let _v = price_tree::borrow(&tree, NO_PARENT_FOR_TESTING);
+    cleanup(&mut tree, vector[5_000_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun borrow_mut_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    let _v = price_tree::borrow_mut(&mut tree, NO_PARENT_FOR_TESTING);
+    cleanup(&mut tree, vector[5_000_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
+fun key_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
+    let (mut scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 5_000_000, mock(1));
+    let _k = price_tree::key(&tree, NO_PARENT_FOR_TESTING);
+    cleanup(&mut tree, vector[5_000_000]);
+    teardown(scenario, tree);
+}
+
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidHintPtr, location = tiny_clob::price_tree)]
+fun insert_at_with_no_parent_hint_aborts_invalid_hint_ptr() {
+    let (scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 100, mock(100));
+    price_tree::insert_at(&mut tree, 300, mock(300), NO_PARENT_FOR_TESTING);
+    cleanup(&mut tree, vector[100, 300]);
+    teardown(scenario, tree);
+}
+
 // === insert_at_rejects_non_leaf_hint_pointer ===
 
 /// `insert_at` must reject a hint pointer that addresses an internal node

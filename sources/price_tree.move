@@ -4,6 +4,7 @@
 /// order/market-specific type.
 module tiny_clob::price_tree;
 
+use sui::balance::Balance;
 use sui::linked_table::{Self, LinkedTable};
 use sui::table::{Self, Table};
 use tiny_clob::order::{Self, Order};
@@ -199,6 +200,92 @@ public(package) fun level_set_order_owner<Base, Quote>(
     new_owner: address,
 ) {
     order::set_owner(level.orders.borrow_mut(order_id), new_owner);
+}
+
+/// Applies a fill to the level's front order IN PLACE — no detach, no
+/// reinsert. Decrements the order's `remaining_size` (by `fill_qty`, always
+/// Base-denominated) and the level's `total_size` in the same call, splits
+/// `fill_qty` of `Balance<Base>` escrow out of the order (for an order
+/// resting on the ask side, whose escrow is held in `Base`), and returns
+/// everything the caller needs to settle the fill. If the fill fully drains
+/// the order, it is popped and destroyed here (the order's own `destroy()`
+/// residual-balance `Option`s are surfaced unchanged as the last two return
+/// values); otherwise it stays at the front of the queue — FIFO is preserved
+/// trivially since nothing is detached.
+///
+/// Returns: `(order_id, owner, maker_fee_bps, remaining_after, base_out,
+/// drained_extra_base, drained_extra_quote)`. `drained_extra_base`/
+/// `drained_extra_quote` are `option::none()` unless the fill fully drained
+/// the order, in which case they hold exactly what `order::destroy` returned.
+///
+/// Aborts if `level` is empty, or if `fill_qty` exceeds the front order's
+/// `remaining_size` (same underflow abort `order::decrease_remaining_size`
+/// already provides) — callers must have already computed a valid
+/// `fill_qty`, exactly as required by the call sites that use this today.
+public(package) fun level_fill_front_order_base<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    fill_qty: u64,
+): (u64, address, u64, u64, Balance<Base>, Option<Balance<Base>>, Option<Balance<Quote>>) {
+    let order_id = (*level.orders.front()).destroy_some();
+    let base_out = {
+        let order_mut = level.orders.borrow_mut(order_id);
+        order::decrease_remaining_size(order_mut, fill_qty);
+        order::split_escrow_base(order_mut, fill_qty)
+    };
+    let (owner, maker_fee_bps, remaining_after) = {
+        let order_ref = level.orders.borrow(order_id);
+        (order::owner(order_ref), order::maker_fee_bps(order_ref), order::remaining_size(order_ref))
+    };
+    level.total_size = level.total_size - fill_qty;
+
+    let (drained_extra_base, drained_extra_quote) = if (remaining_after == 0) {
+        let order = level.orders.remove(order_id);
+        order::destroy(order)
+    } else {
+        (option::none(), option::none())
+    };
+    (order_id, owner, maker_fee_bps, remaining_after, base_out, drained_extra_base, drained_extra_quote)
+}
+
+/// Symmetric counterpart to `level_fill_front_order_base` for the bid side —
+/// splits `Balance<Quote>` escrow (a resting bid's escrow currency) instead
+/// of `Balance<Base>`. `fill_qty` (Base-denominated) still drives
+/// `remaining_size`/`total_size` accounting exactly like the base version;
+/// `quote_cost` is the separate, price-derived amount of `Balance<Quote>` to
+/// split out of the order's escrow (equal to `price * fill_qty`, computed by
+/// the caller) — unlike the base version, the escrow-split amount and the
+/// `remaining_size` decrement amount are denominated in different units on
+/// this side, so both must be passed in.
+///
+/// Same abort conditions as `level_fill_front_order_base`, adapted:
+/// `fill_qty` exceeding `remaining_size` aborts via
+/// `order::decrease_remaining_size`; `quote_cost` exceeding the order's
+/// remaining quote escrow aborts via `order::split_escrow_quote`'s own
+/// underflow check.
+public(package) fun level_fill_front_order_quote<Base, Quote>(
+    level: &mut PriceLevel<Base, Quote>,
+    fill_qty: u64,
+    quote_cost: u64,
+): (u64, address, u64, u64, Balance<Quote>, Option<Balance<Base>>, Option<Balance<Quote>>) {
+    let order_id = (*level.orders.front()).destroy_some();
+    let quote_out = {
+        let order_mut = level.orders.borrow_mut(order_id);
+        order::decrease_remaining_size(order_mut, fill_qty);
+        order::split_escrow_quote(order_mut, quote_cost)
+    };
+    let (owner, maker_fee_bps, remaining_after) = {
+        let order_ref = level.orders.borrow(order_id);
+        (order::owner(order_ref), order::maker_fee_bps(order_ref), order::remaining_size(order_ref))
+    };
+    level.total_size = level.total_size - fill_qty;
+
+    let (drained_extra_base, drained_extra_quote) = if (remaining_after == 0) {
+        let order = level.orders.remove(order_id);
+        order::destroy(order)
+    } else {
+        (option::none(), option::none())
+    };
+    (order_id, owner, maker_fee_bps, remaining_after, quote_out, drained_extra_base, drained_extra_quote)
 }
 
 // === Construction ===
@@ -409,17 +496,36 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
 /// Like `insert`, but skips the descent-to-leaf phase entirely and uses
 /// `hint_ptr` directly as the "closest leaf" that phase would have found.
 ///
-/// Contract: `hint_ptr` MUST be the result of an immediately-preceding
-/// `descend_probe(tree, key)` call on this exact `key`, with NO intervening
-/// mutation to `tree` between the two calls — passing a stale or unrelated
-/// `hint_ptr` will corrupt the tree's structure. Since `descend_probe`
-/// already returns `option::none()` for an empty tree, `hint_ptr` can never
-/// legitimately come from an empty tree, so this function assumes
-/// `tree.root != EMPTY_TREE` and does not handle that case itself — callers
-/// must branch to plain `insert` when `descend_probe` returns `None`. This
-/// is a `public(package)` function, so this trust contract is scoped to
-/// callers within this package (i.e. `tiny_clob.move`), not arbitrary
-/// external code.
+/// TRUST CONTRACT (not runtime-enforced beyond the shape check below):
+/// `hint_ptr` MUST be the leaf pointer returned by an immediately-preceding
+/// `descend_probe(tree, key)` call made on this exact same `key`, with NO
+/// intervening mutation of `tree` between the two calls. Passing a stale
+/// pointer (from a prior, since-mutated state of `tree`), a foreign pointer
+/// (from a different tree entirely), or a pointer obtained by probing a
+/// different key is undefined behavior: because `insert_at` uses `hint_ptr`
+/// to locate the crit-bit insertion point without re-verifying it via a
+/// fresh descent, a mismatched hint doesn't necessarily abort — it can
+/// silently corrupt the tree's internal structure (wrong crit-bit ordering,
+/// a leaf attached under the wrong parent, etc.), which may only surface as
+/// a much later, harder-to-diagnose failure. The `is_leaf_ptr`/`NO_PARENT`
+/// check just below only rejects a pointer that isn't even leaf-shaped; it
+/// is a shape guard, not a provenance guard, and cannot detect a
+/// stale/foreign/mismatched-key hint that still happens to be leaf-shaped.
+///
+/// This is currently safe in practice because this function's sole caller,
+/// `insert_resting_order` in `tiny_clob.move`, satisfies the contract
+/// exactly: it calls `descend_probe(tree, price)` and, on a non-exact-match
+/// result, passes that same call's `hint_ptr` straight into `insert_at`
+/// with no mutation of `tree` in between. But this guarantee is
+/// `public(package)`-scoped caller trust, not something this function
+/// verifies at runtime — any future caller added within this package must
+/// uphold the contract manually; it will not be caught for them.
+///
+/// Since `descend_probe` already returns `option::none()` for an empty tree,
+/// `hint_ptr` can never legitimately come from an empty tree, so this
+/// function assumes `tree.root != EMPTY_TREE` and does not handle that case
+/// itself — callers must branch to plain `insert` when `descend_probe`
+/// returns `None`.
 ///
 /// Cost: unlike `insert`, this does NOT get Fix 1's in-memory-replay
 /// optimization for its insertion-point search — since it skipped the
@@ -431,7 +537,7 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
 /// `find` + `insert` pattern's three touches (one descent inside `find`,
 /// discarded on a miss, plus `insert`'s own two descents).
 public(package) fun insert_at<V: store>(tree: &mut PriceTree<V>, key: u64, value: V, hint_ptr: u64) {
-    assert!(is_leaf_ptr(hint_ptr), EInvalidHintPtr);
+    assert!(is_leaf_ptr(hint_ptr) && hint_ptr != NO_PARENT, EInvalidHintPtr);
     let closest_ptr = hint_ptr;
     let closest_leaf_idx = leaf_index_of(closest_ptr);
     let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
@@ -520,7 +626,7 @@ public(package) fun descend_probe<V: store>(tree: &PriceTree<V>, key: u64): Opti
 ///
 /// Cost: O(log distinct_price_count).
 public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
-    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
+    assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     let leaf_idx = leaf_index_of(leaf_ptr);
     let Leaf { key: _, value, parent } = table::remove(&mut tree.leaves, leaf_idx);
 
@@ -574,19 +680,19 @@ public fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
 }
 
 public fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
-    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
+    assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     &table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).value
 }
 
 /// Returns the price `key` a leaf pointer (as returned by `find`/
 /// `min_leaf`/`max_leaf`) was inserted under.
 public fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
-    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
+    assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).key
 }
 
 public fun borrow_mut<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): &mut V {
-    assert!(is_leaf_ptr(leaf_ptr), EInvalidLeafPtr);
+    assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     &mut table::borrow_mut(&mut tree.leaves, leaf_index_of(leaf_ptr)).value
 }
 

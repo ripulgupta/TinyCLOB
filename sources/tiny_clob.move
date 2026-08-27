@@ -93,7 +93,7 @@ public struct FeeAccumulator<phantom Base, phantom Quote> has store {
     quote: Balance<Quote>,
 }
 
-public(package) fun credit_maker_table<Base, Quote>(
+fun credit_maker_table<Base, Quote>(
     proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
     order_id: u64,
     owner: address,
@@ -115,7 +115,7 @@ public(package) fun credit_maker_table<Base, Quote>(
 /// credit time in that case. Used by `update_resting_order` to keep an
 /// already-pooled proceeds balance's payout destination in sync with a
 /// reassigned order owner.
-public(package) fun sync_maker_balance_owner<Base, Quote>(
+fun sync_maker_balance_owner<Base, Quote>(
     proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
     order_id: u64,
     new_owner: address,
@@ -125,25 +125,25 @@ public(package) fun sync_maker_balance_owner<Base, Quote>(
     };
 }
 
-public(package) fun destroy_maker_balance<Base, Quote>(
+fun destroy_maker_balance<Base, Quote>(
     mb: MakerBalance<Base, Quote>,
 ): (address, Balance<Base>, Balance<Quote>) {
     let MakerBalance { owner, base, quote } = mb;
     (owner, base, quote)
 }
 
-public(package) fun new_fee_accumulator<Base, Quote>(): FeeAccumulator<Base, Quote> {
+fun new_fee_accumulator<Base, Quote>(): FeeAccumulator<Base, Quote> {
     FeeAccumulator { base: balance::zero(), quote: balance::zero() }
 }
 
-public(package) fun destroy_fee_accumulator<Base, Quote>(
+fun destroy_fee_accumulator<Base, Quote>(
     fees: FeeAccumulator<Base, Quote>,
 ): (Balance<Base>, Balance<Quote>) {
     let FeeAccumulator { base, quote } = fees;
     (base, quote)
 }
 
-public(package) fun credit_fee_accumulator<Base, Quote>(
+fun credit_fee_accumulator<Base, Quote>(
     fees: &mut FeeAccumulator<Base, Quote>,
     base: Balance<Base>,
     quote: Balance<Quote>,
@@ -241,15 +241,6 @@ public struct ClobAdminCapDiscarded has copy, drop {
     for_book: ID,
 }
 
-/// No liveness check: the book keeps functioning normally after its cap is
-/// discarded — this only gives up the ability to administer it.
-public fun discard_clob_admin_cap(cap: ClobAdminCap) {
-    let ClobAdminCap { id, for_book } = cap;
-    let cap_id = object::uid_to_inner(&id);
-    object::delete(id);
-    event::emit(ClobAdminCapDiscarded { cap_id, for_book });
-}
-
 // === Constructor ===
 
 /// Callable by any address — no capability is required to create a book,
@@ -341,15 +332,15 @@ public(package) fun min_size<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.min_size
 }
 
-public(package) fun taker_fee_bps<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+fun taker_fee_bps<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.taker_fee_bps
 }
 
-public(package) fun maker_fee_bps<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+fun maker_fee_bps<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.maker_fee_bps
 }
 
-public(package) fun withdraw_fee_accumulator<Base, Quote>(
+fun withdraw_fee_accumulator<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
 ): (Balance<Base>, Balance<Quote>) {
     let fees = &mut book.fee_accumulator;
@@ -368,7 +359,7 @@ public(package) fun next_order_id<Base, Quote>(book: &mut OrderBook<Base, Quote>
     id
 }
 
-public(package) fun claim_maker_balance<Base, Quote>(
+fun claim_maker_balance<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     order_id: u64,
 ): (address, Balance<Base>, Balance<Quote>) {
@@ -377,6 +368,12 @@ public(package) fun claim_maker_balance<Base, Quote>(
     };
     let mb = linked_table::remove(&mut book.proceeds, order_id);
     destroy_maker_balance(mb)
+}
+
+public struct BookVersionUpgraded has copy, drop {
+    book_id: ID,
+    from: u64,
+    to: u64,
 }
 
 /// Public so an integrator wrapping this book can version-guard its own
@@ -390,10 +387,27 @@ public(package) fun claim_maker_balance<Base, Quote>(
 /// understand a `version` the book already carries — this call is running
 /// against an older, not-yet-upgraded package build) still aborts, since
 /// that direction can never be safely auto-resolved by older code.
+///
+/// IMPORTANT — this silent, no-migration self-healing is a placeholder
+/// policy, valid only because no version bump to date has ever required
+/// actual per-book data migration (`CURRENT_VERSION` has only ever moved
+/// from 0 to 1, a bookkeeping-only change). The day `CURRENT_VERSION` is
+/// bumped for a change that DOES require converting a book's existing
+/// on-chain data, this silent auto-bump behavior must be replaced — before
+/// that version ships, not after — with an explicit, cap-gated migration
+/// function and a strict version-equality assert here, so an un-migrated
+/// book can no longer silently self-heal into a version whose data layout it
+/// doesn't actually have yet.
 public fun assert_book_version<Base, Quote>(book: &mut OrderBook<Base, Quote>) {
     assert!(book.version <= CURRENT_VERSION, ENewVersionMismatch);
     if (book.version < CURRENT_VERSION) {
+        let from = book.version;
         book.version = CURRENT_VERSION;
+        event::emit(BookVersionUpgraded {
+            book_id: object::uid_to_inner(&book.id),
+            from,
+            to: CURRENT_VERSION,
+        });
     };
 }
 
@@ -732,11 +746,11 @@ fun drain_proceeds<Base, Quote>(
 /// identity, unlike `event_id`, which is caller-controllable at
 /// construction time and must never be trusted for that purpose.
 public fun clob_admin_finalize<Base, Quote>(
-    cap: &ClobAdminCap,
+    cap: ClobAdminCap,
     mut book: OrderBook<Base, Quote>,
 ): ID {
     assert_book_version(&mut book);
-    assert_clob_admin(cap, &book);
+    assert_clob_admin(&cap, &book);
     assert!(book.retiring, ENotRetiring);
     let (fee_base, fee_quote) = fee_accumulator_balances(&book);
     assert!(
@@ -765,6 +779,12 @@ public fun clob_admin_finalize<Base, Quote>(
         base: type_name::with_defining_ids<Base>(),
         quote: type_name::with_defining_ids<Quote>(),
     });
+
+    let ClobAdminCap { id: cap_id_uid, for_book: _ } = cap;
+    let cap_id = object::uid_to_inner(&cap_id_uid);
+    object::delete(cap_id_uid);
+    event::emit(ClobAdminCapDiscarded { cap_id, for_book: true_book_id });
+
     true_book_id
 }
 
@@ -795,13 +815,15 @@ fun checked_mul_u64(a: u64, b: u64): u64 {
     product as u64
 }
 
-/// `receive_amount * rate_bps / 10_000`, computed via a `u128` intermediate.
-/// No explicit overflow check is needed: `rate_bps` is bounds-checked to at
-/// most `MAX_TAKER_FEE_BPS`/`MAX_MAKER_FEE_BPS` before it can ever reach this
-/// function, so the maximum possible product is far below `u128::MAX`. Floor
-/// division.
+/// `ceil(receive_amount * rate_bps / 10_000)`, computed via a `u128`
+/// intermediate. No explicit overflow check is needed: `rate_bps` is
+/// bounds-checked to at most `MAX_TAKER_FEE_BPS`/`MAX_MAKER_FEE_BPS` before
+/// it can ever reach this function, so the maximum possible product is far
+/// below `u128::MAX`. Ceiling division: any nonzero `receive_amount` at a
+/// nonzero `rate_bps` now pays at least 1 unit of fee, closing a dust-sized
+/// exploit where floor division let many small fills each collect zero fee.
 fun fee_amount(receive_amount: u64, rate_bps: u64): u64 {
-    (((receive_amount as u128) * (rate_bps as u128)) / 10_000) as u64
+    (((receive_amount as u128) * (rate_bps as u128) + 9_999) / 10_000) as u64
 }
 
 fun validate_size_raw(min_size: u64, size: u64) {
@@ -906,13 +928,8 @@ fun fill_level_bid<Base, Quote>(
             };
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            let mut maker_order = price_tree::level_remove_order(level, head_key);
-            order::decrease_remaining_size(&mut maker_order, fill_qty);
-            let mut base_out = order::split_escrow_base(&mut maker_order, fill_qty);
-            let maker_fee_bps = order::maker_fee_bps(&maker_order);
-            let maker_addr = order::owner(&maker_order);
-            let maker_order_id = order::id(&maker_order);
-            let maker_remaining_after = order::remaining_size(&maker_order);
+            let (maker_order_id, maker_addr, maker_fee_bps, maker_remaining_after, mut base_out, drained_extra_base, drained_extra_quote) =
+                price_tree::level_fill_front_order_base(level, fill_qty);
 
             let taker_fee_base = fee_amount(fill_qty, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut base_out, taker_fee_base);
@@ -936,10 +953,10 @@ fun fill_level_bid<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                let (eb, eq) = order::destroy(maker_order);
-                destroy_drained_ask_escrow(eb, eq);
+                destroy_drained_ask_escrow(drained_extra_base, drained_extra_quote);
             } else {
-                price_tree::level_insert_order_front(level, head_key, maker_order);
+                drained_extra_base.destroy_none();
+                drained_extra_quote.destroy_none();
             };
 
             if (fill_qty < natural_fill_qty) {
@@ -1043,13 +1060,8 @@ fun fill_level_ask<Base, Quote>(
             let fill_qty = std::u64::min(*remaining_size, maker_remaining);
             let quote_cost = checked_mul_u64(best_price, fill_qty);
 
-            let mut maker_order = price_tree::level_remove_order(level, head_key);
-            order::decrease_remaining_size(&mut maker_order, fill_qty);
-            let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
-            let maker_fee_bps = order::maker_fee_bps(&maker_order);
-            let maker_addr = order::owner(&maker_order);
-            let maker_order_id = order::id(&maker_order);
-            let maker_remaining_after = order::remaining_size(&maker_order);
+            let (maker_order_id, maker_addr, maker_fee_bps, maker_remaining_after, mut quote_out, drained_extra_base, drained_extra_quote) =
+                price_tree::level_fill_front_order_quote(level, fill_qty, quote_cost);
 
             let taker_fee_quote = fee_amount(quote_cost, taker_fee_bps);
             let taker_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
@@ -1073,10 +1085,10 @@ fun fill_level_ask<Base, Quote>(
             *remaining_size = *remaining_size - fill_qty;
 
             if (maker_remaining_after == 0) {
-                let (eb, eq) = order::destroy(maker_order);
-                destroy_drained_bid_escrow(eb, eq);
+                destroy_drained_bid_escrow(drained_extra_base, drained_extra_quote);
             } else {
-                price_tree::level_insert_order_front(level, head_key, maker_order);
+                drained_extra_base.destroy_none();
+                drained_extra_quote.destroy_none();
             };
         };
         is_empty_now = price_tree::level_is_empty(level);
@@ -1176,16 +1188,6 @@ public fun ticket_price(t: &OrderTicket): u64 {
     t.price
 }
 
-/// Unconditional disposal — no liveness check of its own. Package-private:
-/// safe only because its sole caller, `claim_proceeds`, guarantees by
-/// construction that `book.proceeds` holds no entry for this ticket's
-/// `order_id` before calling this (it has just drained that entry via
-/// `claim_maker_balance`). Any other caller must use the guarded public
-/// `destroy_orphaned_ticket` below instead.
-public(package) fun destroy_orphaned_ticket_unchecked(ticket: OrderTicket) {
-    let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
-}
-
 /// Guarded disposal: aborts with `EWrongBook` if `ticket` wasn't minted by
 /// `book`, and with `EProceedsNotEmpty` if `book.proceeds` still holds an
 /// entry for this ticket's `order_id` — destroying the ticket in that case
@@ -1201,7 +1203,7 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 ) {
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     assert!(!linked_table::contains(&book.proceeds, ticket.order_id), EProceedsNotEmpty);
-    destroy_orphaned_ticket_unchecked(ticket);
+    let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
 }
 
 // === Order placement, cancellation, and proceeds claiming ===
@@ -1365,7 +1367,7 @@ public fun place_market_order_bid<Base, Quote>(
     max_quote_in: Option<u64>,
     min_base_out: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Coin<Quote>) {
+): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     validate_size(book, size);
@@ -1375,7 +1377,7 @@ public fun place_market_order_bid<Base, Quote>(
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees) = (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator);
-    let (matched_base, remaining_budget, _remaining_size, _stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
         match_bid(asks, proceeds, fees, taker_fee_bps, option::none(), size, budget_balance, taker, event_book_id, max_fills);
 
     if (max_quote_in.is_some()) {
@@ -1386,7 +1388,12 @@ public fun place_market_order_bid<Base, Quote>(
         assert!(balance::value(&matched_base) >= *min_base_out.borrow(), ESlippageExceeded);
     };
 
-    (coin::from_balance(matched_base, ctx), coin::from_balance(remaining_budget, ctx), payment)
+    (
+        coin::from_balance(matched_base, ctx),
+        coin::from_balance(remaining_budget, ctx),
+        payment,
+        stopped_on_max_fills_while_crossing,
+    )
 }
 
 public fun place_market_order_ask<Base, Quote>(
@@ -1397,7 +1404,7 @@ public fun place_market_order_ask<Base, Quote>(
     min_quote_out: Option<u64>,
     max_base_in: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>) {
+): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     validate_size(book, size);
@@ -1407,7 +1414,7 @@ public fun place_market_order_ask<Base, Quote>(
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees) = (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator);
-    let (matched_quote, remaining_escrow, _remaining_size, _stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, _remaining_size, stopped_on_max_fills_while_crossing) =
         match_ask(bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id, max_fills);
 
     if (max_base_in.is_some()) {
@@ -1419,7 +1426,7 @@ public fun place_market_order_ask<Base, Quote>(
     };
 
     coin::join(&mut payment, coin::from_balance(remaining_escrow, ctx));
-    (payment, coin::from_balance(matched_quote, ctx))
+    (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
 public fun swap_bid<Base, Quote>(
@@ -1660,22 +1667,25 @@ public fun update_resting_order<Base, Quote>(
 /// pay-the-caller convention, not the stored owner) — authority to claim
 /// follows `OrderTicket` possession, exactly like cancellation authority.
 ///
-/// If the order identified by `ticket` is still resting on the book, the
-/// ticket is handed back (`option::some`) so it can be used for future
-/// claims or eventual cancellation. If the order is no longer resting
-/// (fully filled and removed, or never found), nothing more can ever be
-/// claimed through this ticket, so it is destroyed and `option::none()` is
-/// returned instead.
+/// Always returns the ticket back (as a bare `OrderTicket`, never wrapped in
+/// an `Option`) — whether the underlying order is still resting or not,
+/// unconditionally. This function deliberately does NOT decide whether the
+/// ticket is still "useful"; that decision belongs to the caller, who can
+/// call `destroy_orphaned_ticket(&book, ticket)` whenever they choose (it
+/// already correctly aborts if proceeds remain unclaimed). Returning an
+/// `Option<OrderTicket>` here would force the caller to branch on
+/// unpredictable, simulation-time book state inside a PTB, where branching is
+/// not possible — any state change between simulation and execution could
+/// flip which arm is "correct," aborting the whole transaction. Always
+/// returning the ticket keeps this function safely composable in a PTB.
 public fun claim_proceeds<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     ticket: OrderTicket,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Option<OrderTicket>) {
+): (Coin<Base>, Coin<Quote>, OrderTicket) {
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     let order_id = ticket.order_id;
-    let side = ticket.side;
-    let price = ticket.price;
 
     let claimant = ctx.sender();
     let event_book_id = book.event_id;
@@ -1692,22 +1702,7 @@ public fun claim_proceeds<Base, Quote>(
         event::emit(ProceedsClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
     };
 
-    let tree: &PriceTree<PriceLevel<Base, Quote>> = if (side) &book.bids else &book.asks;
-    let leaf_opt = price_tree::find(tree, price);
-    let still_resting = if (leaf_opt.is_none()) {
-        false
-    } else {
-        let leaf_ptr = leaf_opt.destroy_some();
-        let level = price_tree::borrow(tree, leaf_ptr);
-        price_tree::level_contains_order(level, order_id)
-    };
-
-    if (still_resting) {
-        (base_coin, quote_coin, option::some(ticket))
-    } else {
-        destroy_orphaned_ticket_unchecked(ticket);
-        (base_coin, quote_coin, option::none())
-    }
+    (base_coin, quote_coin, ticket)
 }
 
 /// Admin-gated convenience/rescue function: pays out a specific order's
@@ -1836,6 +1831,11 @@ public fun maker_fee_set_fields_for_testing(e: &MakerFeeSet): (ID, u64) { (e.ord
 
 #[test_only]
 public fun event_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID { book.event_id }
+
+#[test_only]
+public fun book_version_upgraded_fields_for_testing(e: &BookVersionUpgraded): (ID, u64, u64) {
+    (e.book_id, e.from, e.to)
+}
 
 #[test_only]
 public fun fees_claimed_fields_for_testing(e: &FeesClaimed): (address, ID, u64, u64) {

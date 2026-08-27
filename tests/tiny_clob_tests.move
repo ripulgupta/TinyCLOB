@@ -134,7 +134,7 @@ public struct CapHolder has key, store {
 #[test]
 fun clob_admin_cap_store_and_discard() {
     let mut scenario = ts::begin(ADMIN);
-    let (book, cap) = new_book(&mut scenario);
+    let (mut book, cap) = new_book(&mut scenario);
     let book_id = tiny_clob::id_for_testing(&book);
 
     // Demonstrates `store`-ability directly: holds the cap as a plain
@@ -144,7 +144,16 @@ fun clob_admin_cap_store_and_discard() {
     id.delete();
 
     let cap_id = object::id(&cap);
-    tiny_clob::discard_clob_admin_cap(cap);
+
+    // The cap can now only be destroyed by consuming it inside
+    // `clob_admin_finalize` — there is no standalone discard function
+    // anymore. Run a full retire -> drain -> clob_admin_finalize sequence and
+    // confirm `ClobAdminCapDiscarded` fires from inside `clob_admin_finalize`
+    // with the correct `cap_id`/`for_book`.
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    assert!(deleted_id == book_id, 3);
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
     assert!(discarded_events.length() == 1, 0);
@@ -154,7 +163,6 @@ fun clob_admin_cap_store_and_discard() {
     assert!(event_cap_id == cap_id, 1);
     assert!(event_for_book == book_id, 2);
 
-    sui::test_utils::destroy(book);
     scenario.end();
 }
 
@@ -193,11 +201,35 @@ fun version_guard_pause_aborts_on_future_version() {
 fun version_auto_upgrades_when_stale_lower_than_current() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
+    let book_id = tiny_clob::id_for_testing(&book);
     tiny_clob::set_book_version_for_testing(&mut book, 0);
     // No explicit migration call needed — any ordinary version-guarded
-    // function transparently upgrades the book's stored version in place.
+    // function transparently upgrades the book's stored version in place,
+    // and emits a BookVersionUpgraded observability event at the moment of
+    // the bump.
     tiny_clob::clob_admin_pause_book(&cap, &mut book);
     assert!(tiny_clob::book_version_is_for_testing(&book, 1), 0);
+
+    let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
+    assert!(upgraded_events.length() == 1, 1);
+    let (ev_book_id, ev_from, ev_to) = tiny_clob::book_version_upgraded_fields_for_testing(&upgraded_events[0]);
+    assert!(ev_book_id == book_id, 2);
+    assert!(ev_from == 0, 3);
+    assert!(ev_to == 1, 4);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// A book already at `CURRENT_VERSION` must NOT emit a spurious
+/// `BookVersionUpgraded` event — the event only fires on an actual bump.
+#[test]
+fun version_already_current_emits_no_upgrade_event() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
+    assert!(upgraded_events.length() == 0, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -241,9 +273,28 @@ fun drain_step_before_retire_aborts() {
 fun finalize_before_retire_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (book, cap) = new_book(&mut scenario);
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
     sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// `clob_admin_finalize` now takes `cap` by value, but must still reject a
+// cap minted for a different book — the by-value signature change must not
+// weaken this authentication check.
+#[test]
+#[expected_failure(abort_code = 4, location = tiny_clob)] // tiny_clob::EWrongClobAdminCap
+fun finalize_rejects_wrong_cap() {
+    let mut scenario = ts::begin(ADMIN);
+    let (book1, _cap1) = new_book(&mut scenario);
+    let (mut book2, cap2) = new_book(&mut scenario);
+    tiny_clob::clob_admin_retire(&cap2, &mut book2);
+    tiny_clob::clob_admin_drain_step(&cap2, &mut book2, 10, scenario.ctx());
+
+    // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap.
+    let deleted_id = tiny_clob::clob_admin_finalize(cap2, book1);
+    sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(book2);
+    sui::test_utils::destroy(_cap1);
     scenario.end();
 }
 
@@ -261,9 +312,8 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
     tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
 
     tiny_clob::clob_admin_retire(&cap, &mut book);
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
     sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -289,7 +339,7 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
     assert!(tiny_clob::bids_size_for_testing(&book) == 0, 2);
 
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 3);
     let (deleted_order_book_id, deleted_base, deleted_quote) =
@@ -298,7 +348,6 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 40);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 41);
 
-    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -325,7 +374,7 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     tiny_clob::clob_admin_retire(&cap, &mut book);
     tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
 
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
     assert!(deleted_id == true_book_id, 1);
 
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
@@ -336,7 +385,6 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     assert!(deleted_order_book_id != deleted_id, 4);
 
     object::delete(wrapper_uid);
-    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -390,10 +438,9 @@ fun finalize_aborts_when_fee_accumulator_nonzero() {
     tiny_clob::clob_admin_retire(&cap, &mut book);
     tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
     // Fee accumulator is still nonzero (never claimed) — this aborts.
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
 
     sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -417,7 +464,7 @@ fun finalize_succeeds_after_fees_claimed() {
 
     tiny_clob::clob_admin_retire(&cap, &mut book);
     tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
-    let deleted_id = tiny_clob::clob_admin_finalize(&cap, book);
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 5);
     let (deleted_order_book_id, deleted_base, deleted_quote) =
@@ -426,7 +473,6 @@ fun finalize_succeeds_after_fees_claimed() {
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 60);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 61);
 
-    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -615,11 +661,11 @@ fun destroy_orphaned_ticket_disposes_with_no_abort() {
 // invoked directly via the `match_bid_for_testing`/`match_ask_for_testing`
 // test-only accessors. Every expected value below is computed
 // independently from the known price/size/fee-rate inputs using the fee
-// formula in `sources/tiny_clob.move` (`fee_amount`: `receive_amount *
-// rate_bps / 10_000`, floored) — not by comparing two invocations of the
+// formula in `sources/tiny_clob.move` (`fee_amount`: `ceil(receive_amount *
+// rate_bps / 10_000)`) — not by comparing two invocations of the
 // same function. Fee rates are bounded by MAX_TAKER_FEE_BPS/
 // MAX_MAKER_FEE_BPS (10/5 bps); 7/3 bps is used here, deliberately
-// non-round relative to the fixture sizes so the floor-rounding on both
+// non-round relative to the fixture sizes so the ceiling-rounding on both
 // fee legs is actually exercised.
 
 const FEE_TEST_TAKER_FEE_BPS: u64 = 7;
@@ -648,14 +694,14 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     // Taker fully filled by the larger resting ask, so fill_qty ==
     // FEE_TEST_TAKER_SIZE:
     //   quote_cost = price * fill_qty = 47_500 * 3_400 = 161_500_000
-    //   taker_fee_base = floor(fill_qty * taker_bps / 10_000)
-    //                  = floor(3_400 * 7 / 10_000) = floor(2.38) = 2
-    //   matched_base   = fill_qty - taker_fee_base = 3_400 - 2 = 3_398
-    //   maker_fee_quote = floor(quote_cost * maker_bps / 10_000)
-    //                   = floor(161_500_000 * 3 / 10_000) = 48_450
+    //   taker_fee_base = ceil(fill_qty * taker_bps / 10_000)
+    //                  = ceil(3_400 * 7 / 10_000) = ceil(2.38) = 3
+    //   matched_base   = fill_qty - taker_fee_base = 3_400 - 3 = 3_397
+    //   maker_fee_quote = ceil(quote_cost * maker_bps / 10_000)
+    //                   = ceil(161_500_000 * 3 / 10_000) = 48_450 (exact)
     //   remaining_budget = payment - quote_cost = 0 (exact full fill)
     let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
-    let expected_taker_fee_base = 2;
+    let expected_taker_fee_base = 3;
     let expected_matched_base = FEE_TEST_TAKER_SIZE - expected_taker_fee_base;
     let expected_maker_fee_quote = 48_450;
 
@@ -697,16 +743,16 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // Taker fully filled by the larger resting bid, so fill_qty ==
     // FEE_TEST_TAKER_SIZE:
     //   quote_cost = price * fill_qty = 47_500 * 3_400 = 161_500_000
-    //   taker_fee_quote = floor(quote_cost * taker_bps / 10_000)
-    //                   = floor(161_500_000 * 7 / 10_000) = 113_050
+    //   taker_fee_quote = ceil(quote_cost * taker_bps / 10_000)
+    //                   = ceil(161_500_000 * 7 / 10_000) = 113_050 (exact)
     //   matched_quote   = quote_cost - taker_fee_quote = 161_386_950
-    //   maker_fee_base = floor(fill_qty * maker_bps / 10_000)
-    //                  = floor(3_400 * 3 / 10_000) = floor(1.02) = 1
+    //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
+    //                  = ceil(3_400 * 3 / 10_000) = ceil(1.02) = 2
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
     let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
     let expected_taker_fee_quote = 113_050;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
-    let expected_maker_fee_base = 1;
+    let expected_maker_fee_base = 2;
 
     let payment = coin::mint_for_testing<BTC>(FEE_TEST_TAKER_SIZE, scenario.ctx());
     let (matched_quote, remaining_escrow, remaining_size, stopped) = tiny_clob::match_ask_for_testing(
@@ -723,6 +769,247 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     assert!(stopped == false, 3);
     assert!(fee_base_after == expected_maker_fee_base, 4);
     assert!(fee_quote_after == expected_taker_fee_quote, 5);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Fix 2: fee rounding — ceiling division closes the dust-fee exploit ===
+
+const FEE_ROUND_PRICE: u64 = 1_000;
+const FEE_ROUND_TAKER_BPS: u64 = 10; // MAX_TAKER_FEE_BPS
+const FEE_ROUND_RESTING_SIZE: u64 = 3_000;
+
+#[test]
+fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, FEE_ROUND_TAKER_BPS);
+
+    let order_id = tiny_clob::next_order_id(&mut book);
+    let escrow = balance::create_for_testing<BTC>(FEE_ROUND_RESTING_SIZE);
+    let ask = order::new<BTC, USDC>(order_id, OTHER, FEE_ROUND_RESTING_SIZE, option::some(escrow), option::none(), 0);
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FEE_ROUND_PRICE, ask, scenario.ctx());
+
+    // Fill 999 units: ceil(999 * 10 / 10_000) = ceil(0.999) = 1 — under the
+    // old floor division this collected 0 fee; the fix now collects 1.
+    let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(FEE_ROUND_PRICE, 999), scenario.ctx());
+    let (matched_base1, remaining_budget1, remaining_size1, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(FEE_ROUND_PRICE), 999, payment1, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base1);
+    coin::burn_for_testing(remaining_budget1);
+    assert!(remaining_size1 == 0, 0);
+    let (fee_base_after_1, _) = tiny_clob::fee_accumulator_balances(&book);
+    assert!(fee_base_after_1 == 1, 1);
+
+    // Fill exactly 1000 more units: ceil(1000 * 10 / 10_000) = ceil(1) = 1,
+    // an exact-division case — confirms ceiling division doesn't
+    // over-round when the division is already exact.
+    let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(FEE_ROUND_PRICE, 1000), scenario.ctx());
+    let (matched_base2, remaining_budget2, remaining_size2, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(FEE_ROUND_PRICE), 1000, payment2, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base2);
+    coin::burn_for_testing(remaining_budget2);
+    assert!(remaining_size2 == 0, 2);
+    let (fee_base_after_2, _) = tiny_clob::fee_accumulator_balances(&book);
+    assert!(fee_base_after_2 == 2, 3);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Regression test for the dust-shredding exploit: at 10 bps, a fill of 50
+/// units yields `50 * 10 / 10_000 = 0.05`. Under the old floor division this
+/// rounded to exactly 0 — a taker could split a large order into many
+/// sub-100-unit fills and pay literally zero total fee across all of them.
+/// Ceiling division closes that: each such fill now collects 1 unit, so
+/// repeating it several times collects a clearly nonzero total.
+#[test]
+fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, FEE_ROUND_TAKER_BPS);
+
+    let order_id = tiny_clob::next_order_id(&mut book);
+    let escrow = balance::create_for_testing<BTC>(FEE_ROUND_RESTING_SIZE);
+    let ask = order::new<BTC, USDC>(order_id, OTHER, FEE_ROUND_RESTING_SIZE, option::some(escrow), option::none(), 0);
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FEE_ROUND_PRICE, ask, scenario.ctx());
+
+    let dust_fill_size = 50;
+    let num_fills = 10;
+    let mut i = 0;
+    while (i < num_fills) {
+        let payment = coin::mint_for_testing<USDC>(
+            tiny_clob::bid_escrow_amount(FEE_ROUND_PRICE, dust_fill_size), scenario.ctx(),
+        );
+        let (matched_base, remaining_budget, remaining_size, _) = tiny_clob::match_bid_for_testing(
+            &mut book, option::some(FEE_ROUND_PRICE), dust_fill_size, payment, 1_000_000, scenario.ctx(),
+        );
+        coin::burn_for_testing(matched_base);
+        coin::burn_for_testing(remaining_budget);
+        assert!(remaining_size == 0, i);
+        i = i + 1;
+    };
+
+    // Under the old floor-division formula, every one of these 10 fills
+    // would have collected 0 fee, so the accumulator would still read 0
+    // here. Ceiling division collects 1 unit per fill instead.
+    let (fee_base_after, _) = tiny_clob::fee_accumulator_balances(&book);
+    assert!(fee_base_after == num_fills, 100);
+    assert!(fee_base_after > 0, 101);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Fix 4: fill-path gas — collapsed detach-mutate-reinsert into one
+// in-place mutation (`level_fill_front_order_base`/`_quote` in
+// price_tree.move). `fill_level_bid`/`fill_level_ask` now call those
+// directly instead of front -> borrow -> remove -> mutate -> (destroy |
+// reinsert); these tests exercise that path through the public matching
+// entry points and confirm behavior is unchanged. ===
+
+const FILL_INPLACE_PRICE: u64 = 25_000;
+
+/// Partial fill of the level's front order must leave it AT THE FRONT (no
+/// detach/reinsert needed since nothing left the level) — FIFO is preserved
+/// trivially. Confirmed the same way the pre-existing FIFO tests below do:
+/// drive a second, larger fill and check fill order.
+#[test]
+fun fill_in_place_partial_fill_preserves_fifo_order() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_a = tiny_clob::next_order_id(&mut book);
+    let ask_a = order::new<BTC, USDC>(
+        order_id_a, MAKER_A, 300, option::some(balance::create_for_testing<BTC>(300)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask_a, scenario.ctx());
+
+    let order_id_b = tiny_clob::next_order_id(&mut book);
+    let ask_b = order::new<BTC, USDC>(
+        order_id_b, MAKER_B, 200, option::some(balance::create_for_testing<BTC>(200)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask_b, scenario.ctx());
+
+    // Partial fill of A (front order) — must remain in place at the front.
+    let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(FILL_INPLACE_PRICE, 100), scenario.ctx());
+    let (matched_base1, remaining_budget1, remaining_size1, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 100, payment1, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base1);
+    coin::burn_for_testing(remaining_budget1);
+    assert!(remaining_size1 == 0, 0);
+    assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == 400, 1); // 200 (A left) + 200 (B)
+
+    // A large enough fill to drain the rest of A, then start on B: if A had
+    // been silently demoted behind B, the first `OrderFilled` event here
+    // would be for B instead of A.
+    let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(FILL_INPLACE_PRICE, 250), scenario.ctx());
+    let (matched_base2, remaining_budget2, remaining_size2, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 250, payment2, 1_000_000, scenario.ctx());
+    coin::burn_for_testing(matched_base2);
+    coin::burn_for_testing(remaining_budget2);
+    assert!(remaining_size2 == 0, 2);
+
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    assert!(fills.length() == 3, 3);
+    let (id_2, _, _, size_2, _, _) = tiny_clob::order_filled_fields_for_testing(&fills[1]);
+    assert!(id_2 == order_id_a, 4); // A drains first (still at the front)
+    assert!(size_2 == 200, 5);
+    let (id_3, _, _, size_3, _, _) = tiny_clob::order_filled_fields_for_testing(&fills[2]);
+    assert!(id_3 == order_id_b, 6);
+    assert!(size_3 == 50, 7);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// A fill that exactly drains the front order must pop it entirely — the
+/// level's depth must reflect its removal, and once the level itself is
+/// fully emptied it must disappear from the tree (depth_at_price -> 0).
+#[test]
+fun fill_in_place_full_drain_removes_order_and_frees_level() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id = tiny_clob::next_order_id(&mut book);
+    let ask = order::new<BTC, USDC>(
+        order_id, OTHER, 150, option::some(balance::create_for_testing<BTC>(150)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask, scenario.ctx());
+    assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == 150, 0);
+
+    let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(FILL_INPLACE_PRICE, 150), scenario.ctx());
+    let (matched_base, remaining_budget, remaining_size, _) =
+        tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 150, payment, 1_000_000, scenario.ctx());
+    assert!(coin::burn_for_testing(matched_base) == 150, 1);
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
+    assert!(remaining_size == 0, 3);
+
+    // Level is now empty and must have been removed from the tree entirely.
+    assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == 0, 4);
+    assert!(tiny_clob::best_ask(&book).is_none(), 5);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Strict, per-step regression guard against `total_size` drift: several
+/// orders at one level, a mix of partial and full fills, asserting
+/// `depth_at_price` (backed by `level_total_size`) exactly matches a
+/// brute-force running total after EVERY SINGLE fill, not just at the end.
+#[test]
+fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id_1 = tiny_clob::next_order_id(&mut book);
+    let ask_1 = order::new<BTC, USDC>(
+        order_id_1, MAKER_A, 150, option::some(balance::create_for_testing<BTC>(150)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask_1, scenario.ctx());
+
+    let order_id_2 = tiny_clob::next_order_id(&mut book);
+    let ask_2 = order::new<BTC, USDC>(
+        order_id_2, MAKER_B, 100, option::some(balance::create_for_testing<BTC>(100)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask_2, scenario.ctx());
+
+    let order_id_3 = tiny_clob::next_order_id(&mut book);
+    let ask_3 = order::new<BTC, USDC>(
+        order_id_3, MAKER_C, 200, option::some(balance::create_for_testing<BTC>(200)), option::none(), 0,
+    );
+    tiny_clob::insert_resting_order_for_testing(&mut book, false, FILL_INPLACE_PRICE, ask_3, scenario.ctx());
+
+    let mut expected_total: u64 = 150 + 100 + 200;
+    assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == expected_total, 0);
+
+    // Mixed partial/full fill sequence: 50 (partial 1), 100 (full-drain 1),
+    // 30 (partial 2), 70 (full-drain 2), 50 (partial 3), 150 (full-drain 3,
+    // which also empties and removes the level).
+    let fill_sizes = vector[50, 100, 30, 70, 50, 150];
+    let mut i = 0;
+    while (i < fill_sizes.length()) {
+        let fill_size = fill_sizes[i];
+        let payment = coin::mint_for_testing<USDC>(
+            tiny_clob::bid_escrow_amount(FILL_INPLACE_PRICE, fill_size), scenario.ctx(),
+        );
+        let (matched_base, remaining_budget, remaining_size, _) = tiny_clob::match_bid_for_testing(
+            &mut book, option::some(FILL_INPLACE_PRICE), fill_size, payment, 1_000_000, scenario.ctx(),
+        );
+        coin::burn_for_testing(matched_base);
+        coin::burn_for_testing(remaining_budget);
+        assert!(remaining_size == 0, 100 + i);
+
+        expected_total = expected_total - fill_size;
+        let actual_total = tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE);
+        assert!(actual_total == expected_total, 200 + i);
+        i = i + 1;
+    };
+
+    assert!(expected_total == 0, 1);
+    assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == 0, 2);
+    assert!(tiny_clob::best_ask(&book).is_none(), 3);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1103,7 +1390,7 @@ fun place_market_order_bid_matches_resting_ask() {
 
     let budget = tiny_clob::bid_escrow_amount(CH2_PRICE, CH2_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment) = tiny_clob::place_market_order_bid(
+    let (matched_base, remaining_budget, leftover_payment, _) = tiny_clob::place_market_order_bid(
         &mut book, CH2_SIZE, budget, bid_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == CH2_SIZE, 0);
@@ -1124,7 +1411,7 @@ fun place_market_order_ask_matches_resting_bid() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(leftover_payment) == 0, 0);
@@ -1219,7 +1506,7 @@ fun cancel_order_sweeps_combined_escrow_and_proceeds() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -1354,22 +1641,22 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
 
     // ADMIN rests a bid; OTHER crosses it fully as a market ask, crediting
     // ADMIN's order_id proceeds table entry with quote. Keep the ticket
-    // alive: it is now required to claim, and since the order will be
-    // fully filled and removed from the book, claim_proceeds is expected
-    // to consume/destroy it.
+    // alive: it is now required to claim. claim_proceeds always returns the
+    // ticket back (never an Option) — the caller decides when it's done with
+    // it, here via a follow-up destroy_orphaned_ticket call.
     let escrow_amount = tiny_clob::bid_escrow_amount(CH2_PRICE, CH2_SIZE);
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
 
     scenario.next_tx(OTHER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
     coin::burn_for_testing(matched_quote);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, ticket_opt) =
+    let (claim_base, claim_quote, returned_ticket) =
         tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
@@ -1384,10 +1671,10 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     assert!(ev_quote == 0, 4);
 
     // The order was fully filled and removed from the book, so nothing
-    // more can ever be claimed through this ticket — claim_proceeds must
-    // have destroyed it.
-    assert!(ticket_opt.is_none(), 5);
-    ticket_opt.destroy_none();
+    // more can ever be claimed through this ticket — the caller's own choice
+    // to dispose of it via destroy_orphaned_ticket must succeed with no
+    // abort (no proceeds remain pooled for this order_id).
+    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1405,7 +1692,7 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -1453,7 +1740,7 @@ fun update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push() {
     // Cross the reassigned resting bid with a market ask from a third party.
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -1499,7 +1786,7 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     // owner = ADMIN.
     scenario.next_tx(TAKER);
     let ask_payment_1 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_1, matched_quote_1) = tiny_clob::place_market_order_ask(
+    let (leftover_1, matched_quote_1, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_1, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_1);
@@ -1516,7 +1803,7 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     // existing ledger entry again.
     scenario.next_tx(TAKER);
     let ask_payment_2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_2, matched_quote_2) = tiny_clob::place_market_order_ask(
+    let (leftover_2, matched_quote_2, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_2);
@@ -1572,7 +1859,7 @@ fun update_resting_order_not_found_is_a_noop() {
     unit_test::destroy(bid_ticket);
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -1605,7 +1892,7 @@ fun push_proceeds_rejects_wrong_cap() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book1, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -1795,7 +2082,7 @@ fun place_market_order_bid_ask_happy_path() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover) = tiny_clob::place_market_order_bid(
+    let (matched_base, remaining_budget, leftover, _) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == PLACEMENT_SIZE, 0);
@@ -1805,7 +2092,7 @@ fun place_market_order_bid_ask_happy_path() {
     scenario.next_tx(TAKER);
     let bid_ticket2 = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
     let ask_payment2 = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
-    let (leftover_base, matched_quote) =
+    let (leftover_base, matched_quote, _) =
         tiny_clob::place_market_order_ask(&mut book, PLACEMENT_SIZE, ask_payment2, 10, option::none(), option::none(), scenario.ctx());
     assert!(coin::burn_for_testing(matched_quote) == tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 3);
     assert!(coin::burn_for_testing(leftover_base) == 0, 4);
@@ -1826,7 +2113,7 @@ fun place_market_order_bid_slippage_bound_aborts() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover) = tiny_clob::place_market_order_bid(
+    let (matched_base, remaining_budget, leftover, _) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::some(PLACEMENT_SIZE + 1), scenario.ctx(),
     );
     coin::burn_for_testing(matched_base);
@@ -1875,6 +2162,95 @@ fun swap_bid_ask_happy_path_and_max_fills_stop_signal() {
     scenario.end();
 }
 
+// === Fix 3: `place_market_order_bid`/`ask` now surface the max_fills
+// truncation signal, matching `swap_bid`/`swap_ask`'s existing precedent ===
+
+#[test]
+fun place_market_order_bid_returns_true_when_truncated_by_max_fills() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask_ticket = rest_ask(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let budget = tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    // max_fills = 0 against a crossing resting ask: nothing can be matched,
+    // and the truncation signal must now come back as `true`.
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+        &mut book, PLACEMENT_SIZE, budget, bid_payment, 0, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(coin::burn_for_testing(matched_base) == 0, 0);
+    assert!(coin::burn_for_testing(remaining_budget) == budget, 1);
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(stopped, 3);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun place_market_order_bid_returns_false_when_fully_filled_within_max_fills() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask_ticket = rest_ask(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let budget = tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+        &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(coin::burn_for_testing(matched_base) == PLACEMENT_SIZE, 0);
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 1);
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(!stopped, 3);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun place_market_order_ask_returns_true_when_truncated_by_max_fills() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let bid_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) = tiny_clob::place_market_order_ask(
+        &mut book, PLACEMENT_SIZE, ask_payment, 0, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(coin::burn_for_testing(leftover_base) == PLACEMENT_SIZE, 0);
+    assert!(coin::burn_for_testing(matched_quote) == 0, 1);
+    assert!(stopped, 2);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun place_market_order_ask_returns_false_when_fully_filled_within_max_fills() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let bid_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) = tiny_clob::place_market_order_ask(
+        &mut book, PLACEMENT_SIZE, ask_payment, 10, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(coin::burn_for_testing(leftover_base) == 0, 0);
+    assert!(coin::burn_for_testing(matched_quote) == tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 1);
+    assert!(!stopped, 2);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 #[test]
 #[expected_failure]
 fun swap_ask_slippage_bound_aborts() {
@@ -1912,18 +2288,18 @@ fun cancel_and_claim_never_block_on_pause_or_retiring() {
     // claim_proceeds also succeeds while retiring.
     // The order was never resting for this order_id, so use a synthetic
     // ticket (bypassing the placement path, which isn't needed here) — the
-    // claim finds nothing, and since the "order" isn't resting, the ticket
-    // is destroyed and option::none() comes back.
+    // claim finds nothing pooled, and claim_proceeds unconditionally hands
+    // the ticket back regardless of resting state; dispose of it via
+    // destroy_orphaned_ticket, which succeeds since no proceeds are pooled.
     tiny_clob::clob_admin_retire(&cap, &mut book);
     let book_id = tiny_clob::id_for_testing(&book);
     let dummy_ticket =
         tiny_clob::new_ticket_for_testing(999, book_id, tiny_clob::bid_for_testing(), PLACEMENT_PRICE);
-    let (claim_base, claim_quote, ticket_opt) =
+    let (claim_base, claim_quote, returned_ticket) =
         tiny_clob::claim_proceeds(&mut book, dummy_ticket, scenario.ctx());
     assert!(coin::burn_for_testing(claim_base) == 0, 2);
     assert!(coin::burn_for_testing(claim_quote) == 0, 3);
-    assert!(ticket_opt.is_none(), 4);
-    ticket_opt.destroy_none();
+    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1940,9 +2316,10 @@ fun claim_proceeds_transfers_maker_proceeds() {
     let bid_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
 
     scenario.next_tx(ADMIN);
-    // ask_ticket's order was fully filled by the crossing bid above, so
-    // claim_proceeds is expected to consume/destroy it.
-    let (claim_base, claim_quote, ticket_opt) =
+    // ask_ticket's order was fully filled by the crossing bid above.
+    // claim_proceeds always returns the ticket back; dispose of it via
+    // destroy_orphaned_ticket once its proceeds have been claimed.
+    let (claim_base, claim_quote, returned_ticket) =
         tiny_clob::claim_proceeds(&mut book, ask_ticket, scenario.ctx());
     let claimed = event::events_by_type<ProceedsClaimed>();
     assert!(claimed.length() == 1, 0);
@@ -1951,8 +2328,7 @@ fun claim_proceeds_transfers_maker_proceeds() {
     assert!(quote_amt == tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 2);
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
-    assert!(ticket_opt.is_none(), 3);
-    ticket_opt.destroy_none();
+    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
@@ -2035,7 +2411,7 @@ fun destroy_orphaned_ticket_with_nonzero_proceeds_aborts() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2090,20 +2466,19 @@ fun destroy_orphaned_ticket_zero_proceeds_on_own_book_disposes_cleanly() {
 }
 
 #[test]
-fun claim_proceeds_full_fill_destroys_ticket_and_clears_proceeds_entry() {
+fun claim_proceeds_always_returns_ticket_even_when_order_fully_filled() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
 
-    // Fully filling a resting bid removes it from the book, so this is the
-    // exact path that reaches the private destroy_orphaned_ticket_unchecked
-    // inside claim_proceeds: this test confirms that path's precondition —
-    // no live proceeds entry survives — actually holds afterward.
+    // Fully filling a resting bid removes it from the book. claim_proceeds
+    // must still hand back a usable OrderTicket (never an Option) — the
+    // caller decides whether/when to dispose of it.
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
     let order_id = tiny_clob::ticket_order_id(&bid_ticket);
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2111,27 +2486,26 @@ fun claim_proceeds_full_fill_destroys_ticket_and_clears_proceeds_entry() {
     assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, ticket_opt) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
-    assert!(ticket_opt.is_none(), 1); // ticket was destroyed
-    ticket_opt.destroy_none();
-    assert!(coin::burn_for_testing(claim_base) == CH2_SIZE, 2);
+    let (claim_base, claim_quote, returned_ticket) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
+    assert!(coin::burn_for_testing(claim_base) == CH2_SIZE, 1);
     coin::burn_for_testing(claim_quote);
-    // Proceeds entry gone -> the unchecked destroy's precondition held.
-    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 3);
+    // Proceeds entry gone -> destroy_orphaned_ticket must succeed with no
+    // abort on the ticket claim_proceeds handed back.
+    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 2);
+    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
 #[test]
-fun claim_proceeds_partial_fill_returns_ticket_then_guarded_destroy_succeeds() {
+fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
 
-    // A partial fill leaves the order still resting, so claim_proceeds
-    // returns the ticket instead of consuming it. That returned ticket then
-    // has zero pooled proceeds (the claim drained them), so the guarded
-    // destroy_orphaned_ticket must accept it with no abort.
+    // A partial fill leaves the order still resting. claim_proceeds returns
+    // the ticket, which must remain valid and reusable for a further claim
+    // after a second fill.
     let size = 300;
     let fill_size = 100;
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, size, 1_000_000_000, scenario.ctx());
@@ -2139,21 +2513,38 @@ fun claim_proceeds_partial_fill_returns_ticket_then_guarded_destroy_succeeds() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
     coin::burn_for_testing(matched_quote);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, ticket_opt) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
-    assert!(ticket_opt.is_some(), 0);
+    let (claim_base, claim_quote, returned_ticket) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
-    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 1);
+    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
 
-    let returned_ticket = ticket_opt.destroy_some();
-    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket); // must NOT abort
+    // Second fill against the still-resting remainder, then claim again
+    // using the SAME ticket returned above — confirms it remains usable
+    // across multiple claims.
+    scenario.next_tx(TAKER);
+    let ask_payment2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment2, matched_quote2, _) = tiny_clob::place_market_order_ask(
+        &mut book, fill_size, ask_payment2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    coin::burn_for_testing(leftover_payment2);
+    coin::burn_for_testing(matched_quote2);
+    assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id), 1);
+
+    scenario.next_tx(ADMIN);
+    let (claim_base2, claim_quote2, returned_ticket2) =
+        tiny_clob::claim_proceeds(&mut book, returned_ticket, scenario.ctx());
+    assert!(coin::burn_for_testing(claim_base2) == fill_size, 2);
+    coin::burn_for_testing(claim_quote2);
+    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 3);
+
+    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket2); // must NOT abort
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -2175,7 +2566,7 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_push() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2214,7 +2605,7 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_drain() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2271,7 +2662,7 @@ fun update_resting_order_reassign_with_no_pooled_proceeds_yet_then_fill_credits_
     // ordinary credit_maker_table path.
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2302,7 +2693,7 @@ fun update_resting_order_reassigned_twice_final_payout_goes_to_latest_owner_only
     // Fill #1 while owned by A: pools proceeds under ADMIN.
     scenario.next_tx(TAKER);
     let ask_payment_1 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_1, matched_quote_1) = tiny_clob::place_market_order_ask(
+    let (leftover_1, matched_quote_1, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_1, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_1);
@@ -2315,7 +2706,7 @@ fun update_resting_order_reassigned_twice_final_payout_goes_to_latest_owner_only
     // Fill #2 while owned by B: credits the same pooled entry again.
     scenario.next_tx(TAKER);
     let ask_payment_2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_2, matched_quote_2) = tiny_clob::place_market_order_ask(
+    let (leftover_2, matched_quote_2, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_2);
@@ -2356,7 +2747,7 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
 
     scenario.next_tx(TAKER);
     let ask_payment_1 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_1, matched_quote_1) = tiny_clob::place_market_order_ask(
+    let (leftover_1, matched_quote_1, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_1, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_1);
@@ -2367,7 +2758,7 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
 
     scenario.next_tx(TAKER);
     let ask_payment_2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_2, matched_quote_2) = tiny_clob::place_market_order_ask(
+    let (leftover_2, matched_quote_2, _) = tiny_clob::place_market_order_ask(
         &mut book, fill_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_2);
@@ -2411,7 +2802,7 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(300, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, 300, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
@@ -2456,7 +2847,7 @@ fun update_resting_order_failed_reassign_after_full_fill_does_not_sync_owner() {
 
     scenario.next_tx(TAKER);
     let ask_payment = coin::mint_for_testing<BTC>(CH2_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote) = tiny_clob::place_market_order_ask(
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
         &mut book, CH2_SIZE, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(leftover_payment);
