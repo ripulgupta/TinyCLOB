@@ -412,6 +412,437 @@ fun borrow_mut_with_internal_node_index_aborts_invalid_leaf_ptr() {
     teardown(scenario, tree);
 }
 
+// === insert_order_independence_same_key_set ===
+
+/// Crit-bit trees are query-behavior-independent of insertion order, even
+/// though internal node layout may differ. Inserts the same key set in
+/// several different orders and confirms `size`, `min_leaf`/`max_leaf`
+/// keys, and every key's `find`-ability come out identical regardless of
+/// order — added as extra confidence for Fix 1's single-descent replay
+/// (any subtle bug in the in-memory path replay would be very likely to
+/// perturb the resulting tree shape/queries for at least one of these
+/// permutations).
+#[test]
+fun insert_order_independence_same_key_set() {
+    let keys = vector[
+        5_000_000u64, 1_250_000, 9_900_000, 3_300_000, 7_000_000,
+        2_000_000, 8_800_000, 4_100_000, 6_600_000, 1_000_000,
+    ];
+
+    let orders = vector[
+        vector[0u64, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        vector[9u64, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+        vector[3u64, 0, 7, 1, 9, 2, 8, 4, 6, 5],
+        vector[5u64, 4, 6, 3, 7, 2, 8, 1, 9, 0],
+    ];
+
+    let mut o = 0;
+    while (o < orders.length()) {
+        let order = orders[o];
+        let (mut scenario, mut tree) = setup();
+
+        let mut i = 0;
+        while (i < order.length()) {
+            let idx = order[i];
+            price_tree::insert(&mut tree, keys[idx], mock(idx));
+            i = i + 1;
+        };
+
+        assert!(price_tree::size(&tree) == keys.length(), o);
+
+        // Every key is findable regardless of insertion order.
+        i = 0;
+        while (i < keys.length()) {
+            assert!(price_tree::find(&tree, keys[i]).is_some(), o);
+            i = i + 1;
+        };
+
+        // min/max are the same actual keys regardless of insertion order.
+        let min_ptr = price_tree::min_leaf(&tree).destroy_some();
+        let max_ptr = price_tree::max_leaf(&tree).destroy_some();
+        assert!(price_tree::key(&tree, min_ptr) == 1_000_000, o);
+        assert!(price_tree::key(&tree, max_ptr) == 9_900_000, o);
+
+        cleanup(&mut tree, keys);
+        teardown(scenario, tree);
+        o = o + 1;
+    };
+}
+
+// === descend_probe_and_insert_at_not_found_lands_correctly ===
+
+/// Exercises the not-found path of the `descend_probe` + `insert_at`
+/// find-or-insert pattern used by `insert_resting_order` (Fix 2), directly
+/// at the `price_tree` level: builds a multi-level tree, probes for an
+/// absent key, confirms the probe's hint does not itself match the key,
+/// completes the insertion via `insert_at`, and confirms the new key is
+/// findable afterward and the tree's invariants (size, min/max) hold.
+#[test]
+fun descend_probe_and_insert_at_not_found_lands_correctly() {
+    let (mut scenario, mut tree) = setup();
+
+    let existing = vector[2_000_000u64, 5_000_000, 9_000_000, 4_100_000, 6_600_000];
+    let mut i = 0;
+    while (i < existing.length()) {
+        price_tree::insert(&mut tree, existing[i], mock(i));
+        i = i + 1;
+    };
+
+    let new_key = 3_300_000u64;
+    let probe = price_tree::descend_probe(&tree, new_key);
+    assert!(probe.is_some(), 0);
+    let hint_ptr = probe.destroy_some();
+    assert!(price_tree::key(&tree, hint_ptr) != new_key, 1);
+
+    price_tree::insert_at(&mut tree, new_key, mock(100), hint_ptr);
+
+    assert!(price_tree::size(&tree) == existing.length() + 1, 2);
+    assert!(price_tree::find(&tree, new_key).is_some(), 3);
+
+    // Existing keys remain findable, and min/max are unaffected (new_key is
+    // strictly between the existing min and max).
+    i = 0;
+    while (i < existing.length()) {
+        assert!(price_tree::find(&tree, existing[i]).is_some(), 4);
+        i = i + 1;
+    };
+    let min_ptr = price_tree::min_leaf(&tree).destroy_some();
+    let max_ptr = price_tree::max_leaf(&tree).destroy_some();
+    assert!(price_tree::key(&tree, min_ptr) == 2_000_000, 5);
+    assert!(price_tree::key(&tree, max_ptr) == 9_000_000, 6);
+
+    let mut all_keys = existing;
+    all_keys.push_back(new_key);
+    cleanup(&mut tree, all_keys);
+    teardown(scenario, tree);
+}
+
+// === order_independence_full_drain_across_orderings_and_entry_points ===
+
+/// LCG-based distinct-key generator (rejects duplicates by linear scan).
+fun gen_distinct_keys(n: u64, seed: u64, span: u64): vector<u64> {
+    let mut out: vector<u64> = vector[];
+    let mut s = seed as u128;
+    let m = 0xFFFFFFFFFFFFFFFFu128;
+    while (out.length() < n) {
+        s = ((s * 6364136223846793005) + 1442695040888963407) & m;
+        let k = (((s >> 13) as u64) % span);
+        if (!out.contains(&k)) { out.push_back(k); };
+    };
+    out
+}
+
+/// Reorders `keys` per `kind`: `0` = ascending, `1` = descending, anything
+/// else = a stride-`kind` shuffle over the original order.
+fun reorder_keys(keys: &vector<u64>, kind: u64): vector<u64> {
+    let n = keys.length();
+    let mut out: vector<u64> = vector[];
+    if (kind == 0) {
+        let mut sorted = *keys;
+        let mut a = 0;
+        while (a < n) {
+            let mut b = a + 1;
+            while (b < n) {
+                if (sorted[b] < sorted[a]) { sorted.swap(a, b); };
+                b = b + 1;
+            };
+            a = a + 1;
+        };
+        out = sorted;
+    } else if (kind == 1) {
+        let mut sorted = *keys;
+        let mut a = 0;
+        while (a < n) {
+            let mut b = a + 1;
+            while (b < n) {
+                if (sorted[b] > sorted[a]) { sorted.swap(a, b); };
+                b = b + 1;
+            };
+            a = a + 1;
+        };
+        out = sorted;
+    } else {
+        let stride = kind;
+        let mut idx = 0;
+        let mut count = 0;
+        let mut seen: vector<u64> = vector[];
+        while (count < n) {
+            if (!seen.contains(&idx)) {
+                seen.push_back(idx);
+                out.push_back(keys[idx]);
+                count = count + 1;
+            };
+            idx = (idx + stride) % n;
+            if (seen.contains(&idx) && count < n) {
+                let mut j = 0;
+                while (j < n && seen.contains(&j)) { j = j + 1; };
+                if (j < n) { idx = j; };
+            };
+        };
+    };
+    out
+}
+
+/// Inserts `keys` via the `descend_probe` + `insert_at` find-or-insert
+/// pattern used by `insert_resting_order` (Fix 2), instead of plain
+/// `insert`.
+fun insert_via_probe(tree: &mut PriceTree<MockLevel>, keys: &vector<u64>) {
+    let mut i = 0;
+    while (i < keys.length()) {
+        let k = keys[i];
+        let probe = price_tree::descend_probe(tree, k);
+        if (probe.is_some()) {
+            let hint = probe.destroy_some();
+            price_tree::insert_at(tree, k, mock(i), hint);
+        } else {
+            probe.destroy_none();
+            price_tree::insert(tree, k, mock(i));
+        };
+        i = i + 1;
+    };
+}
+
+/// Confirms every key in `keys` is present with the right size, then fully
+/// drains the tree ascending via `min_leaf` + `remove`, checking structural
+/// integrity (sortedness, size, `max_leaf` staying correct) at every step —
+/// this exercises parent/child rewiring on every removal, so any structural
+/// corruption from insertion tends to surface here.
+fun assert_full_ascending_drain(tree: &mut PriceTree<MockLevel>, keys: &vector<u64>) {
+    let n = keys.length();
+    assert!(price_tree::size(tree) == n, 0);
+
+    let mut i = 0;
+    while (i < n) {
+        assert!(price_tree::find(tree, keys[i]).is_some(), 1);
+        i = i + 1;
+    };
+
+    let mut hi = keys[0];
+    i = 1;
+    while (i < n) {
+        if (keys[i] > hi) { hi = keys[i] };
+        i = i + 1;
+    };
+
+    let mut prev = 0;
+    let mut first = true;
+    let mut remaining = n;
+    while (remaining > 0) {
+        let mp = price_tree::min_leaf(tree).destroy_some();
+        let k = price_tree::key(tree, mp);
+        if (!first) { assert!(k > prev, 2); };
+        assert!(keys.contains(&k), 3);
+        assert!(price_tree::key(tree, price_tree::max_leaf(tree).destroy_some()) == hi, 4);
+        let _v = price_tree::remove(tree, mp);
+        prev = k;
+        first = false;
+        remaining = remaining - 1;
+        assert!(price_tree::size(tree) == remaining, 5);
+    };
+    assert!(price_tree::min_leaf(tree).is_none(), 6);
+    assert!(price_tree::max_leaf(tree).is_none(), 7);
+}
+
+/// Strengthens `insert_order_independence_same_key_set` above: inserts the
+/// same 60-key set in 7 different orderings (ascending, descending, and 5
+/// stride shuffles), through both insertion entry points (`insert` and the
+/// `descend_probe` + `insert_at` pattern), and fully drains ascending after
+/// each build — checking structural integrity throughout rather than only
+/// at the end.
+#[test]
+fun order_independence_full_drain_across_orderings_and_entry_points() {
+    let base = gen_distinct_keys(60, 77777, 5_000_000);
+    let kinds = vector[0u64, 1, 2, 3, 7, 11, 13];
+    let mut c = 0;
+    while (c < kinds.length()) {
+        let order = reorder_keys(&base, kinds[c]);
+        assert!(order.length() == base.length(), 8);
+
+        let (scenario, mut tree) = setup();
+        let mut i = 0;
+        while (i < order.length()) {
+            price_tree::insert(&mut tree, order[i], mock(i));
+            i = i + 1;
+        };
+        assert_full_ascending_drain(&mut tree, &base);
+        teardown(scenario, tree);
+
+        // Same permutation, through the probe/insert_at path.
+        let (scenario2, mut tree2) = setup();
+        insert_via_probe(&mut tree2, &order);
+        assert_full_ascending_drain(&mut tree2, &base);
+        teardown(scenario2, tree2);
+
+        c = c + 1;
+    };
+}
+
+// === Insertion stress and differential tests (plain `insert` vs
+// === `descend_probe` + `insert_at`) ===
+//
+// These strengthen `insert_order_independence_same_key_set` and
+// `order_independence_full_drain_across_orderings_and_entry_points` above
+// with a deterministic pseudo-random (xorshift-style) key generator
+// independent of the LCG-based `gen_distinct_keys` used elsewhere, plus a
+// direct differential comparison between the two insertion entry points and
+// a combined insert/remove churn test.
+
+// === insert_bulk_random_matches_sorted_reference ===
+
+/// Bulk pseudo-random `insert` across several seeds: every key findable,
+/// size correct, min/max correct, and a full ascending drain matches an
+/// independently computed sorted reference.
+#[test]
+fun insert_bulk_random_matches_sorted_reference() {
+    let mut seed = 1;
+    while (seed <= 6) {
+        let (scenario, mut tree) = setup();
+        let keys = prng_keys(120, seed * 7919);
+        let mut i = 0;
+        while (i < keys.length()) {
+            price_tree::insert(&mut tree, keys[i], mock(keys[i]));
+            i = i + 1;
+        };
+        assert!(price_tree::size(&tree) == keys.length(), 0);
+
+        // Every inserted key must be findable at a leaf carrying that key.
+        let mut j = 0;
+        while (j < keys.length()) {
+            let ptr = price_tree::find(&tree, keys[j]).destroy_some();
+            assert!(price_tree::key(&tree, ptr) == keys[j], 1);
+            j = j + 1;
+        };
+
+        let want = sorted(&keys);
+        assert!(price_tree::key(&tree, price_tree::min_leaf(&tree).destroy_some()) == want[0], 2);
+        assert!(
+            price_tree::key(&tree, price_tree::max_leaf(&tree).destroy_some())
+                == want[want.length() - 1],
+            3,
+        );
+
+        let got = drain_ascending(&mut tree);
+        assert!(got == want, 4);
+        teardown(scenario, tree);
+        seed = seed + 1;
+    };
+}
+
+// === insert_via_probe_matches_plain_insert_differential ===
+
+/// Differential test: the same bulk pseudo-random workload driven through
+/// `descend_probe` + `insert_at` (the find-or-insert pattern
+/// `insert_resting_order` uses) must produce a tree indistinguishable, by
+/// full ascending drain, from one built purely with plain `insert` on the
+/// identical key set.
+#[test]
+fun insert_via_probe_matches_plain_insert_differential() {
+    let mut seed = 1;
+    while (seed <= 3) {
+        let keys = prng_keys(60, seed * 104729);
+
+        // Reference tree, built with plain `insert`.
+        let (scenario1, mut ref_tree) = setup();
+        let mut i = 0;
+        while (i < keys.length()) {
+            price_tree::insert(&mut ref_tree, keys[i], mock(keys[i]));
+            i = i + 1;
+        };
+        let ref_drain = drain_ascending(&mut ref_tree);
+        teardown(scenario1, ref_tree);
+
+        // Subject tree, built exactly the way `insert_resting_order` does.
+        let (scenario2, mut tree) = setup();
+        let mut j = 0;
+        while (j < keys.length()) {
+            let k = keys[j];
+            let probe = price_tree::descend_probe(&tree, k);
+            if (probe.is_some()) {
+                let hint = probe.destroy_some();
+                assert!(price_tree::key(&tree, hint) != k, 0); // all keys distinct
+                price_tree::insert_at(&mut tree, k, mock(k), hint);
+            } else {
+                probe.destroy_none();
+                price_tree::insert(&mut tree, k, mock(k));
+            };
+            j = j + 1;
+        };
+        assert!(price_tree::size(&tree) == keys.length(), 1);
+        let got = drain_ascending(&mut tree);
+        assert!(got == ref_drain, 2);
+        teardown(scenario2, tree);
+        seed = seed + 1;
+    };
+}
+
+// === mixed_insert_paths_with_removals_stay_consistent ===
+
+/// Interleaves both insertion entry points with periodic removals of the
+/// current minimum, tracking an in-memory `live` model alongside the tree
+/// and checking size and full sortedness at every step — the combined
+/// insert/insert_at/remove churn that neither of the two tests above
+/// exercises in isolation.
+#[test]
+fun mixed_insert_paths_with_removals_stay_consistent() {
+    let (scenario, mut tree) = setup();
+    let keys = prng_keys(90, 424_242);
+    let mut live: vector<u64> = vector[];
+
+    let mut i = 0;
+    while (i < keys.length()) {
+        let k = keys[i];
+        // Alternate between the two insertion entry points.
+        if (i % 2 == 0) {
+            price_tree::insert(&mut tree, k, mock(k));
+        } else {
+            let probe = price_tree::descend_probe(&tree, k);
+            if (probe.is_some()) {
+                let hint = probe.destroy_some();
+                price_tree::insert_at(&mut tree, k, mock(k), hint);
+            } else {
+                probe.destroy_none();
+                price_tree::insert(&mut tree, k, mock(k));
+            };
+        };
+        live.push_back(k);
+
+        // Every third step, remove the current minimum.
+        if (i % 3 == 2) {
+            let ptr = price_tree::min_leaf(&tree).destroy_some();
+            let mk = price_tree::key(&tree, ptr);
+            let MockLevel { orders: _ } = price_tree::remove(&mut tree, ptr);
+            let (found, idx) = live.index_of(&mk);
+            assert!(found, 0);
+            live.remove(idx);
+        };
+        assert!(price_tree::size(&tree) == live.length(), 1);
+        i = i + 1;
+    };
+
+    let got = drain_ascending(&mut tree);
+    assert!(got == sorted(&live), 2);
+    teardown(scenario, tree);
+}
+
+// === insert_at_rejects_non_leaf_hint_pointer ===
+
+/// `insert_at` must reject a hint pointer that addresses an internal node
+/// rather than a leaf (`EInvalidHintPtr`) — the `insert_at`-specific
+/// counterpart to the `EInvalidLeafPtr` guard tests above, which cover
+/// `borrow`/`remove`/`key`/`borrow_mut` but not `insert_at`'s separate hint
+/// validation.
+#[test]
+#[expected_failure(abort_code = price_tree::EInvalidHintPtr, location = tiny_clob::price_tree)]
+fun insert_at_rejects_non_leaf_hint_pointer() {
+    let (scenario, mut tree) = setup();
+    price_tree::insert(&mut tree, 100, mock(100));
+    price_tree::insert(&mut tree, 200, mock(200));
+    // 0 is an internal-node index, not a leaf pointer.
+    price_tree::insert_at(&mut tree, 300, mock(300), 0);
+    cleanup(&mut tree, vector[100, 200, 300]);
+    teardown(scenario, tree);
+}
+
 // === test helpers ===
 
 fun setup(): (ts::Scenario, PriceTree<MockLevel>) {
@@ -432,4 +863,51 @@ fun cleanup(tree: &mut PriceTree<MockLevel>, keys: vector<u64>) {
         let _v = price_tree::remove(tree, ptr);
         i = i + 1;
     };
+}
+
+/// Insertion-sort a copy of `v` ascending (reference implementation used by
+/// the stress/differential tests above).
+fun sorted(v: &vector<u64>): vector<u64> {
+    let mut out: vector<u64> = vector[];
+    let mut i = 0;
+    while (i < v.length()) {
+        let x = v[i];
+        let mut j = 0;
+        while (j < out.length() && out[j] < x) { j = j + 1; };
+        out.insert(x, j);
+        i = i + 1;
+    };
+    out
+}
+
+/// Deterministic pseudo-random key stream (xorshift-ish), deliberately
+/// independent of `gen_distinct_keys`'s LCG so the stress tests above don't
+/// share any accidental structure with the ordering tests they strengthen.
+fun prng_keys(n: u64, seed: u64): vector<u64> {
+    let mut out: vector<u64> = vector[];
+    let mut x = seed;
+    let mut i = 0;
+    while (i < n) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        let k = x % 1_000_000;
+        if (!out.contains(&k)) { out.push_back(k); };
+        i = i + 1;
+    };
+    out
+}
+
+/// Drains the whole tree via repeated `min_leaf` + `remove`, returning the
+/// keys in the order the tree yielded them.
+fun drain_ascending(tree: &mut PriceTree<MockLevel>): vector<u64> {
+    let mut out: vector<u64> = vector[];
+    loop {
+        let m = price_tree::min_leaf(tree);
+        if (m.is_none()) { m.destroy_none(); break };
+        let ptr = m.destroy_some();
+        out.push_back(price_tree::key(tree, ptr));
+        let MockLevel { orders: _ } = price_tree::remove(tree, ptr);
+    };
+    out
 }

@@ -4,6 +4,11 @@
 /// order placement, cancellation, matching, maker-fee proceeds tracking,
 /// clob-admin-gated fee/pause controls, and a clob_admin_retire/drain/clob_admin_finalize
 /// deletion lifecycle.
+///
+/// `price` throughout this module is quote-atoms per base-atom, not a
+/// human-readable decimal ratio; see `place_limit_order_bid`'s doc comment
+/// for the resulting granularity constraint on pairs where
+/// `quote_decimals < base_decimals`.
 module tiny_clob::tiny_clob;
 
 use sui::balance::{Self, Balance};
@@ -33,6 +38,7 @@ const EBookPaused: u64 = 15;
 const EWrongBook: u64 = 16;
 const ESlippageExceeded: u64 = 17;
 const EBookRetiring: u64 = 18;
+const EProceedsNotEmpty: u64 = 19;
 
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
@@ -101,6 +107,22 @@ public(package) fun credit_maker_table<Base, Quote>(
     mb.owner = owner;
     mb.base.join(base);
     mb.quote.join(quote);
+}
+
+/// If `proceeds` already holds a pooled `MakerBalance` entry for `order_id`,
+/// re-stamps its payout `owner` in place. A no-op when no such entry exists
+/// yet — a later `credit_maker_table` call will stamp the correct owner at
+/// credit time in that case. Used by `update_resting_order` to keep an
+/// already-pooled proceeds balance's payout destination in sync with a
+/// reassigned order owner.
+public(package) fun sync_maker_balance_owner<Base, Quote>(
+    proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
+    order_id: u64,
+    new_owner: address,
+) {
+    if (linked_table::contains(proceeds, order_id)) {
+        linked_table::borrow_mut(proceeds, order_id).owner = new_owner;
+    };
 }
 
 public(package) fun destroy_maker_balance<Base, Quote>(
@@ -759,7 +781,10 @@ public struct OrderFilled has copy, drop {
 
 /// `price * size`, computed via a `u128` intermediate and abort-checked
 /// before narrowing back to `u64` — never silently wraps. `size` is always
-/// `Base`-atomic-units; a bid's escrow is this amount of `Quote`.
+/// `Base`-atomic-units; a bid's escrow is this amount of `Quote`. Like every
+/// `price` in this module, `price` here is quote-atoms per base-atom, not a
+/// human-readable quote-per-base decimal ratio; see `place_limit_order_bid`'s
+/// doc comment for the granularity caveat when `quote_decimals < base_decimals`.
 public fun bid_escrow_amount(price: u64, size: u64): u64 {
     checked_mul_u64(price, size)
 }
@@ -818,13 +843,23 @@ fun insert_resting_order<Base, Quote>(
     let order_id = order::id(&order);
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
-    let existing = price_tree::find(tree, price);
-    if (existing.is_some()) {
-        let leaf_ptr = existing.destroy_some();
-        let level = price_tree::borrow_mut(tree, leaf_ptr);
-        price_tree::level_insert_order(level, order_id, order);
+    let probe = price_tree::descend_probe(tree, price);
+    if (probe.is_some()) {
+        let hint_ptr = probe.destroy_some();
+        if (price_tree::key(tree, hint_ptr) == price) {
+            // Found — insert into the existing level, no further tree traversal.
+            let level = price_tree::borrow_mut(tree, hint_ptr);
+            price_tree::level_insert_order(level, order_id, order);
+        } else {
+            // Not found — `hint_ptr` is the nearest leaf; complete the
+            // insertion from it directly, no second descent.
+            let mut level = price_tree::new_price_level<Base, Quote>(ctx);
+            price_tree::level_insert_order(&mut level, order_id, order);
+            price_tree::insert_at(tree, price, level, hint_ptr);
+        };
     } else {
-        existing.destroy_none();
+        // Empty tree.
+        probe.destroy_none();
         let mut level = price_tree::new_price_level<Base, Quote>(ctx);
         price_tree::level_insert_order(&mut level, order_id, order);
         price_tree::insert(tree, price, level);
@@ -1141,10 +1176,32 @@ public fun ticket_price(t: &OrderTicket): u64 {
     t.price
 }
 
-/// Unconditional disposal — no liveness check of its own; callers that need
-/// to validate a ticket before dropping it must do so before calling this.
-public fun destroy_orphaned_ticket(ticket: OrderTicket) {
+/// Unconditional disposal — no liveness check of its own. Package-private:
+/// safe only because its sole caller, `claim_proceeds`, guarantees by
+/// construction that `book.proceeds` holds no entry for this ticket's
+/// `order_id` before calling this (it has just drained that entry via
+/// `claim_maker_balance`). Any other caller must use the guarded public
+/// `destroy_orphaned_ticket` below instead.
+public(package) fun destroy_orphaned_ticket_unchecked(ticket: OrderTicket) {
     let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
+}
+
+/// Guarded disposal: aborts with `EWrongBook` if `ticket` wasn't minted by
+/// `book`, and with `EProceedsNotEmpty` if `book.proceeds` still holds an
+/// entry for this ticket's `order_id` — destroying the ticket in that case
+/// would permanently strand those pooled funds, since nothing else can ever
+/// reference that `order_id` again. Deliberately does NOT check whether the
+/// order is still resting: destroying a ticket for a still-resting order
+/// with zero pooled proceeds is a legitimate caller choice (e.g. abandoning
+/// a dust order); the only actual safety invariant is "would this strand
+/// funds."
+public fun destroy_orphaned_ticket<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    ticket: OrderTicket,
+) {
+    assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
+    assert!(!linked_table::contains(&book.proceeds, ticket.order_id), EProceedsNotEmpty);
+    destroy_orphaned_ticket_unchecked(ticket);
 }
 
 // === Order placement, cancellation, and proceeds claiming ===
@@ -1165,6 +1222,14 @@ public struct ProceedsClaimed has copy, drop {
     quote_amount: u64,
 }
 
+/// `price` is quote-atoms per base-atom (e.g. atomic USDC per atomic SUI),
+/// never a human-readable quote-per-base decimal ratio. When
+/// `quote_decimals < base_decimals`, the smallest expressible `price` is
+/// `10^(base_decimals - quote_decimals)` quote-atoms per base-atom; if that
+/// granularity is coarser than the pair's economically meaningful price
+/// resolution, this book cannot usefully quote it. Integrators should either
+/// reject such pairs at wrapper-construction time or pre-scale `price`/`size`
+/// themselves before calling in. See the `OrderBook` struct doc comment.
 public fun place_limit_order_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     price: u64,
@@ -1229,6 +1294,9 @@ public fun place_limit_order_bid<Base, Quote>(
     (ticket, coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
 }
 
+/// `price` is quote-atoms per base-atom, not a human-readable quote-per-base
+/// decimal ratio; see `place_limit_order_bid`'s doc comment for the full
+/// note on price granularity when `quote_decimals < base_decimals`.
 public fun place_limit_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     price: u64,
@@ -1533,14 +1601,27 @@ public fun cancel_order<Base, Quote>(
 /// it with the same care as `push_proceeds`. Proceeds are pooled per
 /// `order_id` in a single maker-table ledger entry, and `credit_maker_table`
 /// re-stamps that entry's payout `owner` on every credit, not just the
-/// first. That means this function's reassignment reaches the order's
-/// *entire* currently-pooled unclaimed proceeds balance for that
+/// first. This function also immediately and unconditionally syncs the
+/// `owner` of any already-pooled `MakerBalance` entry for this `order_id`
+/// (via `sync_maker_balance_owner`) at the moment of reassignment — not
+/// merely on a future fill. That means this function's reassignment reaches
+/// the order's *entire* currently-pooled unclaimed proceeds balance for that
 /// `order_id` — both proceeds already credited before the reassignment and
-/// any credited afterward — not merely future ones: whoever ends up
-/// stamped as of the order's most recent fill is who `push_proceeds` /
-/// `drain_proceeds` pays for the whole pool. This is intentional, since
-/// it remains the ticket holder's own choice about their own order's
-/// funds.
+/// any credited afterward — immediately, whether or not the order is ever
+/// filled again: `push_proceeds` / `drain_proceeds` always pay whoever is
+/// currently stamped as owner, which this function keeps current. This is
+/// intentional, since it remains the ticket holder's own choice about their
+/// own order's funds.
+///
+/// Note: a bare `transfer::public_transfer` of the `OrderTicket` object
+/// itself (bypassing this function) cannot be observed or synced by any
+/// on-chain code — `OrderTicket` has no `key` ability and is never an owned
+/// object in the usual sense, but if a wrapping integrator type does make
+/// ticket custody transferable outside of calling this function, this
+/// module has no way to know. `push_proceeds`/`drain_proceeds` therefore
+/// remain a best-effort payout to the last address recorded via
+/// `update_resting_order`, not a guarantee of payment to the ticket's true
+/// current holder if custody changed by other means.
 public fun update_resting_order<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     ticket: &OrderTicket,
@@ -1558,12 +1639,19 @@ public fun update_resting_order<Base, Quote>(
         return false
     };
     let leaf_ptr = leaf_opt.destroy_some();
-    let level = price_tree::borrow_mut(tree, leaf_ptr);
-    if (!price_tree::level_contains_order(level, order_id)) {
-        return false
+    let found = {
+        let level = price_tree::borrow_mut(tree, leaf_ptr);
+        if (!price_tree::level_contains_order(level, order_id)) {
+            false
+        } else {
+            price_tree::level_set_order_owner(level, order_id, new_owner);
+            true
+        }
     };
-    price_tree::level_set_order_owner(level, order_id, new_owner);
-    true
+    if (found) {
+        sync_maker_balance_owner(&mut book.proceeds, order_id, new_owner);
+    };
+    found
 }
 
 /// Ticket-gated: any accumulated proceeds for `ticket`'s `order_id` are paid
@@ -1617,7 +1705,7 @@ public fun claim_proceeds<Base, Quote>(
     if (still_resting) {
         (base_coin, quote_coin, option::some(ticket))
     } else {
-        destroy_orphaned_ticket(ticket);
+        destroy_orphaned_ticket_unchecked(ticket);
         (base_coin, quote_coin, option::none())
     }
 }

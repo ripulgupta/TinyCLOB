@@ -34,6 +34,13 @@ const EInvalidLeafPtr: u64 = 2;
 /// silently discarding the evidence.
 const EPriceLevelNotEmpty: u64 = 3;
 
+/// `insert_at` was called with a `hint_ptr` that is not leaf-shaped (i.e.
+/// `< PARTITION_INDEX`). `hint_ptr` must be a leaf pointer returned by an
+/// immediately-preceding `descend_probe` call on the same `key` (see
+/// `insert_at`'s doc comment) — this guard catches a caller passing garbage
+/// or a non-leaf pointer instead of that contract being violated silently.
+const EInvalidHintPtr: u64 = 4;
+
 // === Constants (Pointer encoding + sentinels) ===
 
 /// Values `>= PARTITION_INDEX` address a leaf (see `leaf_index_of`);
@@ -291,7 +298,12 @@ fun descend_extreme<V: store>(tree: &PriceTree<V>, start_ptr: u64, want_min: boo
 /// already present — a second order resting at an already-present price
 /// must be applied via `find` + `borrow_mut`, not a second `insert`.
 ///
-/// Cost: O(log distinct_price_count) `Table` reads/writes.
+/// Cost: a single root-to-leaf descent (O(log distinct_price_count) `Table`
+/// reads), plus O(log distinct_price_count) `Table` writes. The
+/// insertion-point search that used to be a second independent root-to-leaf
+/// descent is now replayed from an in-memory record of the first descent's
+/// path instead of touching `Table` again — see the comments below for why
+/// that replay is always exactly a prefix of the first descent's path.
 public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     if (tree.root == EMPTY_TREE) {
         let leaf_idx = tree.next_leaf_index;
@@ -304,7 +316,25 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
         return
     };
 
-    let closest_ptr = descend_to_leaf(tree, key);
+    // Single descent: record every internal node visited (ptr + mask) so
+    // the insertion-point search below can replay it from memory instead
+    // of touching `tree.internal_nodes` a second time. Correct because both
+    // this descent and the (replaced) insertion-point search descend using
+    // the exact same rule (`key & node.mask == 0 ? left : right`) on the
+    // exact same `key` — so the insertion-point search's path is always
+    // exactly a prefix of this descent's path, by construction, regardless
+    // of any ordering relationship between `new_mask` and the masks on the
+    // path.
+    let mut path_ptrs: vector<u64> = vector[];
+    let mut path_masks: vector<u64> = vector[];
+    let mut ptr = tree.root;
+    while (!is_leaf_ptr(ptr)) {
+        let node = table::borrow(&tree.internal_nodes, ptr);
+        path_ptrs.push_back(ptr);
+        path_masks.push_back(node.mask);
+        ptr = if (key & node.mask == 0) node.left else node.right;
+    };
+    let closest_ptr = ptr;
     let closest_leaf_idx = leaf_index_of(closest_ptr);
     let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
     assert!(closest_key != key, EKeyAlreadyExists);
@@ -312,9 +342,109 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     let xor = closest_key ^ key;
     let new_mask = highest_set_bit_mask(xor);
 
-    // Re-descend, stopping where the existing node's mask is lower than
+    // Replay the recorded path in memory — no further `Table` reads —
+    // reproducing exactly the original loop's semantics: for each
+    // recorded node (in order), if its mask < new_mask, stop with
+    // current_ptr = that node's own ptr and parent_ptr unchanged from the
+    // previous iteration; otherwise advance parent_ptr to this node and
+    // current_ptr to the NEXT recorded node (or closest_ptr, if this was
+    // the last recorded node — i.e. the descent reached a leaf).
+    let mut parent_ptr = NO_PARENT;
+    let mut current_ptr = tree.root;
+    let n = path_ptrs.length();
+    let mut i = 0;
+    while (i < n) {
+        let node_mask = path_masks[i];
+        if (node_mask < new_mask) {
+            current_ptr = path_ptrs[i];
+            break
+        };
+        parent_ptr = path_ptrs[i];
+        current_ptr = if (i + 1 < n) path_ptrs[i + 1] else closest_ptr;
+        i = i + 1;
+    };
+
+    let leaf_idx = tree.next_leaf_index;
+    tree.next_leaf_index = leaf_idx + 1;
+    let leaf_ptr = encode_leaf_ptr(leaf_idx);
+
+    let internal_idx = tree.next_internal_index;
+    tree.next_internal_index = internal_idx + 1;
+
+    let (left, right) = if (key & new_mask == 0) {
+        (leaf_ptr, current_ptr)
+    } else {
+        (current_ptr, leaf_ptr)
+    };
+    table::add(
+        &mut tree.internal_nodes,
+        internal_idx,
+        InternalNode { mask: new_mask, left, right, parent: parent_ptr },
+    );
+    table::add(&mut tree.leaves, leaf_idx, Leaf { key, value, parent: internal_idx });
+
+    set_parent(tree, current_ptr, internal_idx);
+
+    if (parent_ptr == NO_PARENT) {
+        tree.root = internal_idx;
+    } else {
+        let gp = table::borrow_mut(&mut tree.internal_nodes, parent_ptr);
+        if (gp.left == current_ptr) {
+            gp.left = internal_idx;
+        } else {
+            gp.right = internal_idx;
+        };
+    };
+
+    let min_key = table::borrow(&tree.leaves, leaf_index_of(tree.min_leaf)).key;
+    if (key < min_key) {
+        tree.min_leaf = leaf_ptr;
+    };
+    let max_key = table::borrow(&tree.leaves, leaf_index_of(tree.max_leaf)).key;
+    if (key > max_key) {
+        tree.max_leaf = leaf_ptr;
+    };
+}
+
+/// Like `insert`, but skips the descent-to-leaf phase entirely and uses
+/// `hint_ptr` directly as the "closest leaf" that phase would have found.
+///
+/// Contract: `hint_ptr` MUST be the result of an immediately-preceding
+/// `descend_probe(tree, key)` call on this exact `key`, with NO intervening
+/// mutation to `tree` between the two calls — passing a stale or unrelated
+/// `hint_ptr` will corrupt the tree's structure. Since `descend_probe`
+/// already returns `option::none()` for an empty tree, `hint_ptr` can never
+/// legitimately come from an empty tree, so this function assumes
+/// `tree.root != EMPTY_TREE` and does not handle that case itself — callers
+/// must branch to plain `insert` when `descend_probe` returns `None`. This
+/// is a `public(package)` function, so this trust contract is scoped to
+/// callers within this package (i.e. `tiny_clob.move`), not arbitrary
+/// external code.
+///
+/// Cost: unlike `insert`, this does NOT get Fix 1's in-memory-replay
+/// optimization for its insertion-point search — since it skipped the
+/// descent that would have recorded the path, that search still walks from
+/// `tree.root` via `Table` reads, exactly like the original (pre-Fix-1)
+/// `insert`'s second phase. This is still a net win when paired with
+/// `descend_probe`: `descend_probe` + `insert_at` together touch the tree
+/// only twice (one descent + one insertion-point search), versus the old
+/// `find` + `insert` pattern's three touches (one descent inside `find`,
+/// discarded on a miss, plus `insert`'s own two descents).
+public(package) fun insert_at<V: store>(tree: &mut PriceTree<V>, key: u64, value: V, hint_ptr: u64) {
+    assert!(is_leaf_ptr(hint_ptr), EInvalidHintPtr);
+    let closest_ptr = hint_ptr;
+    let closest_leaf_idx = leaf_index_of(closest_ptr);
+    let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
+    assert!(closest_key != key, EKeyAlreadyExists);
+
+    let xor = closest_key ^ key;
+    let new_mask = highest_set_bit_mask(xor);
+
+    // Walk from root, stopping where the existing node's mask is lower than
     // `new_mask` — masks strictly decrease root-to-leaf, so this finds the
-    // correct insertion point for the new critical bit.
+    // correct insertion point for the new critical bit. Unlike `insert`,
+    // there is no recorded path to replay here (see doc comment above), so
+    // this still touches `tree.internal_nodes` via `Table` reads.
     let mut parent_ptr = NO_PARENT;
     let mut current_ptr = tree.root;
     while (!is_leaf_ptr(current_ptr)) {
@@ -364,6 +494,25 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     if (key > max_key) {
         tree.max_leaf = leaf_ptr;
     };
+}
+
+/// Descends from the root to the leaf `key` would be found at, or nearest
+/// to if absent. Returns `option::none()` if the tree is empty (mirrors
+/// `find`'s own `EMPTY_TREE` handling, without calling `descend_to_leaf` at
+/// all), or `option::some(ptr)` otherwise. The caller must independently
+/// check `key(tree, ptr) == key` (via the public `key` accessor) to know
+/// whether this was an exact hit — this function itself makes no such
+/// comparison.
+///
+/// Intended for pairing with `insert_at`: a caller that gets `None` back
+/// knows the tree is empty and can go straight to `insert`; a caller that
+/// gets `Some(ptr)` and finds `key(tree, ptr) != key` can pass `ptr` as
+/// `insert_at`'s `hint_ptr` to complete the insertion without re-descending.
+public(package) fun descend_probe<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
+    if (tree.root == EMPTY_TREE) {
+        return option::none()
+    };
+    option::some(descend_to_leaf(tree, key))
 }
 
 /// Removes and returns the leaf's value. `leaf_ptr` is a leaf pointer as
