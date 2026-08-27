@@ -571,10 +571,8 @@ public fun clob_admin_claim_fees<Base, Quote>(
     let base_amount = balance::value(&base);
     let quote_amount = balance::value(&quote);
 
-    let base_coin = if (base_amount == 0) { balance::destroy_zero(base); coin::zero(ctx) }
-        else { coin::from_balance(base, ctx) };
-    let quote_coin = if (quote_amount == 0) { balance::destroy_zero(quote); coin::zero(ctx) }
-        else { coin::from_balance(quote, ctx) };
+    let base_coin = coin_or_zero(base, ctx);
+    let quote_coin = coin_or_zero(quote, ctx);
 
     if (base_amount != 0 || quote_amount != 0) {
         event::emit(FeesClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
@@ -603,26 +601,11 @@ public fun clob_admin_cancel_order<Base, Quote>(
     let event_book_id = book.event_id;
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
-    let leaf_opt = price_tree::find(tree, price);
-    if (leaf_opt.is_none()) { return };
-    let leaf_ptr = leaf_opt.destroy_some();
-
-    let (found, owner, escrow_base, escrow_quote, level_now_empty) = {
-        let level = price_tree::borrow_mut(tree, leaf_ptr);
-        if (price_tree::level_contains_order(level, order_id)) {
-            let live_order = price_tree::level_remove_order(level, order_id);
-            let owner = order::owner(&live_order);
-            let (eb, eq) = order::destroy(live_order);
-            (true, owner, eb, eq, price_tree::level_is_empty(level))
-        } else {
-            (false, @0x0, option::none(), option::none(), price_tree::level_is_empty(level))
-        }
-    };
-    if (!found) { escrow_base.destroy_none(); escrow_quote.destroy_none(); return };
-    if (level_now_empty) {
-        let removed = price_tree::remove(tree, leaf_ptr);
-        price_tree::destroy_empty_price_level(removed);
-    };
+    let order_opt = price_tree::find_and_remove_order(tree, price, order_id);
+    if (order_opt.is_none()) { order_opt.destroy_none(); return };
+    let live_order = order_opt.destroy_some();
+    let owner = order::owner(&live_order);
+    let (escrow_base, escrow_quote) = order::destroy(live_order);
     refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
     event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
 }
@@ -694,6 +677,28 @@ fun drain_side<Base, Quote>(
     };
 }
 
+/// Converts `b` to a `Coin`, avoiding `coin::from_balance` on a zero-valued
+/// `Balance` (which lacks `drop` and cannot simply be discarded) by
+/// destroying it and minting an empty coin instead.
+fun coin_or_zero<T>(b: Balance<T>, ctx: &mut TxContext): Coin<T> {
+    if (balance::value(&b) == 0) {
+        balance::destroy_zero(b);
+        coin::zero(ctx)
+    } else {
+        coin::from_balance(b, ctx)
+    }
+}
+
+/// Transfers `b` to `owner` as a `Coin`, or destroys it in place if it's
+/// zero-valued (avoiding a zero-value transfer).
+fun transfer_or_destroy_zero<T>(b: Balance<T>, owner: address, ctx: &mut TxContext) {
+    if (balance::value(&b) == 0) {
+        balance::destroy_zero(b);
+    } else {
+        transfer::public_transfer(coin::from_balance(b, ctx), owner);
+    };
+}
+
 /// Both escrow legs may legitimately be zero-valued (e.g. a fully-filled
 /// order still holds a spent `Balance`), so `balance::destroy_zero` is used
 /// in place of transferring a zero coin.
@@ -705,20 +710,12 @@ fun refund_order_escrow<Base, Quote>(
 ) {
     if (escrow_base.is_some()) {
         let base = escrow_base.extract();
-        if (balance::value(&base) == 0) {
-            balance::destroy_zero(base);
-        } else {
-            transfer::public_transfer(coin::from_balance(base, ctx), owner);
-        };
+        transfer_or_destroy_zero(base, owner, ctx);
     };
     escrow_base.destroy_none();
     if (escrow_quote.is_some()) {
         let quote = escrow_quote.extract();
-        if (balance::value(&quote) == 0) {
-            balance::destroy_zero(quote);
-        } else {
-            transfer::public_transfer(coin::from_balance(quote, ctx), owner);
-        };
+        transfer_or_destroy_zero(quote, owner, ctx);
     };
     escrow_quote.destroy_none();
 }
@@ -731,18 +728,8 @@ fun drain_proceeds<Base, Quote>(
     while (*remaining > 0 && !linked_table::is_empty(proceeds)) {
         let (_order_id, mb) = linked_table::pop_front(proceeds);
         let (owner, base, quote) = destroy_maker_balance(mb);
-        let base_amount = balance::value(&base);
-        let quote_amount = balance::value(&quote);
-        if (base_amount == 0) {
-            balance::destroy_zero(base);
-        } else {
-            transfer::public_transfer(coin::from_balance(base, ctx), owner);
-        };
-        if (quote_amount == 0) {
-            balance::destroy_zero(quote);
-        } else {
-            transfer::public_transfer(coin::from_balance(quote, ctx), owner);
-        };
+        transfer_or_destroy_zero(base, owner, ctx);
+        transfer_or_destroy_zero(quote, owner, ctx);
         *remaining = *remaining - 1;
     };
 }
@@ -900,27 +887,7 @@ fun insert_resting_order<Base, Quote>(
     let order_id = order::id(&order);
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
-    let probe = price_tree::descend_probe(tree, price);
-    if (probe.is_some()) {
-        let hint_ptr = probe.destroy_some();
-        if (price_tree::key(tree, hint_ptr) == price) {
-            // Found — insert into the existing level, no further tree traversal.
-            let level = price_tree::borrow_mut(tree, hint_ptr);
-            price_tree::level_insert_order(level, order_id, order);
-        } else {
-            // Not found — `hint_ptr` is the nearest leaf; complete the
-            // insertion from it directly, no second descent.
-            let mut level = price_tree::new_price_level<Base, Quote>(ctx);
-            price_tree::level_insert_order(&mut level, order_id, order);
-            price_tree::insert_at(tree, price, level, hint_ptr);
-        };
-    } else {
-        // Empty tree.
-        probe.destroy_none();
-        let mut level = price_tree::new_price_level<Base, Quote>(ctx);
-        price_tree::level_insert_order(&mut level, order_id, order);
-        price_tree::insert(tree, price, level);
-    };
+    price_tree::insert_or_append_order(tree, price, order_id, order, ctx);
 }
 
 fun fill_level_bid<Base, Quote>(
@@ -1572,34 +1539,17 @@ public fun cancel_order<Base, Quote>(
 
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
-    let leaf_opt = price_tree::find(tree, price);
+    let order_opt = price_tree::find_and_remove_order(tree, price, order_id);
 
-    let (mut escrow_base, mut escrow_quote) = if (leaf_opt.is_none()) {
+    let (mut escrow_base, mut escrow_quote) = if (order_opt.is_none()) {
+        order_opt.destroy_none();
         (option::none(), option::none())
     } else {
-        let leaf_ptr = leaf_opt.destroy_some();
-
-        let (found_live, trader, escrow_base, escrow_quote, level_now_empty) = {
-            let level = price_tree::borrow_mut(tree, leaf_ptr);
-            if (price_tree::level_contains_order(level, order_id)) {
-                let live_order = price_tree::level_remove_order(level, order_id);
-                let owner = order::owner(&live_order);
-                let (eb, eq) = order::destroy(live_order);
-                (true, owner, eb, eq, price_tree::level_is_empty(level))
-            } else {
-                (false, @0x0, option::none(), option::none(), price_tree::level_is_empty(level))
-            }
-        };
-
-        if (found_live && level_now_empty) {
-            let removed = price_tree::remove(tree, leaf_ptr);
-            price_tree::destroy_empty_price_level(removed);
-        };
-
-        if (found_live) {
-            event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader });
-        };
-        (escrow_base, escrow_quote)
+        let live_order = order_opt.destroy_some();
+        let trader = order::owner(&live_order);
+        let (eb, eq) = order::destroy(live_order);
+        event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader });
+        (eb, eq)
     };
 
     let (_owner, proceeds_base, proceeds_quote) = claim_maker_balance(book, order_id);
@@ -1635,12 +1585,8 @@ public fun cancel_order<Base, Quote>(
         });
     };
 
-    let base_amount = balance::value(&base_balance);
-    let quote_amount = balance::value(&quote_balance);
-    let base_coin = if (base_amount == 0) { balance::destroy_zero(base_balance); coin::zero(ctx) }
-        else { coin::from_balance(base_balance, ctx) };
-    let quote_coin = if (quote_amount == 0) { balance::destroy_zero(quote_balance); coin::zero(ctx) }
-        else { coin::from_balance(quote_balance, ctx) };
+    let base_coin = coin_or_zero(base_balance, ctx);
+    let quote_coin = coin_or_zero(quote_balance, ctx);
     (base_coin, quote_coin)
 }
 
@@ -1745,10 +1691,8 @@ public fun claim_proceeds<Base, Quote>(
     let base_amount = balance::value(&base);
     let quote_amount = balance::value(&quote);
 
-    let base_coin = if (base_amount == 0) { balance::destroy_zero(base); coin::zero(ctx) }
-        else { coin::from_balance(base, ctx) };
-    let quote_coin = if (quote_amount == 0) { balance::destroy_zero(quote); coin::zero(ctx) }
-        else { coin::from_balance(quote, ctx) };
+    let base_coin = coin_or_zero(base, ctx);
+    let quote_coin = coin_or_zero(quote, ctx);
 
     if (base_amount != 0 || quote_amount != 0) {
         event::emit(ProceedsClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
@@ -1796,10 +1740,8 @@ public fun push_proceeds<Base, Quote>(
         balance::destroy_zero(quote);
         return
     };
-    if (base_amount == 0) { balance::destroy_zero(base) }
-    else { transfer::public_transfer(coin::from_balance(base, ctx), owner) };
-    if (quote_amount == 0) { balance::destroy_zero(quote) }
-    else { transfer::public_transfer(coin::from_balance(quote, ctx), owner) };
+    transfer_or_destroy_zero(base, owner, ctx);
+    transfer_or_destroy_zero(quote, owner, ctx);
     event::emit(ProceedsClaimed { claimant: owner, order_book_id: event_book_id, base_amount, quote_amount });
 }
 
