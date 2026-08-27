@@ -1640,9 +1640,9 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
 
     // ADMIN rests a bid; OTHER crosses it fully as a market ask, crediting
     // ADMIN's order_id proceeds table entry with quote. Keep the ticket
-    // alive: it is now required to claim. claim_proceeds always returns the
-    // ticket back (never an Option) — the caller decides when it's done with
-    // it, here via a follow-up destroy_orphaned_ticket call.
+    // alive: it is now required to claim. The bid is fully filled and
+    // removed from the book, so claim_proceeds auto-destroys the ticket and
+    // hands back option::none().
     let escrow_amount = tiny_clob::bid_escrow_amount(CH2_PRICE, CH2_SIZE);
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
 
@@ -1655,7 +1655,7 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     coin::burn_for_testing(matched_quote);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, returned_ticket) =
+    let (claim_base, claim_quote, returned_ticket_opt) =
         tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
@@ -1670,10 +1670,10 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     assert!(ev_quote == 0, 4);
 
     // The order was fully filled and removed from the book, so nothing
-    // more can ever be claimed through this ticket — the caller's own choice
-    // to dispose of it via destroy_orphaned_ticket must succeed with no
-    // abort (no proceeds remain pooled for this order_id).
-    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
+    // more can ever be claimed through this ticket — claim_proceeds already
+    // destroyed it and returned option::none().
+    assert!(returned_ticket_opt.is_none(), 5);
+    option::destroy_none(returned_ticket_opt);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -2287,18 +2287,19 @@ fun cancel_and_claim_never_block_on_pause_or_retiring() {
     // claim_proceeds also succeeds while retiring.
     // The order was never resting for this order_id, so use a synthetic
     // ticket (bypassing the placement path, which isn't needed here) — the
-    // claim finds nothing pooled, and claim_proceeds unconditionally hands
-    // the ticket back regardless of resting state; dispose of it via
-    // destroy_orphaned_ticket, which succeeds since no proceeds are pooled.
+    // claim finds nothing pooled, and since order_id 999 was never actually
+    // resting, claim_proceeds auto-destroys the ticket and returns
+    // option::none().
     tiny_clob::clob_admin_retire(&cap, &mut book);
     let book_id = tiny_clob::id_for_testing(&book);
     let dummy_ticket =
         tiny_clob::new_ticket_for_testing(999, book_id, tiny_clob::bid_for_testing(), PLACEMENT_PRICE);
-    let (claim_base, claim_quote, returned_ticket) =
+    let (claim_base, claim_quote, returned_ticket_opt) =
         tiny_clob::claim_proceeds(&mut book, dummy_ticket, scenario.ctx());
     assert!(coin::burn_for_testing(claim_base) == 0, 2);
     assert!(coin::burn_for_testing(claim_quote) == 0, 3);
-    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
+    assert!(returned_ticket_opt.is_none(), 4);
+    option::destroy_none(returned_ticket_opt);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -2315,10 +2316,10 @@ fun claim_proceeds_transfers_maker_proceeds() {
     let bid_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
 
     scenario.next_tx(ADMIN);
-    // ask_ticket's order was fully filled by the crossing bid above.
-    // claim_proceeds always returns the ticket back; dispose of it via
-    // destroy_orphaned_ticket once its proceeds have been claimed.
-    let (claim_base, claim_quote, returned_ticket) =
+    // ask_ticket's order was fully filled by the crossing bid above, so it
+    // is no longer resting — claim_proceeds auto-destroys the ticket and
+    // hands back option::none().
+    let (claim_base, claim_quote, returned_ticket_opt) =
         tiny_clob::claim_proceeds(&mut book, ask_ticket, scenario.ctx());
     let claimed = event::events_by_type<ProceedsClaimed>();
     assert!(claimed.length() == 1, 0);
@@ -2327,7 +2328,8 @@ fun claim_proceeds_transfers_maker_proceeds() {
     assert!(quote_amt == tiny_clob::bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 2);
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
-    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
+    assert!(returned_ticket_opt.is_none(), 3);
+    option::destroy_none(returned_ticket_opt);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
@@ -2465,13 +2467,13 @@ fun destroy_orphaned_ticket_zero_proceeds_on_own_book_disposes_cleanly() {
 }
 
 #[test]
-fun claim_proceeds_always_returns_ticket_even_when_order_fully_filled() {
+fun claim_proceeds_auto_destroys_ticket_when_order_fully_filled() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
 
     // Fully filling a resting bid removes it from the book. claim_proceeds
-    // must still hand back a usable OrderTicket (never an Option) — the
-    // caller decides whether/when to dispose of it.
+    // must auto-destroy the ticket and return option::none() — nothing more
+    // can ever be claimed through it.
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
     let order_id = tiny_clob::ticket_order_id(&bid_ticket);
 
@@ -2485,13 +2487,14 @@ fun claim_proceeds_always_returns_ticket_even_when_order_fully_filled() {
     assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, returned_ticket) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
+    let (claim_base, claim_quote, returned_ticket_opt) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
     assert!(coin::burn_for_testing(claim_base) == CH2_SIZE, 1);
     coin::burn_for_testing(claim_quote);
-    // Proceeds entry gone -> destroy_orphaned_ticket must succeed with no
-    // abort on the ticket claim_proceeds handed back.
+    // Proceeds entry gone, and the order is no longer resting, so
+    // claim_proceeds already destroyed the ticket for us.
     assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 2);
-    tiny_clob::destroy_orphaned_ticket(&book, returned_ticket);
+    assert!(returned_ticket_opt.is_none(), 3);
+    option::destroy_none(returned_ticket_opt);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -2503,8 +2506,8 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     let (mut book, cap) = new_book(&mut scenario);
 
     // A partial fill leaves the order still resting. claim_proceeds returns
-    // the ticket, which must remain valid and reusable for a further claim
-    // after a second fill.
+    // the ticket via option::some, which must remain valid and reusable for
+    // a further claim after a second fill.
     let size = 300;
     let fill_size = 100;
     let bid_ticket = rest_bid(&mut book, CH2_PRICE, size, 1_000_000_000, scenario.ctx());
@@ -2519,10 +2522,12 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     coin::burn_for_testing(matched_quote);
 
     scenario.next_tx(ADMIN);
-    let (claim_base, claim_quote, returned_ticket) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
+    let (claim_base, claim_quote, returned_ticket_opt) = tiny_clob::claim_proceeds(&mut book, bid_ticket, scenario.ctx());
     coin::burn_for_testing(claim_base);
     coin::burn_for_testing(claim_quote);
     assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
+    assert!(returned_ticket_opt.is_some(), 4);
+    let returned_ticket = option::destroy_some(returned_ticket_opt);
 
     // Second fill against the still-resting remainder, then claim again
     // using the SAME ticket returned above — confirms it remains usable
@@ -2537,12 +2542,16 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id), 1);
 
     scenario.next_tx(ADMIN);
-    let (claim_base2, claim_quote2, returned_ticket2) =
+    let (claim_base2, claim_quote2, returned_ticket_opt2) =
         tiny_clob::claim_proceeds(&mut book, returned_ticket, scenario.ctx());
     assert!(coin::burn_for_testing(claim_base2) == fill_size, 2);
     coin::burn_for_testing(claim_quote2);
     assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 3);
 
+    // size (300) minus two fills of 100 leaves 100 still resting, so the
+    // ticket remains live.
+    assert!(returned_ticket_opt2.is_some(), 5);
+    let returned_ticket2 = option::destroy_some(returned_ticket_opt2);
     tiny_clob::destroy_orphaned_ticket(&book, returned_ticket2); // must NOT abort
 
     destroy_book_and_cap(book, cap);

@@ -183,6 +183,9 @@ fun credit_fee_accumulator<Base, Quote>(
 #[allow(lint(missing_key))]
 public struct OrderBook<phantom Base, phantom Quote> has store {
     id: UID,
+    /// Bounds order-placement size only, not post-fill remainder size — see
+    /// `validate_size_raw`'s doc comment for the full caveat about resulting
+    /// dust and `max_fills` griefing.
     min_size: u64,
     bids: PriceTree<PriceLevel<Base, Quote>>,
     asks: PriceTree<PriceLevel<Base, Quote>>,
@@ -249,6 +252,10 @@ public struct ClobAdminCapDiscarded has copy, drop {
 /// The book's `event_id` (stamped on every emitted event) defaults to the
 /// book's own object id. Use `new_with_event_id_override` instead of this
 /// function if a wrapping object's own id should be stamped there instead.
+///
+/// `min_size` bounds order-placement size only, not post-fill remainder
+/// size — see `validate_size_raw`'s doc comment for the full caveat about
+/// resulting dust and `max_fills` griefing.
 public fun new<Base, Quote>(
     min_size: u64,
     ctx: &mut TxContext,
@@ -280,6 +287,9 @@ public fun new<Base, Quote>(
 /// including `Option`'s, cannot be references), which is why this is a
 /// separate function rather than an `Option<&UID>` parameter on `new`
 /// itself.
+///
+/// `min_size` carries the same order-placement-size-only caveat documented
+/// on `new` (see `validate_size_raw`'s doc comment).
 public fun new_with_event_id_override<Base, Quote>(
     min_size: u64,
     event_id_override: &UID,
@@ -826,6 +836,31 @@ fun fee_amount(receive_amount: u64, rate_bps: u64): u64 {
     (((receive_amount as u128) * (rate_bps as u128) + 9_999) / 10_000) as u64
 }
 
+/// `min_size` bounds order-placement size only — it is enforced here, once,
+/// at the moment an order is submitted. It is never re-checked against the
+/// size of a resulting fill or a partial-fill remainder. A partial fill can
+/// leave a resting order's `remaining_size` below `min_size` ("dust"); that
+/// dust persists on the book — untouched by any automatic mechanism — until
+/// it is cancelled by its ticket holder, fully consumed by a later fill, or
+/// removed by an admin via `clob_admin_cancel_order` / `clob_admin_drain_step`.
+/// Each resting order, dust-sized or not, consumes exactly one `max_fills`
+/// slot when a taker's sweep reaches it (see `fills_consumed` in
+/// `fill_level_bid`/`fill_level_ask`, incremented unconditionally per
+/// touched order before any size check
+/// runs). In an adversarial or permissionless deployment, this means dust
+/// accumulation can cheapen a `max_fills`-based griefing strategy against a
+/// specific taker — most plausible where delaying one specific transaction
+/// has real payoff (e.g. a liquidation venue), not typical ordinary trading.
+/// The available mitigation: every placement/market entry point returns a
+/// `stopped_on_max_fills_while_crossing` bool — integrators should treat a
+/// `true` result as a signal to retry with a larger `max_fills`, not assume
+/// a single sweep reflects true available liquidity. This tradeoff is
+/// deliberate: a fill-time fix (force-cancelling a maker's dust remainder
+/// instead of resting it) was considered and rejected, since it would
+/// force-cancel a maker's resting order below their own chosen `min_size`
+/// without their consent — a real behavior change this project has chosen
+/// not to make, consistent with the earlier removal of `lot_size` to keep
+/// size-policy decisions out of the core matching engine.
 fun validate_size_raw(min_size: u64, size: u64) {
     assert!(size >= min_size, ESizeBelowMinSize);
 }
@@ -1198,6 +1233,16 @@ public fun ticket_price(t: &OrderTicket): u64 {
     t.price
 }
 
+/// Unconditional disposal — no liveness check of its own. Package-private:
+/// safe only because its sole caller, `claim_proceeds`, guarantees by
+/// construction that `book.proceeds` holds no entry for this ticket's
+/// `order_id` before calling this (it has just drained that entry via
+/// `claim_maker_balance`). Any other caller must use the guarded public
+/// `destroy_orphaned_ticket` below instead.
+public(package) fun destroy_orphaned_ticket_unchecked(ticket: OrderTicket) {
+    let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
+}
+
 /// Guarded disposal: aborts with `EWrongBook` if `ticket` wasn't minted by
 /// `book`, and with `EProceedsNotEmpty` if `book.proceeds` still holds an
 /// entry for this ticket's `order_id` — destroying the ticket in that case
@@ -1213,7 +1258,7 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 ) {
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     assert!(!linked_table::contains(&book.proceeds, ticket.order_id), EProceedsNotEmpty);
-    let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
+    destroy_orphaned_ticket_unchecked(ticket);
 }
 
 // === Order placement, cancellation, and proceeds claiming ===
@@ -1677,25 +1722,22 @@ public fun update_resting_order<Base, Quote>(
 /// pay-the-caller convention, not the stored owner) — authority to claim
 /// follows `OrderTicket` possession, exactly like cancellation authority.
 ///
-/// Always returns the ticket back (as a bare `OrderTicket`, never wrapped in
-/// an `Option`) — whether the underlying order is still resting or not,
-/// unconditionally. This function deliberately does NOT decide whether the
-/// ticket is still "useful"; that decision belongs to the caller, who can
-/// call `destroy_orphaned_ticket(&book, ticket)` whenever they choose (it
-/// already correctly aborts if proceeds remain unclaimed). Returning an
-/// `Option<OrderTicket>` here would force the caller to branch on
-/// unpredictable, simulation-time book state inside a PTB, where branching is
-/// not possible — any state change between simulation and execution could
-/// flip which arm is "correct," aborting the whole transaction. Always
-/// returning the ticket keeps this function safely composable in a PTB.
+/// If the order identified by `ticket` is still resting on the book, the
+/// ticket is handed back (`option::some`) so it can be used for future
+/// claims or eventual cancellation. If the order is no longer resting
+/// (fully filled and removed, or never found), nothing more can ever be
+/// claimed through this ticket, so it is destroyed and `option::none()` is
+/// returned instead.
 public fun claim_proceeds<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     ticket: OrderTicket,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, OrderTicket) {
+): (Coin<Base>, Coin<Quote>, Option<OrderTicket>) {
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     let order_id = ticket.order_id;
+    let side = ticket.side;
+    let price = ticket.price;
 
     let claimant = ctx.sender();
     let event_book_id = book.event_id;
@@ -1712,7 +1754,22 @@ public fun claim_proceeds<Base, Quote>(
         event::emit(ProceedsClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
     };
 
-    (base_coin, quote_coin, ticket)
+    let tree: &PriceTree<PriceLevel<Base, Quote>> = if (side) &book.bids else &book.asks;
+    let leaf_opt = price_tree::find(tree, price);
+    let still_resting = if (leaf_opt.is_none()) {
+        false
+    } else {
+        let leaf_ptr = leaf_opt.destroy_some();
+        let level = price_tree::borrow(tree, leaf_ptr);
+        price_tree::level_contains_order(level, order_id)
+    };
+
+    if (still_resting) {
+        (base_coin, quote_coin, option::some(ticket))
+    } else {
+        destroy_orphaned_ticket_unchecked(ticket);
+        (base_coin, quote_coin, option::none())
+    }
 }
 
 /// Admin-gated convenience/rescue function: pays out a specific order's
