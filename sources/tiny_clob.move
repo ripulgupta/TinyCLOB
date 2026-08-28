@@ -5,10 +5,16 @@
 /// clob-admin-gated fee/pause controls, and a clob_admin_retire/drain/clob_admin_finalize
 /// deletion lifecycle.
 ///
-/// `price` throughout this module is quote-atoms per base-atom, not a
-/// human-readable decimal ratio; see `place_limit_order_bid`'s doc comment
-/// for the resulting granularity constraint on pairs where
-/// `quote_decimals < base_decimals`.
+/// `price` throughout this module is a raw, book-relative unit, not a
+/// human-readable decimal ratio: the true price is
+/// `price / price_scale * 10^(base_decimals - quote_decimals)`, where
+/// `price_scale` is derived at construction time from the book's declared
+/// `base_decimals`/`quote_decimals`/`precision`/`exponent` (see `new`'s doc
+/// comment and `price_scale`'s accessor). `precision`/`exponent` are the
+/// book's declared guarantee on representable true-price resolution/range;
+/// an optional `price_band_factor` (see `clob_admin_set_price_band_factor`)
+/// is a further, independent safeguard bounding every placed order's `price`
+/// to a factor of the book's `last_price`.
 module tiny_clob::tiny_clob;
 
 use sui::balance::{Self, Balance};
@@ -30,20 +36,57 @@ const ENotFullyDrained: u64 = 7;
 const ETakerFeeRateTooHigh: u64 = 8;
 const EMakerFeeRateTooHigh: u64 = 9;
 const ESizeBelowMinSize: u64 = 12;
-/// A `price * size`-style multiplication's `u128` intermediate exceeded
-/// `u64::MAX`.
-const EPriceSizeOverflow: u64 = 13;
 const EZeroPrice: u64 = 14;
 const EBookPaused: u64 = 15;
 const EWrongBook: u64 = 16;
 const ESlippageExceeded: u64 = 17;
 const EBookRetiring: u64 = 18;
 const EProceedsNotEmpty: u64 = 19;
+/// A book's declared `base_decimals`/`quote_decimals`/`precision`/`exponent`
+/// admit no valid `price_scale` at all (`scale_lo > scale_hi`), or the
+/// tightest valid `price_scale` (`scale_lo`) itself cannot fit in a `u64` —
+/// see `new_impl`.
+const EPriceRangeInfeasible: u64 = 20;
+/// A `price` fell below the book's declared minimum representable true
+/// price.
+const EPriceBelowDeclaredMin: u64 = 21;
+/// A `price` exceeded the book's declared maximum representable true price.
+const EPriceAboveDeclaredMax: u64 = 22;
+/// A `price` fell below `last_price / price_band_factor`.
+const EPriceBelowBand: u64 = 23;
+/// A `price` exceeded `last_price * price_band_factor`.
+const EPriceAboveBand: u64 = 24;
+/// `clob_admin_set_price_band_factor` was called with `Some(0)` — a
+/// zero-valued factor can never bound any price and is always a caller
+/// mistake.
+const EZeroPriceBandFactor: u64 = 25;
+/// `clob_admin_set_last_price` was called with a value below the book's
+/// current best bid.
+const EResetPriceBelowBestBid: u64 = 26;
+/// `clob_admin_set_last_price` was called with a value above the book's
+/// current best ask.
+const EResetPriceAboveBestAsk: u64 = 27;
+/// A decimals/precision/exponent argument to `new`/`new_with_event_id_override`
+/// exceeded `MAX_DECIMALS`.
+const EDecimalsTooLarge: u64 = 28;
 
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
 const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
 const U64_MAX: u128 = 0xFFFFFFFFFFFFFFFF;
+
+/// Upper bound on `base_decimals`/`quote_decimals`/`precision`/`exponent`.
+/// Empirically verified: 10^38 squared fits comfortably inside `u256` (with
+/// ~6.3x headroom given the true worst-case product
+/// `price * pow_base * pow_prec` at `u64::MAX * 10^38 * 10^19`); 10^39
+/// squared does not. IMPORTANT: this bound is safe ONLY in combination with
+/// `assert_price_in_declared_range`'s independent enforcement (via the
+/// `scale_lo`/`scale_hi` feasibility check in `new_impl`) that
+/// `precision + exponent` is effectively bounded well below `MAX_DECIMALS`
+/// for any book that can actually be constructed — `MAX_DECIMALS = 38` alone,
+/// without that coupling, would NOT be a safe bound against `u256` overflow
+/// in `assert_price_in_declared_range`'s intermediate products.
+const MAX_DECIMALS: u8 = 38;
 
 /// Bumped whenever a published version of this package introduces a
 /// breaking change to `OrderBook`'s on-chain layout or semantics. Existing
@@ -200,6 +243,33 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     taker_fee_bps: u64,
     maker_fee_bps: u64,
     fee_accumulator: FeeAccumulator<Base, Quote>,
+    /// Derived at construction (see `new_impl`) from the book's declared
+    /// `base_decimals`/`quote_decimals`/`precision`/`exponent`: the true
+    /// price is `price / price_scale * 10^(base_decimals - quote_decimals)`.
+    /// Chosen to maximize precision subject to fitting in a `u64`. Used by
+    /// `bid_escrow_amount`/`scaled_ceil_mul_div` to convert a raw `price` and
+    /// `size` into `Quote`-atom escrow.
+    price_scale: u64,
+    /// Declared minimum number of significant decimal digits of true-price
+    /// resolution this book guarantees to support; see
+    /// `assert_price_in_declared_range`.
+    precision: u8,
+    /// Declared upper bound (as a power of ten) on the true price this book
+    /// guarantees to support; see `assert_price_in_declared_range`.
+    exponent: u8,
+    base_decimals: u8,
+    quote_decimals: u8,
+    /// The price (in the book's raw, `price_scale`-relative units) of the
+    /// most recent real fill, or the constructor-supplied
+    /// `initial_last_price` if no fill has ever occurred. Seeds and anchors
+    /// `price_band_factor`'s optional band. See `clob_admin_set_last_price`.
+    last_price: u64,
+    /// Optional additional safeguard, independent of `precision`/`exponent`:
+    /// when set, every placed order's `price` must fall within
+    /// `[last_price / price_band_factor, last_price * price_band_factor]`.
+    /// `None` (the default) disables this check entirely. See
+    /// `clob_admin_set_price_band_factor`.
+    price_band_factor: Option<u64>,
     /// The id every event this module emits stamps as `order_book_id`.
     /// Write-once: fixed at construction time (defaults to the book's own
     /// internal id via plain `new`, or to a caller-supplied override via
@@ -244,6 +314,47 @@ public struct ClobAdminCapDiscarded has copy, drop {
     for_book: ID,
 }
 
+// === Price scaling helpers ===
+
+/// `10^exp`, computed as a `u256`.
+fun pow10_u256(exp: u8): u256 {
+    let mut result: u256 = 1;
+    let mut i: u8 = 0;
+    while (i < exp) {
+        result = result * 10;
+        i = i + 1;
+    };
+    result
+}
+
+fun u64_max_as_u256(): u256 { U64_MAX as u256 }
+
+/// Asserts `price` (in the book's raw, `price_scale`-relative units) decodes
+/// to a true price within the range the book's declared
+/// `precision`/`exponent` guarantee is representable: true price must be at
+/// least `10^-precision` and at most `10^exponent`. Raw scalars only —
+/// deliberately NOT `&OrderBook` — reused unmodified across 6 call sites in
+/// 3 categories: construction (`new_impl`), `clob_admin_set_last_price`, and
+/// order placement (`place_limit_order_bid`/`_ask`, `swap_bid`/`_ask`), the
+/// first of which has no live book reference to borrow yet.
+fun assert_price_in_declared_range(
+    price: u64,
+    price_scale: u64,
+    base_decimals: u8,
+    quote_decimals: u8,
+    precision: u8,
+    exponent: u8,
+) {
+    let pow_base = pow10_u256(base_decimals);
+    let pow_quote = pow10_u256(quote_decimals);
+    let pow_prec = pow10_u256(precision);
+    let pow_exp = pow10_u256(exponent);
+    let price_u256 = price as u256;
+    let scale_u256 = price_scale as u256;
+    assert!(scale_u256 * pow_quote <= price_u256 * pow_base * pow_prec, EPriceBelowDeclaredMin);
+    assert!(price_u256 * pow_base <= pow_exp * scale_u256 * pow_quote, EPriceAboveDeclaredMax);
+}
+
 // === Constructor ===
 
 /// Callable by any address — no capability is required to create a book,
@@ -256,11 +367,29 @@ public struct ClobAdminCapDiscarded has copy, drop {
 /// `min_size` bounds order-placement size only, not post-fill remainder
 /// size — see `validate_size_raw`'s doc comment for the full caveat about
 /// resulting dust and `max_fills` griefing.
+///
+/// `base_decimals`/`quote_decimals` are the on-chain atomic-unit decimals of
+/// `Base`/`Quote` respectively. `precision`/`exponent` jointly declare the
+/// range of true price this book guarantees to be able to represent: at
+/// least `10^-precision` and at most `10^exponent`. From these four values, a
+/// `price_scale` is derived (see `price_scale`'s accessor) that maximizes
+/// representable precision subject to fitting in a `u64`; construction
+/// aborts with `EPriceRangeInfeasible` if no valid `price_scale` exists for
+/// the declared inputs. `initial_last_price` seeds the book's `last_price`
+/// (see `clob_admin_set_last_price`), the reference point an optional
+/// `price_band_factor` bounds every placed order's `price` against; it must
+/// be nonzero and must itself decode to a true price within the declared
+/// `precision`/`exponent` range.
 public fun new<Base, Quote>(
     min_size: u64,
+    base_decimals: u8,
+    quote_decimals: u8,
+    precision: u8,
+    exponent: u8,
+    initial_last_price: u64,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
-    new_impl(min_size, option::none(), ctx)
+    new_impl(min_size, base_decimals, quote_decimals, precision, exponent, initial_last_price, option::none(), ctx)
 }
 
 /// Same as `new`, except the book's `event_id` (stamped on every emitted
@@ -290,21 +419,59 @@ public fun new<Base, Quote>(
 ///
 /// `min_size` carries the same order-placement-size-only caveat documented
 /// on `new` (see `validate_size_raw`'s doc comment).
+///
+/// `base_decimals`/`quote_decimals`/`precision`/`exponent`/`initial_last_price`
+/// carry the same meaning documented on `new`.
 public fun new_with_event_id_override<Base, Quote>(
     min_size: u64,
+    base_decimals: u8,
+    quote_decimals: u8,
+    precision: u8,
+    exponent: u8,
+    initial_last_price: u64,
     event_id_override: &UID,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
-    new_impl(min_size, option::some(object::uid_to_inner(event_id_override)), ctx)
+    new_impl(
+        min_size, base_decimals, quote_decimals, precision, exponent, initial_last_price,
+        option::some(object::uid_to_inner(event_id_override)), ctx,
+    )
 }
 
 fun new_impl<Base, Quote>(
     min_size: u64,
+    base_decimals: u8,
+    quote_decimals: u8,
+    precision: u8,
+    exponent: u8,
+    initial_last_price: u64,
     event_id_override: Option<ID>,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
     assert!(min_size != 0, EZeroMinSize);
     assert!(min_size <= MAX_MIN_SIZE, EMinSizeTooLarge);
+    assert!(
+        base_decimals <= MAX_DECIMALS && quote_decimals <= MAX_DECIMALS
+            && precision <= MAX_DECIMALS && exponent <= MAX_DECIMALS,
+        EDecimalsTooLarge,
+    );
+
+    let pow_base = pow10_u256(base_decimals);
+    let pow_quote = pow10_u256(quote_decimals);
+    let pow_prec = pow10_u256(precision);
+    let pow_exp = pow10_u256(exponent);
+    let u64_max = u64_max_as_u256();
+
+    // scale_lo = ceil(pow_base * pow_prec / pow_quote)
+    let numerator = pow_base * pow_prec;
+    let scale_lo = (numerator + pow_quote - 1) / pow_quote;
+    // scale_hi = floor(u64::MAX * pow_base / (pow_quote * pow_exp))
+    let scale_hi = (u64_max * pow_base) / (pow_quote * pow_exp);
+    assert!(scale_lo <= scale_hi && scale_lo <= u64_max, EPriceRangeInfeasible);
+    let price_scale = (if (scale_hi > u64_max) { u64_max } else { scale_hi }) as u64;
+
+    assert!(initial_last_price != 0, EZeroPrice);
+    assert_price_in_declared_range(initial_last_price, price_scale, base_decimals, quote_decimals, precision, exponent);
 
     let book_uid = object::new(ctx);
     let book_id = object::uid_to_inner(&book_uid);
@@ -331,6 +498,13 @@ fun new_impl<Base, Quote>(
         taker_fee_bps: 0,
         maker_fee_bps: 0,
         fee_accumulator: new_fee_accumulator(),
+        price_scale,
+        precision,
+        exponent,
+        base_decimals,
+        quote_decimals,
+        last_price: initial_last_price,
+        price_band_factor: option::none(),
         event_id,
     };
     (book, cap)
@@ -434,6 +608,12 @@ public fun book_id<Base, Quote>(book: &OrderBook<Base, Quote>): ID {
 
 public fun fee_config<Base, Quote>(book: &OrderBook<Base, Quote>): (u64, u64) {
     (book.taker_fee_bps, book.maker_fee_bps)
+}
+
+/// See the `OrderBook.price_scale` field doc comment and the module doc
+/// comment for what this value means for decoding `price`.
+public fun price_scale<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+    book.price_scale
 }
 
 public fun fee_accumulator_balances<Base, Quote>(book: &OrderBook<Base, Quote>): (u64, u64) {
@@ -556,6 +736,67 @@ public fun clob_admin_set_maker_fee<Base, Quote>(
     let event_book_id = book.event_id;
     book.maker_fee_bps = rate_bps;
     event::emit(MakerFeeSet { order_book_id: event_book_id, rate_bps });
+}
+
+public struct PriceBandFactorSet has copy, drop {
+    order_book_id: ID,
+    factor: Option<u64>,
+}
+
+/// Sets (or clears, via `option::none()`) the book's optional price-band
+/// safeguard: when set, every placed order's `price` must fall within
+/// `[last_price / factor, last_price * factor]`. `factor` must be at least
+/// `1` when `Some` — a factor of `0` could never bound anything and is
+/// always a caller mistake.
+public fun clob_admin_set_price_band_factor<Base, Quote>(
+    cap: &ClobAdminCap,
+    book: &mut OrderBook<Base, Quote>,
+    factor: Option<u64>,
+) {
+    assert_book_version(book);
+    assert_clob_admin(cap, book);
+    if (factor.is_some()) {
+        assert!(*factor.borrow() >= 1, EZeroPriceBandFactor);
+    };
+    let event_book_id = book.event_id;
+    book.price_band_factor = factor;
+    event::emit(PriceBandFactorSet { order_book_id: event_book_id, factor });
+}
+
+public struct LastPriceSet has copy, drop {
+    order_book_id: ID,
+    last_price: u64,
+}
+
+/// Admin-gated reset of the book's `last_price` reference point (see
+/// `OrderBook.last_price`'s doc comment). `new_last_price` must be nonzero,
+/// must decode to a true price within the book's declared
+/// `precision`/`exponent` range, and — if a best bid/ask currently exists —
+/// must not cross it (an admin-set `last_price` inside the live spread can
+/// never itself be an executable price, so this rules out setting a
+/// nonsensical reference point).
+public fun clob_admin_set_last_price<Base, Quote>(
+    cap: &ClobAdminCap,
+    book: &mut OrderBook<Base, Quote>,
+    new_last_price: u64,
+) {
+    assert_book_version(book);
+    assert_clob_admin(cap, book);
+    assert!(new_last_price != 0, EZeroPrice);
+    assert_price_in_declared_range(
+        new_last_price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
+    );
+    let bid_opt = best_bid(book);
+    if (bid_opt.is_some()) {
+        assert!(new_last_price >= *bid_opt.borrow(), EResetPriceBelowBestBid);
+    };
+    let ask_opt = best_ask(book);
+    if (ask_opt.is_some()) {
+        assert!(new_last_price <= *ask_opt.borrow(), EResetPriceAboveBestAsk);
+    };
+    let event_book_id = book.event_id;
+    book.last_price = new_last_price;
+    event::emit(LastPriceSet { order_book_id: event_book_id, last_price: new_last_price });
 }
 
 public fun clob_admin_claim_fees<Base, Quote>(
@@ -759,7 +1000,9 @@ public fun clob_admin_finalize<Base, Quote>(
     let OrderBook {
         id, min_size: _, bids, asks, proceeds,
         paused: _, retiring: _, next_order_id: _, clob_admin_cap_id: _, version: _,
-        taker_fee_bps: _, maker_fee_bps: _, fee_accumulator, event_id,
+        taker_fee_bps: _, maker_fee_bps: _, fee_accumulator,
+        price_scale: _, precision: _, exponent: _, base_decimals: _, quote_decimals: _,
+        last_price: _, price_band_factor: _, event_id,
     } = book;
     let event_book_id = event_id;
     let true_book_id = object::uid_to_inner(&id);
@@ -796,20 +1039,23 @@ public struct OrderFilled has copy, drop {
     taker: address,
 }
 
-/// `price * size`, computed via a `u128` intermediate and abort-checked
-/// before narrowing back to `u64` — never silently wraps. `size` is always
-/// `Base`-atomic-units; a bid's escrow is this amount of `Quote`. Like every
-/// `price` in this module, `price` here is quote-atoms per base-atom, not a
-/// human-readable quote-per-base decimal ratio; see `place_limit_order_bid`'s
-/// doc comment for the granularity caveat when `quote_decimals < base_decimals`.
-public fun bid_escrow_amount(price: u64, size: u64): u64 {
-    checked_mul_u64(price, size)
+/// `ceil(price * size / book.price_scale)`. `size` is always
+/// `Base`-atomic-units; a bid's escrow is this amount of `Quote`. `price` is
+/// the book's raw, `price_scale`-relative unit — see the module doc comment.
+public fun bid_escrow_amount<Base, Quote>(book: &OrderBook<Base, Quote>, price: u64, size: u64): u64 {
+    scaled_ceil_mul_div(price, size, book.price_scale)
 }
 
-fun checked_mul_u64(a: u64, b: u64): u64 {
-    let product = (a as u128) * (b as u128);
-    assert!(product <= U64_MAX, EPriceSizeOverflow);
-    product as u64
+/// `ceil(price * size / price_scale)`, computed via a `u128` intermediate.
+/// Style-mirrors `fee_amount`'s ceiling pattern. No separate overflow assert
+/// on the intermediate product is needed: `price` and `size` are both `u64`,
+/// so their raw product always fits in `u128` regardless of magnitude; only
+/// the post-division narrowing back to `u64` can abort, which is the correct
+/// safety net (a `price_scale` too coarse to represent the true cost in a
+/// `u64` is a genuine "this amount cannot be escrowed" condition, not
+/// silently-wrapped arithmetic).
+fun scaled_ceil_mul_div(price: u64, size: u64, price_scale: u64): u64 {
+    (((price as u128) * (size as u128) + (price_scale as u128) - 1) / (price_scale as u128)) as u64
 }
 
 /// `ceil(receive_amount * rate_bps / 10_000)`, computed via a `u128`
@@ -904,6 +1150,8 @@ fun fill_level_bid<Base, Quote>(
     fills_consumed: &mut u64,
     max_fills: u64,
     taker_fee_bps: u64,
+    price_scale: u64,
+    last_price: &mut u64,
 ): (bool, bool) {
     let mut budget_exhausted = false;
     let mut hit_max_fills = false;
@@ -922,13 +1170,21 @@ fun fill_level_bid<Base, Quote>(
             *fills_consumed = *fills_consumed + 1;
             let maker_remaining = order::remaining_size(price_tree::level_borrow_order(level, head_key));
             let natural_fill_qty = std::u64::min(*remaining_size, maker_remaining);
-            let affordable_qty = balance::value(budget) / best_price;
-            let fill_qty = std::u64::min(natural_fill_qty, affordable_qty);
+            // Taker-side scaling: no accumulator needed, since `affordable_qty`
+            // is freshly recomputed every loop iteration from the taker's
+            // live, already-decremented `budget`. Narrowing to `u64` happens
+            // AFTER the min-clamp against `natural_fill_qty`, avoiding a
+            // DoS-via-abort class where a live budget's `u128` intermediate
+            // exceeds `u64::MAX` before clamping.
+            let affordable_qty_u128 = ((balance::value(budget) as u128) * (price_scale as u128)) / (best_price as u128);
+            let natural_fill_qty_u128 = natural_fill_qty as u128;
+            let fill_qty =
+                (if (natural_fill_qty_u128 < affordable_qty_u128) { natural_fill_qty_u128 } else { affordable_qty_u128 }) as u64;
             if (fill_qty == 0) {
                 budget_exhausted = true;
                 break
             };
-            let quote_cost = checked_mul_u64(best_price, fill_qty);
+            let quote_cost = scaled_ceil_mul_div(best_price, fill_qty, price_scale);
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
@@ -958,6 +1214,7 @@ fun fill_level_bid<Base, Quote>(
             });
 
             *remaining_size = *remaining_size - fill_qty;
+            *last_price = best_price;
 
             if (maker_remaining_after == 0) {
                 let (eb, eq) = order::destroy(maker_order);
@@ -991,6 +1248,8 @@ fun match_bid<Base, Quote>(
     taker: address,
     event_book_id: ID,
     max_fills: u64,
+    price_scale: u64,
+    last_price: &mut u64,
 ): (Balance<Base>, Balance<Quote>, u64, bool) {
     let mut remaining_size = remaining_size_in;
     let mut budget = budget_in;
@@ -1025,6 +1284,8 @@ fun match_bid<Base, Quote>(
             &mut fills_consumed,
             max_fills,
             taker_fee_bps,
+            price_scale,
+            last_price,
         );
         if (hit_max_fills) stopped_on_max_fills_while_crossing = true;
         if (stop) break;
@@ -1047,6 +1308,7 @@ fun fill_level_ask<Base, Quote>(
     fills_consumed: &mut u64,
     max_fills: u64,
     taker_fee_bps: u64,
+    last_price: &mut u64,
 ): (bool, bool) {
     let mut stop = false;
     let mut hit_max_fills = false;
@@ -1065,10 +1327,24 @@ fun fill_level_ask<Base, Quote>(
             *fills_consumed = *fills_consumed + 1;
             let maker_remaining = order::remaining_size(price_tree::level_borrow_order(level, head_key));
             let fill_qty = std::u64::min(*remaining_size, maker_remaining);
-            let quote_cost = checked_mul_u64(best_price, fill_qty);
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
+            // Maker-side (bid-resting-order) charge: a proportional floor of
+            // the order's actual `total_reserved` (never a fresh,
+            // independently-rounded ceiling), so the running charged total
+            // can never exceed what was truly reserved at placement time —
+            // this telescopes to exactly `total_reserved` with zero dust no
+            // matter how many separate fills the order is drained across.
+            // Read AFTER `decrease_remaining_size` so `cumulative_filled`
+            // reflects this fill.
+            let cumulative_filled = order::original_size(&maker_order) - order::remaining_size(&maker_order);
+            let cumulative_charged_u128 = ((order::total_reserved(&maker_order) as u128) * (cumulative_filled as u128))
+                / (order::original_size(&maker_order) as u128);
+            let cumulative_charged = cumulative_charged_u128 as u64;
+            let quote_cost = cumulative_charged - order::quote_charged_so_far(&maker_order);
+            order::set_quote_charged_so_far(&mut maker_order, cumulative_charged);
+
             let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
             let maker_fee_bps = order::maker_fee_bps(&maker_order);
             let maker_addr = order::owner(&maker_order);
@@ -1095,6 +1371,7 @@ fun fill_level_ask<Base, Quote>(
             });
 
             *remaining_size = *remaining_size - fill_qty;
+            *last_price = best_price;
 
             if (maker_remaining_after == 0) {
                 let (eb, eq) = order::destroy(maker_order);
@@ -1123,6 +1400,7 @@ fun match_ask<Base, Quote>(
     taker: address,
     event_book_id: ID,
     max_fills: u64,
+    last_price: &mut u64,
 ): (Balance<Quote>, Balance<Base>, u64, bool) {
     let mut remaining_size = remaining_size_in;
     let mut escrow_base = escrow_base_in;
@@ -1157,6 +1435,7 @@ fun match_ask<Base, Quote>(
             &mut fills_consumed,
             max_fills,
             taker_fee_bps,
+            last_price,
         );
         if (hit_max_fills) stopped_on_max_fills_while_crossing = true;
         if (stop) break;
@@ -1246,14 +1525,11 @@ public struct ProceedsClaimed has copy, drop {
     quote_amount: u64,
 }
 
-/// `price` is quote-atoms per base-atom (e.g. atomic USDC per atomic SUI),
-/// never a human-readable quote-per-base decimal ratio. When
-/// `quote_decimals < base_decimals`, the smallest expressible `price` is
-/// `10^(base_decimals - quote_decimals)` quote-atoms per base-atom; if that
-/// granularity is coarser than the pair's economically meaningful price
-/// resolution, this book cannot usefully quote it. Integrators should either
-/// reject such pairs at wrapper-construction time or pre-scale `price`/`size`
-/// themselves before calling in. See the `OrderBook` struct doc comment.
+/// `price` is a raw, book-relative unit; see the module doc comment for how
+/// it decodes to a true price via `price_scale`/`precision`/`exponent`, and
+/// `clob_admin_set_price_band_factor` for the optional additional band
+/// safeguard. Both checks are enforced here immediately after the
+/// zero-price check, before any escrow is taken.
 public fun place_limit_order_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     price: u64,
@@ -1261,27 +1537,60 @@ public fun place_limit_order_bid<Base, Quote>(
     mut payment: Coin<Quote>,
     max_fills: u64,
     ctx: &mut TxContext,
-): (OrderTicket, Coin<Base>, Coin<Quote>, bool) {
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     assert!(price != 0, EZeroPrice);
+    let price_scale = book.price_scale;
+    assert_price_in_declared_range(
+        price, price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
+    );
+    if (book.price_band_factor.is_some()) {
+        let factor = *book.price_band_factor.borrow();
+        assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
+        assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
+    };
     validate_size(book, size);
 
-    let escrow_amount = bid_escrow_amount(price, size);
+    let escrow_amount = bid_escrow_amount(book, price, size);
     let mut escrow = coin::into_balance(coin::split(&mut payment, escrow_amount, ctx));
 
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (asks, proceeds, fees) = (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator);
+    let (asks, proceeds, fees, last_price) =
+        (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_base, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(asks, proceeds, fees, taker_fee_bps, option::some(price), size, escrow, taker, event_book_id, max_fills);
+        match_bid(
+            asks, proceeds, fees, taker_fee_bps, option::some(price), size, escrow, taker, event_book_id,
+            max_fills, price_scale, last_price,
+        );
     escrow = remaining_escrow;
 
     let order_id = next_order_id(book);
-    let should_rest = remaining_size > 0 && !stopped_on_max_fills_while_crossing;
-    if (should_rest) {
-        let resting_escrow_amount = bid_escrow_amount(price, remaining_size);
+    // Derive the resting remainder's size from what the taker's leftover
+    // escrow can actually back, rather than resting the full unmatched
+    // `remaining_size` and possibly under-funding it: a fresh
+    // `bid_escrow_amount(book, price, remaining_size)` recomputation can, by
+    // ceiling-division superadditivity, demand strictly more than what's
+    // actually left over after the crossing sweep. Narrowing to `u64`
+    // happens AFTER the min-clamp, matching `fill_level_bid`'s
+    // affordable-quantity pattern. This mathematically guarantees
+    // `resting_escrow_amount <= balance::value(&escrow)` always (the
+    // identity `ceil(a/b) <= c <=> a <= c*b`), so the `balance::split` below
+    // can never abort.
+    let max_size_available_can_back_u128 =
+        ((balance::value(&escrow) as u128) * (price_scale as u128)) / (price as u128);
+    let remaining_size_u128 = remaining_size as u128;
+    let actual_resting_size =
+        (if (remaining_size_u128 < max_size_available_can_back_u128) { remaining_size_u128 }
+        else { max_size_available_can_back_u128 }) as u64;
+    // Gates on `actual_resting_size`, NOT raw `remaining_size` — a resting
+    // bid with real displayed size but zero/insufficient escrow must never
+    // be created.
+    let should_rest = actual_resting_size > 0 && !stopped_on_max_fills_while_crossing;
+    let ticket_opt = if (should_rest) {
+        let resting_escrow_amount = bid_escrow_amount(book, price, actual_resting_size);
         let resting_escrow = balance::split(&mut escrow, resting_escrow_amount);
         coin::join(&mut payment, coin::from_balance(escrow, ctx));
         // Snapshot the book's *current* maker-fee rate at the exact moment
@@ -1291,7 +1600,7 @@ public fun place_limit_order_bid<Base, Quote>(
         let resting = order::new(
             order_id,
             taker,
-            remaining_size,
+            actual_resting_size,
             option::none(),
             option::some(resting_escrow),
             maker_fee_bps_snapshot,
@@ -1302,25 +1611,25 @@ public fun place_limit_order_bid<Base, Quote>(
             order_book_id: event_book_id,
             side: true,
             price,
-            size: remaining_size,
+            size: actual_resting_size,
             trader: taker,
         });
+        option::some(OrderTicket {
+            order_id,
+            order_book_id: object::uid_to_inner(&book.id),
+            side: true,
+            price,
+        })
     } else {
         coin::join(&mut payment, coin::from_balance(escrow, ctx));
+        option::none()
     };
 
-    let ticket = OrderTicket {
-        order_id,
-        order_book_id: object::uid_to_inner(&book.id),
-        side: true,
-        price,
-    };
-    (ticket, coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
+    (ticket_opt, coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
 }
 
-/// `price` is quote-atoms per base-atom, not a human-readable quote-per-base
-/// decimal ratio; see `place_limit_order_bid`'s doc comment for the full
-/// note on price granularity when `quote_decimals < base_decimals`.
+/// `price` is a raw, book-relative unit; see `place_limit_order_bid`'s doc
+/// comment for the full note on price-range/band checks.
 public fun place_limit_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     price: u64,
@@ -1328,10 +1637,18 @@ public fun place_limit_order_ask<Base, Quote>(
     mut payment: Coin<Base>,
     max_fills: u64,
     ctx: &mut TxContext,
-): (OrderTicket, Coin<Base>, Coin<Quote>, bool) {
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     assert!(price != 0, EZeroPrice);
+    assert_price_in_declared_range(
+        price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
+    );
+    if (book.price_band_factor.is_some()) {
+        let factor = *book.price_band_factor.borrow();
+        assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
+        assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
+    };
     validate_size(book, size);
 
     let escrow_base = coin::into_balance(coin::split(&mut payment, size, ctx));
@@ -1339,13 +1656,17 @@ public fun place_limit_order_ask<Base, Quote>(
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (bids, proceeds, fees) = (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator);
+    let (bids, proceeds, fees, last_price) =
+        (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(bids, proceeds, fees, taker_fee_bps, option::some(price), size, escrow_base, taker, event_book_id, max_fills);
+        match_ask(
+            bids, proceeds, fees, taker_fee_bps, option::some(price), size, escrow_base, taker, event_book_id,
+            max_fills, last_price,
+        );
 
     let order_id = next_order_id(book);
     let should_rest = remaining_size > 0 && !stopped_on_max_fills_while_crossing;
-    if (should_rest) {
+    let ticket_opt = if (should_rest) {
         // Snapshot the book's *current* maker-fee rate at the exact moment
         // this resting order is constructed; later fee-rate changes never
         // retroactively affect an already-resting order.
@@ -1367,17 +1688,18 @@ public fun place_limit_order_ask<Base, Quote>(
             size: remaining_size,
             trader: taker,
         });
+        option::some(OrderTicket {
+            order_id,
+            order_book_id: object::uid_to_inner(&book.id),
+            side: false,
+            price,
+        })
     } else {
         coin::join(&mut payment, coin::from_balance(remaining_escrow, ctx));
+        option::none()
     };
 
-    let ticket = OrderTicket {
-        order_id,
-        order_book_id: object::uid_to_inner(&book.id),
-        side: false,
-        price,
-    };
-    (ticket, payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
+    (ticket_opt, payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
 public fun place_market_order_bid<Base, Quote>(
@@ -1394,13 +1716,18 @@ public fun place_market_order_bid<Base, Quote>(
     assert!(!is_paused(book), EBookPaused);
     validate_size(book, size);
 
+    let price_scale = book.price_scale;
     let budget_balance = coin::into_balance(coin::split(&mut payment, budget, ctx));
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (asks, proceeds, fees) = (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator);
+    let (asks, proceeds, fees, last_price) =
+        (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(asks, proceeds, fees, taker_fee_bps, option::none(), size, budget_balance, taker, event_book_id, max_fills);
+        match_bid(
+            asks, proceeds, fees, taker_fee_bps, option::none(), size, budget_balance, taker, event_book_id,
+            max_fills, price_scale, last_price,
+        );
 
     if (max_quote_in.is_some()) {
         let quote_spent = budget - balance::value(&remaining_budget);
@@ -1435,9 +1762,13 @@ public fun place_market_order_ask<Base, Quote>(
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (bids, proceeds, fees) = (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator);
+    let (bids, proceeds, fees, last_price) =
+        (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, _remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id, max_fills);
+        match_ask(
+            bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id,
+            max_fills, last_price,
+        );
 
     if (max_base_in.is_some()) {
         let base_spent = size - balance::value(&remaining_escrow);
@@ -1451,6 +1782,8 @@ public fun place_market_order_ask<Base, Quote>(
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
+/// `limit_price`, when `Some`, carries the same price-range/band checks
+/// documented on `place_limit_order_bid`.
 public fun swap_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     size: u64,
@@ -1464,15 +1797,31 @@ public fun swap_bid<Base, Quote>(
 ): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
+    let price_scale = book.price_scale;
+    if (limit_price.is_some()) {
+        let price = *limit_price.borrow();
+        assert_price_in_declared_range(
+            price, price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
+        );
+        if (book.price_band_factor.is_some()) {
+            let factor = *book.price_band_factor.borrow();
+            assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
+            assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
+        };
+    };
     validate_size(book, size);
 
     let budget_balance = coin::into_balance(coin::split(&mut payment, budget, ctx));
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (asks, proceeds, fees) = (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator);
+    let (asks, proceeds, fees, last_price) =
+        (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(asks, proceeds, fees, taker_fee_bps, limit_price, size, budget_balance, taker, event_book_id, max_fills);
+        match_bid(
+            asks, proceeds, fees, taker_fee_bps, limit_price, size, budget_balance, taker, event_book_id,
+            max_fills, price_scale, last_price,
+        );
 
     if (max_quote_in.is_some()) {
         let quote_spent = budget - balance::value(&remaining_budget);
@@ -1490,6 +1839,8 @@ public fun swap_bid<Base, Quote>(
     )
 }
 
+/// `limit_price`, when `Some`, carries the same price-range/band checks
+/// documented on `place_limit_order_bid`.
 public fun swap_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     size: u64,
@@ -1502,15 +1853,30 @@ public fun swap_ask<Base, Quote>(
 ): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
+    if (limit_price.is_some()) {
+        let price = *limit_price.borrow();
+        assert_price_in_declared_range(
+            price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
+        );
+        if (book.price_band_factor.is_some()) {
+            let factor = *book.price_band_factor.borrow();
+            assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
+            assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
+        };
+    };
     validate_size(book, size);
 
     let escrow_base = coin::into_balance(coin::split(&mut payment, size, ctx));
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (bids, proceeds, fees) = (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator);
+    let (bids, proceeds, fees, last_price) =
+        (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, _remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(bids, proceeds, fees, taker_fee_bps, limit_price, size, escrow_base, taker, event_book_id, max_fills);
+        match_ask(
+            bids, proceeds, fees, taker_fee_bps, limit_price, size, escrow_base, taker, event_book_id,
+            max_fills, last_price,
+        );
 
     if (max_base_in.is_some()) {
         let base_spent = size - balance::value(&remaining_escrow);
@@ -1763,6 +2129,11 @@ public fun bids_size_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): u6
     price_tree::size(&book.bids)
 }
 
+#[test_only]
+public fun last_price_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+    book.last_price
+}
+
 /// The book's own object id, derived from its `id: UID` field directly
 /// (`object::id` requires `key`, which this struct deliberately does not
 /// have — see the struct's own doc comment above).
@@ -1924,9 +2295,14 @@ public fun match_bid_for_testing<Base, Quote>(
     let event_book_id = book.event_id;
     let budget = coin::into_balance(payment);
     let taker_fee_bps = book.taker_fee_bps;
-    let (asks, proceeds, fees) = (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator);
+    let price_scale = book.price_scale;
+    let (asks, proceeds, fees, last_price) =
+        (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(asks, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, budget, taker, event_book_id, max_fills);
+        match_bid(
+            asks, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, budget, taker, event_book_id,
+            max_fills, price_scale, last_price,
+        );
     (
         coin::from_balance(matched_base, ctx),
         coin::from_balance(remaining_budget, ctx),
@@ -1950,9 +2326,13 @@ public fun match_ask_for_testing<Base, Quote>(
     let event_book_id = book.event_id;
     let escrow_base = coin::into_balance(payment);
     let taker_fee_bps = book.taker_fee_bps;
-    let (bids, proceeds, fees) = (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator);
+    let (bids, proceeds, fees, last_price) =
+        (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(bids, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, escrow_base, taker, event_book_id, max_fills);
+        match_ask(
+            bids, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, escrow_base, taker, event_book_id,
+            max_fills, last_price,
+        );
     (
         coin::from_balance(matched_quote, ctx),
         coin::from_balance(remaining_escrow, ctx),
