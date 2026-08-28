@@ -3156,7 +3156,7 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
 fun price_band_factor_just_inside_band_succeeds() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000);
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     // band: [1000/2, 1000*2] = [500, 2000]
     let low_ticket = rest_bid(&mut book, 500, MIN_SIZE, 10, scenario.ctx());
@@ -3172,7 +3172,7 @@ fun price_band_factor_just_inside_band_succeeds() {
 fun price_band_factor_just_outside_band_below_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000);
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     let ticket = rest_bid(&mut book, 499, MIN_SIZE, 10, scenario.ctx()); // just below the [500, 2000] band
     unit_test::destroy(ticket);
@@ -3185,7 +3185,7 @@ fun price_band_factor_just_outside_band_below_aborts() {
 fun price_band_factor_just_outside_band_above_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000);
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     let ticket = rest_bid(&mut book, 2001, MIN_SIZE, 10, scenario.ctx()); // just above the [500, 2000] band
     unit_test::destroy(ticket);
@@ -3197,7 +3197,7 @@ fun price_band_factor_just_outside_band_above_aborts() {
 fun set_last_price_empty_book_is_unconstrained() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 12_345);
+    tiny_clob::set_last_price(&mut book, 12_345);
     assert!(tiny_clob::last_price_for_testing(&book) == 12_345, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3209,7 +3209,7 @@ fun set_last_price_below_best_bid_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 999);
+    tiny_clob::set_last_price(&mut book, 999);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3220,9 +3220,9 @@ fun set_last_price_at_or_above_best_bid_succeeds_with_only_bid_present() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1000); // exactly the best bid
+    tiny_clob::set_last_price(&mut book, 1000); // exactly the best bid
     assert!(tiny_clob::last_price_for_testing(&book) == 1000, 0);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 5_000_000); // far above; no best ask to bound it
+    tiny_clob::set_last_price(&mut book, 5_000_000); // far above; no best ask to bound it
     assert!(tiny_clob::last_price_for_testing(&book) == 5_000_000, 1);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -3235,7 +3235,7 @@ fun set_last_price_above_best_ask_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 2001);
+    tiny_clob::set_last_price(&mut book, 2001);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3246,9 +3246,9 @@ fun set_last_price_at_or_below_best_ask_succeeds_with_only_ask_present() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 2000); // exactly the best ask
+    tiny_clob::set_last_price(&mut book, 2000); // exactly the best ask
     assert!(tiny_clob::last_price_for_testing(&book) == 2000, 0);
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1); // far below; no best bid to bound it
+    tiny_clob::set_last_price(&mut book, 1); // far below; no best bid to bound it
     assert!(tiny_clob::last_price_for_testing(&book) == 1, 1);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -3261,7 +3261,7 @@ fun set_last_price_within_spread_both_sides_present_succeeds() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 1500);
+    tiny_clob::set_last_price(&mut book, 1500);
     assert!(tiny_clob::last_price_for_testing(&book) == 1500, 0);
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
@@ -3276,7 +3276,7 @@ fun set_last_price_below_bid_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 999);
+    tiny_clob::set_last_price(&mut book, 999);
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -3290,7 +3290,7 @@ fun set_last_price_above_ask_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::clob_admin_set_last_price(&cap, &mut book, 2001);
+    tiny_clob::set_last_price(&mut book, 2001);
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -3593,6 +3593,98 @@ fun fresh_order_lifetime_total_still_exact_under_proportional_floor() {
     assert!(coin::burn_for_testing(cq) == 0, 2);
     assert!(coin::burn_for_testing(cb) == size, 3);
 
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Regression: L-01 -- ceiling (not floor) division on the per-fill
+// escrow charge, closing the "free base, full refund" exploit ===
+//
+// When `total_reserved < original_size` (the shortfall scenario above), a
+// small fill's proportional share of `total_reserved` can be a fraction
+// less than 1. A FLOOR-based accumulator (the scheme this file used to
+// document, see the section above) rounds that fraction down to 0, so
+// `quote_charged_so_far` stays at 0 even though the maker's resting bid
+// already paid out real `Base` to the taker for that fill. A maker could
+// then cancel immediately afterward and receive a FULL escrow refund (since
+// nothing was ever recorded as charged) while keeping the `Base` they
+// already received for free -- extracting real value for zero payment.
+//
+// `fill_level_ask` now charges each fill a proportional CEILING of
+// `total_reserved`, clamped at `total_reserved` itself (the clamp is
+// defensive/redundant: `ceil(total_reserved * original_size / original_size)
+// == total_reserved` exactly at full fill). This guarantees any fill with
+// `cumulative_filled >= 1` charges `cumulative_charged >= 1`, so
+// `quote_charged_so_far` becomes nonzero after any real fill -- a maker
+// cancelling afterward forfeits at least 1 quote atom of escrow, closing the
+// exploit. (This does not guarantee every individual fill of a
+// multi-taker-filled order charges nonzero marginal `quote_cost` -- a later
+// filler of the same order can still see a 0 marginal charge if an earlier
+// filler already absorbed the whole tiny escrow. That residual is bounded
+// under 1 quote atom of true value and is an accepted, understood
+// trade-off, not addressed by this fix.)
+//
+// Uses the same shortfall book as above (`price=5`, `price_scale=18`):
+// resting bid remainder after the placement-time clamp has
+// `original_size=7`, `total_reserved=2` (see the derivation in the
+// "resting-remainder escrow rounding shortfall" section). A 1-unit fill's
+// proportional share is `2*1/7 = 0.2857...`:
+//   floor(2*1/7) = 0  -- the OLD scheme: quote_cost = 0, exploit possible.
+//   ceil(2*1/7)  = 1  -- the FIX: quote_cost = 1, nonzero.
+#[test]
+fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = shortfall_book(&mut scenario);
+
+    // One resting ask of size 1 so the incoming bid below crosses exactly
+    // this much before resting its remainder (identical setup to
+    // `partial_cross_then_rest_clamps_resting_escrow_to_available`).
+    scenario.next_tx(MAKER_A);
+    let ask_ticket = rest_ask(&mut book, SHORTFALL_PRICE, 1, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let payment = coin::mint_for_testing<USDC>(3, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, _) =
+        tiny_clob::place_limit_order_bid(&mut book, SHORTFALL_PRICE, 10, payment, 10, scenario.ctx());
+    assert!(coin::burn_for_testing(matched_base) == 1, 0);
+    assert!(coin::burn_for_testing(leftover_quote) == 0, 1);
+    let bid_ticket = option::destroy_some(ticket_opt);
+    // Resting remainder: original_size=7, total_reserved=2 (clamped, per the
+    // shortfall derivation above).
+
+    // A tiny 1-unit ask fills the resting bid's front (only) order by 1 --
+    // small enough that `2*1/7` floors to 0 under the old scheme, but
+    // ceils to 1 under the fix.
+    scenario.next_tx(MAKER_B);
+    let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (t, leftover_base, matched_quote, _) =
+        tiny_clob::place_limit_order_ask(&mut book, SHORTFALL_PRICE, 1, base, 10, scenario.ctx());
+    assert!(option::is_none(&t), 2); // fully consumed by the resting bid
+    option::destroy_none(t);
+    assert!(coin::burn_for_testing(leftover_base) == 0, 3);
+    // The maker fee bps is 0 in this book, so taker fee is also 0: the full
+    // charged quote_cost flows through to the ask taker as matched_quote.
+    // This is the fix in action: under the old floor scheme this would be
+    // 0; under the ceiling fix it is 1 -- nonzero.
+    assert!(coin::burn_for_testing(matched_quote) == 1, 4);
+
+    // Cancel the resting bid immediately after. Under the OLD floor scheme,
+    // `quote_charged_so_far` would still read 0 here, so the maker would
+    // get back the FULL `total_reserved` (2) in the quote leg while ALSO
+    // having already received 1 unit of `Base` for free via the pooled
+    // proceeds joined into `cancel_order`'s base return -- the exploit.
+    // Under the fix, the maker's quote refund is strictly less than
+    // `total_reserved`: they forfeit exactly the 1 quote atom that was
+    // actually charged for the free base they received.
+    scenario.next_tx(TAKER);
+    let (cb, cq) = tiny_clob::cancel_order(&mut book, bid_ticket, scenario.ctx());
+    let cb_val = coin::burn_for_testing(cb);
+    let cq_val = coin::burn_for_testing(cq);
+    assert!(cb_val == 1, 5); // the free base, received via pooled proceeds
+    assert!(cq_val < 2, 6); // strictly less than total_reserved -- forfeited
+    assert!(cq_val == 1, 7); // exact: total_reserved(2) - charged(1) = 1
+
+    unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

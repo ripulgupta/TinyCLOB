@@ -14,7 +14,9 @@
 /// book's declared guarantee on representable true-price resolution/range;
 /// an optional `price_band_factor` (see `clob_admin_set_price_band_factor`)
 /// is a further, independent safeguard bounding every placed order's `price`
-/// to a factor of the book's `last_price`.
+/// to a factor of the book's `last_price`. `set_last_price` resets that
+/// reference point and, unlike most controls in this module, requires no
+/// capability at all.
 module tiny_clob::tiny_clob;
 
 use sui::balance::{Self, Balance};
@@ -60,10 +62,10 @@ const EPriceAboveBand: u64 = 24;
 /// zero-valued factor can never bound any price and is always a caller
 /// mistake.
 const EZeroPriceBandFactor: u64 = 25;
-/// `clob_admin_set_last_price` was called with a value below the book's
+/// `set_last_price` was called with a value below the book's
 /// current best bid.
 const EResetPriceBelowBestBid: u64 = 26;
-/// `clob_admin_set_last_price` was called with a value above the book's
+/// `set_last_price` was called with a value above the book's
 /// current best ask.
 const EResetPriceAboveBestAsk: u64 = 27;
 /// A decimals/precision/exponent argument to `new`/`new_with_event_id_override`
@@ -262,7 +264,7 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     /// The price (in the book's raw, `price_scale`-relative units) of the
     /// most recent real fill, or the constructor-supplied
     /// `initial_last_price` if no fill has ever occurred. Seeds and anchors
-    /// `price_band_factor`'s optional band. See `clob_admin_set_last_price`.
+    /// `price_band_factor`'s optional band. See `set_last_price`.
     last_price: u64,
     /// Optional additional safeguard, independent of `precision`/`exponent`:
     /// when set, every placed order's `price` must fall within
@@ -334,7 +336,7 @@ fun u64_max_as_u256(): u256 { U64_MAX as u256 }
 /// `precision`/`exponent` guarantee is representable: true price must be at
 /// least `10^-precision` and at most `10^exponent`. Raw scalars only —
 /// deliberately NOT `&OrderBook` — reused unmodified across 6 call sites in
-/// 3 categories: construction (`new_impl`), `clob_admin_set_last_price`, and
+/// 3 categories: construction (`new_impl`), `set_last_price`, and
 /// order placement (`place_limit_order_bid`/`_ask`, `swap_bid`/`_ask`), the
 /// first of which has no live book reference to borrow yet.
 fun assert_price_in_declared_range(
@@ -376,7 +378,7 @@ fun assert_price_in_declared_range(
 /// representable precision subject to fitting in a `u64`; construction
 /// aborts with `EPriceRangeInfeasible` if no valid `price_scale` exists for
 /// the declared inputs. `initial_last_price` seeds the book's `last_price`
-/// (see `clob_admin_set_last_price`), the reference point an optional
+/// (see `set_last_price`), the reference point an optional
 /// `price_band_factor` bounds every placed order's `price` against; it must
 /// be nonzero and must itself decode to a true price within the declared
 /// `precision`/`exponent` range.
@@ -768,20 +770,32 @@ public struct LastPriceSet has copy, drop {
     last_price: u64,
 }
 
-/// Admin-gated reset of the book's `last_price` reference point (see
+/// Permissionless reset of the book's `last_price` reference point (see
 /// `OrderBook.last_price`'s doc comment). `new_last_price` must be nonzero,
 /// must decode to a true price within the book's declared
 /// `precision`/`exponent` range, and — if a best bid/ask currently exists —
-/// must not cross it (an admin-set `last_price` inside the live spread can
+/// must not cross it (a set `last_price` inside the live spread can
 /// never itself be an executable price, so this rules out setting a
 /// nonsensical reference point).
-public fun clob_admin_set_last_price<Base, Quote>(
-    cap: &ClobAdminCap,
+///
+/// Deliberately not capability-gated. The spread-bound check above already
+/// makes this a no-op safety-wise whenever real resting liquidity exists —
+/// it can only move `last_price` to somewhere at least as constrained as
+/// the live spread already permits. When the book is empty near the
+/// reference price, the check is unconstrained (no best bid/ask means no
+/// bound applies) — but that state is already reachable cheaply by anyone
+/// via self-crossing trades, so gating this setter behind `ClobAdminCap`
+/// blocked no real attack while adding pure friction: a genuine caller
+/// recovering from a stale or walked-away `last_price` had to run multiple
+/// self-crossing rounds, or wait on the admin, just to unblock their own
+/// order placement. Now they can call this directly — optionally bundled
+/// with their order-placement call in the same PTB for atomicity — the
+/// moment the book is unconstrained at that price.
+public fun set_last_price<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     new_last_price: u64,
 ) {
     assert_book_version(book);
-    assert_clob_admin(cap, book);
     assert!(new_last_price != 0, EZeroPrice);
     assert_price_in_declared_range(
         new_last_price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
@@ -1330,17 +1344,28 @@ fun fill_level_ask<Base, Quote>(
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
-            // Maker-side (bid-resting-order) charge: a proportional floor of
-            // the order's actual `total_reserved` (never a fresh,
-            // independently-rounded ceiling), so the running charged total
-            // can never exceed what was truly reserved at placement time —
-            // this telescopes to exactly `total_reserved` with zero dust no
+            // Maker-side (bid-resting-order) charge: a proportional ceiling
+            // of the order's actual `total_reserved`, clamped at
+            // `total_reserved` so the running charged total can never exceed
+            // what was truly reserved at placement time. Ceiling (not floor)
+            // ensures any real, nonzero base fill charges at least 1 quote
+            // atom, closing an exploit where a floor rounds a tiny fill's
+            // charge down to 0 and lets the maker cancel afterward for a
+            // full escrow refund while keeping the base already received.
+            // At full drain, ceil(total_reserved * original_size /
+            // original_size) == total_reserved exactly, so this still
+            // telescopes to exactly `total_reserved` with zero dust no
             // matter how many separate fills the order is drained across.
             // Read AFTER `decrease_remaining_size` so `cumulative_filled`
             // reflects this fill.
             let cumulative_filled = order::original_size(&maker_order) - order::remaining_size(&maker_order);
-            let cumulative_charged_u128 = ((order::total_reserved(&maker_order) as u128) * (cumulative_filled as u128))
-                / (order::original_size(&maker_order) as u128);
+            let total_reserved_u128 = order::total_reserved(&maker_order) as u128;
+            let original_size_u128 = order::original_size(&maker_order) as u128;
+            let cumulative_filled_u128 = cumulative_filled as u128;
+            let ceil_charged_u128 =
+                (total_reserved_u128 * cumulative_filled_u128 + original_size_u128 - 1) / original_size_u128;
+            let cumulative_charged_u128 =
+                if (ceil_charged_u128 < total_reserved_u128) { ceil_charged_u128 } else { total_reserved_u128 };
             let cumulative_charged = cumulative_charged_u128 as u64;
             let quote_cost = cumulative_charged - order::quote_charged_so_far(&maker_order);
             order::set_quote_charged_so_far(&mut maker_order, cumulative_charged);
@@ -1782,8 +1807,11 @@ public fun place_market_order_ask<Base, Quote>(
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
-/// `limit_price`, when `Some`, carries the same price-range/band checks
-/// documented on `place_limit_order_bid`.
+/// `limit_price`, when `Some`, is validated for representability via the
+/// same price-range check documented on `place_limit_order_bid`, but is
+/// NOT subject to the price-band check — it's the taker's own protective
+/// slippage cap, not a price that can rest on the book, so a self-imposed
+/// tighter cap must never be rejected.
 public fun swap_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     size: u64,
@@ -1803,11 +1831,6 @@ public fun swap_bid<Base, Quote>(
         assert_price_in_declared_range(
             price, price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
         );
-        if (book.price_band_factor.is_some()) {
-            let factor = *book.price_band_factor.borrow();
-            assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
-            assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
-        };
     };
     validate_size(book, size);
 
@@ -1839,8 +1862,11 @@ public fun swap_bid<Base, Quote>(
     )
 }
 
-/// `limit_price`, when `Some`, carries the same price-range/band checks
-/// documented on `place_limit_order_bid`.
+/// `limit_price`, when `Some`, is validated for representability via the
+/// same price-range check documented on `place_limit_order_bid`, but is
+/// NOT subject to the price-band check — it's the taker's own protective
+/// slippage cap, not a price that can rest on the book, so a self-imposed
+/// tighter cap must never be rejected.
 public fun swap_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     size: u64,
@@ -1858,11 +1884,6 @@ public fun swap_ask<Base, Quote>(
         assert_price_in_declared_range(
             price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
         );
-        if (book.price_band_factor.is_some()) {
-            let factor = *book.price_band_factor.borrow();
-            assert!((price as u128) * (factor as u128) >= (book.last_price as u128), EPriceBelowBand);
-            assert!((price as u128) <= (book.last_price as u128) * (factor as u128), EPriceAboveBand);
-        };
     };
     validate_size(book, size);
 

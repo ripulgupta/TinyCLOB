@@ -37,11 +37,12 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// resting, this is the post-sweep remainder, not the taker's original
     /// full requested size). Never mutated afterward. Together with
     /// `quote_charged_so_far`, this lets `fill_level_ask` charge a resting
-    /// bid's escrow via a delta-of-cumulative-proportional-floor scheme
-    /// (`total_reserved * cumulative_filled / original_size` at each fill,
-    /// minus what was already charged) that telescopes to exactly the
-    /// order's actual `total_reserved` escrow with zero dust, no matter how
-    /// many separate fills/transactions the order is drained across. Only
+    /// bid's escrow via a delta-of-cumulative-proportional-ceiling scheme
+    /// (`ceil(total_reserved * cumulative_filled / original_size)`, clamped
+    /// at `total_reserved`, at each fill, minus what was already charged)
+    /// that telescopes to exactly the order's actual `total_reserved`
+    /// escrow with zero dust, no matter how many separate fills/transactions
+    /// the order is drained across. Only
     /// bid-side resting orders need this field; it exists (unused) on
     /// ask-side orders too, matching how `escrow_base`/`escrow_quote`
     /// already sit unused on one side or the other.
@@ -57,9 +58,9 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// `bid_escrow_amount` recomputation, it already reflects any rounding
     /// shortfall clamped in at placement (see `place_limit_order_bid`'s
     /// resting-remainder clamp). `fill_level_ask` charges each fill a
-    /// proportional floor of this value rather than an independently
-    /// re-derived ceiling, so the running total can never exceed what was
-    /// actually reserved. Only bid-side resting orders need this field; it
+    /// proportional ceiling of this value, clamped at `total_reserved`
+    /// itself, so the running total can never exceed what was actually
+    /// reserved. Only bid-side resting orders need this field; it
     /// exists (unused) on ask-side orders too, matching how
     /// `escrow_base`/`escrow_quote` already sit unused on one side or the
     /// other.
