@@ -8,7 +8,7 @@ use sui::event;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsClaimed};
 use tiny_clob::order;
-use tiny_clob::test_markers::{BTC, USDC};
+use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 
 const ADMIN: address = @0xA11CE;
 const OTHER: address = @0xB0B;
@@ -3152,11 +3152,384 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     scenario.end();
 }
 
+// === Pair-decimal coverage: realistic decimal combinations ===
+//
+// The tests below exercise `price_scale` derivation and the resulting raw
+// `price` range for decimal-pair shapes not covered by
+// `btc_usdc_realistic_price_scale_end_to_end` above: a base/quote decimals
+// reversal (USDC/BTC), two more common Sui-ecosystem decimal shapes
+// (BTC/SUI, SUI/BTC), and a same-decimals pair (WAL/SUI, both 9 decimals).
+//
+// For each pair, `P_min`/`P_max` (the smallest/largest raw `price` that
+// `assert_price_in_declared_range` accepts) are derived by hand from that
+// function's two inequalities, mirroring the derivation in its doc comment:
+//   scale * 10^quote_dec <= price * 10^base_dec * 10^precision   (min bound)
+//   price * 10^base_dec <= 10^exponent * scale * 10^quote_dec    (max bound)
+// which solve to:
+//   P_min = ceil(scale * 10^quote_dec / (10^base_dec * 10^precision))
+//   P_max = floor(10^exponent * scale * 10^quote_dec / 10^base_dec)
+// with `scale` itself derived the same way `new`/`price_scale` derive it
+// (see that function's doc comment): `scale_hi = floor(u64::MAX * 10^base_dec
+// / (10^quote_dec * 10^exponent))`, and `price_scale = scale_hi` whenever
+// `scale_hi <= u64::MAX` (true for every book below). These were computed
+// out-of-band (Python, mirroring the exact integer arithmetic) and are
+// hardcoded here as named constants with the derivation shown per-test;
+// `bid_escrow_amount` itself is always called through the real API rather
+// than hand-computed, so only the raw `price` values below are "derived
+// offline" — the escrow amounts they produce are asserted against the
+// book's own computation.
+
+/// `USDC/BTC`: `Base` = USDC (6 decimals), `Quote` = BTC (8 decimals) — the
+/// reverse orientation of `btc_usdc_realistic_price_scale_end_to_end` above,
+/// i.e. this book's raw prices express "BTC per USDC". A true BTC/USDC spot
+/// price around $117,647 implies a true USDC/BTC price around
+/// 1/117,647 ≈ 0.0000085 (8.5e-6) BTC per USDC — a tiny fraction, so this
+/// book needs `precision` deep enough to represent values below `10^-6`.
+/// `precision=8, exponent=0` declares a representable true-price range of
+/// `[10^-8, 10^0]`, which comfortably straddles 8.5e-6 with margin on both
+/// ends (unlike the BTC/USDC book, the max true price here is bounded by 1,
+/// since a fraction of a BTC per USDC can never realistically reach 1).
+///
+/// With `base_decimals=6, quote_decimals=8, precision=8, exponent=0`:
+/// `scale_hi = floor(u64::MAX * 10^6 / (10^8 * 10^0)) = floor(u64::MAX / 100)
+/// = 184_467_440_737_095_516 = price_scale`.
+/// `P_min = ceil(scale * 10^8 / (10^6 * 10^8)) = ceil(scale / 10^6)
+/// = 184_467_440_738`.
+/// `P_max = floor(10^0 * scale * 10^8 / 10^6) = floor(scale * 100)
+/// = 18_446_744_073_709_551_600`.
+#[test]
+fun usdc_btc_reversed_pair_price_extremes_and_adjacent_ticks() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 184_467_440_738;
+    let p_max: u64 = 18_446_744_073_709_551_600;
+    // Realistic mid-range price: true price ≈ 8.5e-6 BTC per USDC (see doc
+    // comment above), which decodes to this raw price via
+    // `price = true_price * price_scale * 10^(quote_dec - base_dec)`.
+    let p_mid: u64 = 156_797_403_025_233;
+
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_mid, scenario.ctx());
+    let scale = tiny_clob::price_scale(&book);
+    assert!(scale == 184_467_440_737_095_516, 0);
+
+    // (b) Extreme minimum representable raw price: rests, checks depth,
+    // cancels, verifies exact escrow refund.
+    let size = MIN_SIZE;
+    let min_escrow = tiny_clob::bid_escrow_amount(&book, p_min, size);
+    let min_payment = coin::mint_for_testing<BTC>(min_escrow, scenario.ctx());
+    let (min_ticket_opt, min_matched, min_leftover, min_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+    assert!(!min_stopped, 1);
+    assert!(coin::burn_for_testing(min_matched) == 0, 2);
+    assert!(coin::burn_for_testing(min_leftover) == 0, 3);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_min) == size, 4);
+    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(min_b) == 0, 5);
+    assert!(coin::burn_for_testing(min_q) == min_escrow, 6);
+
+    // (c) Extreme maximum representable raw price: same checks.
+    let max_escrow = tiny_clob::bid_escrow_amount(&book, p_max, size);
+    let max_payment = coin::mint_for_testing<BTC>(max_escrow, scenario.ctx());
+    let (max_ticket_opt, max_matched, max_leftover, max_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+    assert!(!max_stopped, 7);
+    assert!(coin::burn_for_testing(max_matched) == 0, 8);
+    assert!(coin::burn_for_testing(max_leftover) == 0, 9);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_max) == size, 10);
+    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(max_b) == 0, 11);
+    assert!(coin::burn_for_testing(max_q) == max_escrow, 12);
+
+    // (d) Two adjacent raw price ticks at a realistic fair-value level: both
+    // rest as genuinely distinct price levels.
+    let mid_size = 1_000;
+    let mid_escrow = tiny_clob::bid_escrow_amount(&book, p_mid, mid_size);
+    let mid_payment = coin::mint_for_testing<BTC>(mid_escrow, scenario.ctx());
+    let (mid_ticket_opt, mid_matched, mid_leftover, mid_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid, mid_size, mid_payment, 10, scenario.ctx());
+    assert!(!mid_stopped, 13);
+    assert!(coin::burn_for_testing(mid_matched) == 0, 14);
+    assert!(coin::burn_for_testing(mid_leftover) == 0, 15);
+
+    let p_mid_next = p_mid + 1;
+    let mid_next_escrow = tiny_clob::bid_escrow_amount(&book, p_mid_next, mid_size);
+    let mid_next_payment = coin::mint_for_testing<BTC>(mid_next_escrow, scenario.ctx());
+    let (mid_next_ticket_opt, mid_next_matched, mid_next_leftover, mid_next_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid_next, mid_size, mid_next_payment, 10, scenario.ctx());
+    assert!(!mid_next_stopped, 16);
+    assert!(coin::burn_for_testing(mid_next_matched) == 0, 17);
+    assert!(coin::burn_for_testing(mid_next_leftover) == 0, 18);
+
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid) == mid_size, 19);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid_next) == mid_size, 20);
+    assert!(p_mid != p_mid_next, 21);
+
+    unit_test::destroy(mid_ticket_opt.destroy_some());
+    unit_test::destroy(mid_next_ticket_opt.destroy_some());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+/// `BTC/SUI`: `Base` = BTC (8 decimals), `Quote` = SUI (9 decimals). A true
+/// BTC/SUI spot price around 33,714 SUI per BTC (e.g. BTC ≈ $118,000, SUI ≈
+/// $3.50). `precision=0, exponent=6` declares a representable true-price
+/// range of `[10^0, 10^6]` (1 to 1,000,000 SUI per BTC), comfortably
+/// straddling 33,714 with wide margin on both ends — SUI/BTC has never been,
+/// and is unlikely soon to be, outside that six-decade band.
+///
+/// With `base_decimals=8, quote_decimals=9, precision=0, exponent=6`:
+/// `scale_hi = floor(u64::MAX * 10^8 / (10^9 * 10^6)) = floor(u64::MAX /
+/// 10^7) = 1_844_674_407_370 = price_scale`.
+/// `P_min = ceil(scale * 10^9 / (10^8 * 10^0)) = ceil(scale * 10) =
+/// 18_446_744_073_700`.
+/// `P_max = floor(10^6 * scale * 10^9 / 10^8) = floor(scale * 10^7) =
+/// 18_446_744_073_700_000_000`.
+#[test]
+fun btc_sui_pair_price_extremes_and_adjacent_ticks() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 18_446_744_073_700;
+    let p_max: u64 = 18_446_744_073_700_000_000;
+    // Realistic mid-range price: true price = 33,714 SUI per BTC (see doc
+    // comment above).
+    let p_mid: u64 = 621_913_529_700_721_800;
+
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(MIN_SIZE, 8, 9, 0, 6, p_mid, scenario.ctx());
+    let scale = tiny_clob::price_scale(&book);
+    assert!(scale == 1_844_674_407_370, 0);
+
+    // (b) Extreme minimum representable raw price.
+    let size = MIN_SIZE;
+    let min_escrow = tiny_clob::bid_escrow_amount(&book, p_min, size);
+    let min_payment = coin::mint_for_testing<SUI>(min_escrow, scenario.ctx());
+    let (min_ticket_opt, min_matched, min_leftover, min_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+    assert!(!min_stopped, 1);
+    assert!(coin::burn_for_testing(min_matched) == 0, 2);
+    assert!(coin::burn_for_testing(min_leftover) == 0, 3);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_min) == size, 4);
+    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(min_b) == 0, 5);
+    assert!(coin::burn_for_testing(min_q) == min_escrow, 6);
+
+    // (c) Extreme maximum representable raw price.
+    let max_escrow = tiny_clob::bid_escrow_amount(&book, p_max, size);
+    let max_payment = coin::mint_for_testing<SUI>(max_escrow, scenario.ctx());
+    let (max_ticket_opt, max_matched, max_leftover, max_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+    assert!(!max_stopped, 7);
+    assert!(coin::burn_for_testing(max_matched) == 0, 8);
+    assert!(coin::burn_for_testing(max_leftover) == 0, 9);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_max) == size, 10);
+    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(max_b) == 0, 11);
+    assert!(coin::burn_for_testing(max_q) == max_escrow, 12);
+
+    // (d) Two adjacent raw price ticks at a realistic fair-value level.
+    let mid_size = 1_000;
+    let mid_escrow = tiny_clob::bid_escrow_amount(&book, p_mid, mid_size);
+    let mid_payment = coin::mint_for_testing<SUI>(mid_escrow, scenario.ctx());
+    let (mid_ticket_opt, mid_matched, mid_leftover, mid_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid, mid_size, mid_payment, 10, scenario.ctx());
+    assert!(!mid_stopped, 13);
+    assert!(coin::burn_for_testing(mid_matched) == 0, 14);
+    assert!(coin::burn_for_testing(mid_leftover) == 0, 15);
+
+    let p_mid_next = p_mid + 1;
+    let mid_next_escrow = tiny_clob::bid_escrow_amount(&book, p_mid_next, mid_size);
+    let mid_next_payment = coin::mint_for_testing<SUI>(mid_next_escrow, scenario.ctx());
+    let (mid_next_ticket_opt, mid_next_matched, mid_next_leftover, mid_next_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid_next, mid_size, mid_next_payment, 10, scenario.ctx());
+    assert!(!mid_next_stopped, 16);
+    assert!(coin::burn_for_testing(mid_next_matched) == 0, 17);
+    assert!(coin::burn_for_testing(mid_next_leftover) == 0, 18);
+
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid) == mid_size, 19);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid_next) == mid_size, 20);
+    assert!(p_mid != p_mid_next, 21);
+
+    unit_test::destroy(mid_ticket_opt.destroy_some());
+    unit_test::destroy(mid_next_ticket_opt.destroy_some());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+/// `SUI/BTC`: `Base` = SUI (9 decimals), `Quote` = BTC (8 decimals) — the
+/// reverse orientation of the BTC/SUI book above, i.e. raw prices express
+/// "BTC per SUI". A true SUI/BTC spot price around 1/33,714 ≈ 0.0000297
+/// (2.97e-5) BTC per SUI. `precision=8, exponent=0` declares a representable
+/// true-price range of `[10^-8, 10^0]`, comfortably straddling 2.97e-5.
+///
+/// With `base_decimals=9, quote_decimals=8, precision=8, exponent=0`:
+/// `scale_hi = floor(u64::MAX * 10^9 / (10^8 * 10^0)) = floor(u64::MAX * 10)
+/// `, which exceeds `u64::MAX`, so `price_scale = u64::MAX =
+/// 18_446_744_073_709_551_615` (the `scale_hi > u64::MAX` clamp case in
+/// `new_impl`, unlike the other three books here where `scale_hi` itself is
+/// the binding value).
+/// `P_min = ceil(scale * 10^8 / (10^9 * 10^8)) = ceil(scale / 10) =
+/// 18_446_744_074` (rounds up since `scale` is odd).
+/// `P_max = floor(10^0 * scale * 10^8 / 10^9) = floor(scale / 10) =
+/// 1_844_674_407_370_955_161`.
+#[test]
+fun sui_btc_reversed_pair_price_extremes_and_adjacent_ticks() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 18_446_744_074;
+    let p_max: u64 = 1_844_674_407_370_955_161;
+    // Realistic mid-range price: true price ≈ 2.97e-5 BTC per SUI (see doc
+    // comment above).
+    let p_mid: u64 = 54_715_382_552_380;
+
+    let (mut book, cap) = tiny_clob::new<SUI, BTC>(MIN_SIZE, 9, 8, 8, 0, p_mid, scenario.ctx());
+    let scale = tiny_clob::price_scale(&book);
+    assert!(scale == 18_446_744_073_709_551_615, 0);
+
+    // (b) Extreme minimum representable raw price.
+    let size = MIN_SIZE;
+    let min_escrow = tiny_clob::bid_escrow_amount(&book, p_min, size);
+    let min_payment = coin::mint_for_testing<BTC>(min_escrow, scenario.ctx());
+    let (min_ticket_opt, min_matched, min_leftover, min_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+    assert!(!min_stopped, 1);
+    assert!(coin::burn_for_testing(min_matched) == 0, 2);
+    assert!(coin::burn_for_testing(min_leftover) == 0, 3);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_min) == size, 4);
+    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(min_b) == 0, 5);
+    assert!(coin::burn_for_testing(min_q) == min_escrow, 6);
+
+    // (c) Extreme maximum representable raw price.
+    let max_escrow = tiny_clob::bid_escrow_amount(&book, p_max, size);
+    let max_payment = coin::mint_for_testing<BTC>(max_escrow, scenario.ctx());
+    let (max_ticket_opt, max_matched, max_leftover, max_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+    assert!(!max_stopped, 7);
+    assert!(coin::burn_for_testing(max_matched) == 0, 8);
+    assert!(coin::burn_for_testing(max_leftover) == 0, 9);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_max) == size, 10);
+    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(max_b) == 0, 11);
+    assert!(coin::burn_for_testing(max_q) == max_escrow, 12);
+
+    // (d) Two adjacent raw price ticks at a realistic fair-value level.
+    let mid_size = 1_000;
+    let mid_escrow = tiny_clob::bid_escrow_amount(&book, p_mid, mid_size);
+    let mid_payment = coin::mint_for_testing<BTC>(mid_escrow, scenario.ctx());
+    let (mid_ticket_opt, mid_matched, mid_leftover, mid_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid, mid_size, mid_payment, 10, scenario.ctx());
+    assert!(!mid_stopped, 13);
+    assert!(coin::burn_for_testing(mid_matched) == 0, 14);
+    assert!(coin::burn_for_testing(mid_leftover) == 0, 15);
+
+    let p_mid_next = p_mid + 1;
+    let mid_next_escrow = tiny_clob::bid_escrow_amount(&book, p_mid_next, mid_size);
+    let mid_next_payment = coin::mint_for_testing<BTC>(mid_next_escrow, scenario.ctx());
+    let (mid_next_ticket_opt, mid_next_matched, mid_next_leftover, mid_next_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid_next, mid_size, mid_next_payment, 10, scenario.ctx());
+    assert!(!mid_next_stopped, 16);
+    assert!(coin::burn_for_testing(mid_next_matched) == 0, 17);
+    assert!(coin::burn_for_testing(mid_next_leftover) == 0, 18);
+
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid) == mid_size, 19);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid_next) == mid_size, 20);
+    assert!(p_mid != p_mid_next, 21);
+
+    unit_test::destroy(mid_ticket_opt.destroy_some());
+    unit_test::destroy(mid_next_ticket_opt.destroy_some());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+/// `WAL/SUI`: a same-decimals pair (`Base` = WAL, `Quote` = SUI, both 9
+/// decimals) — the case `base_decimals == quote_decimals`, where the
+/// `10^(base_dec - quote_dec)` scaling factor from the module's true-price
+/// formula is exactly 1 and raw price tracks true price most directly of
+/// any shape covered here. A plausible WAL/SUI true price around 2.5 SUI
+/// per WAL. `precision=2, exponent=4` declares a representable true-price
+/// range of `[10^-2, 10^4]` (0.01 to 10,000), comfortably straddling 2.5.
+///
+/// With `base_decimals=9, quote_decimals=9, precision=2, exponent=4`:
+/// `scale_hi = floor(u64::MAX * 10^9 / (10^9 * 10^4)) = floor(u64::MAX /
+/// 10^4) = 1_844_674_407_370_955 = price_scale`.
+/// `P_min = ceil(scale * 10^9 / (10^9 * 10^2)) = ceil(scale / 100) =
+/// 18_446_744_073_710`.
+/// `P_max = floor(10^4 * scale * 10^9 / 10^9) = floor(scale * 10^4) =
+/// 18_446_744_073_709_550_000`.
+#[test]
+fun wal_sui_same_decimals_pair_price_extremes_and_adjacent_ticks() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 18_446_744_073_710;
+    let p_max: u64 = 18_446_744_073_709_550_000;
+    // Realistic mid-range price: true price = 2.5 SUI per WAL (see doc
+    // comment above).
+    let p_mid: u64 = 4_611_686_018_427_388;
+
+    let (mut book, cap) = tiny_clob::new<WAL, SUI>(MIN_SIZE, 9, 9, 2, 4, p_mid, scenario.ctx());
+    let scale = tiny_clob::price_scale(&book);
+    assert!(scale == 1_844_674_407_370_955, 0);
+
+    // (b) Extreme minimum representable raw price.
+    let size = MIN_SIZE;
+    let min_escrow = tiny_clob::bid_escrow_amount(&book, p_min, size);
+    let min_payment = coin::mint_for_testing<SUI>(min_escrow, scenario.ctx());
+    let (min_ticket_opt, min_matched, min_leftover, min_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+    assert!(!min_stopped, 1);
+    assert!(coin::burn_for_testing(min_matched) == 0, 2);
+    assert!(coin::burn_for_testing(min_leftover) == 0, 3);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_min) == size, 4);
+    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(min_b) == 0, 5);
+    assert!(coin::burn_for_testing(min_q) == min_escrow, 6);
+
+    // (c) Extreme maximum representable raw price.
+    let max_escrow = tiny_clob::bid_escrow_amount(&book, p_max, size);
+    let max_payment = coin::mint_for_testing<SUI>(max_escrow, scenario.ctx());
+    let (max_ticket_opt, max_matched, max_leftover, max_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+    assert!(!max_stopped, 7);
+    assert!(coin::burn_for_testing(max_matched) == 0, 8);
+    assert!(coin::burn_for_testing(max_leftover) == 0, 9);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_max) == size, 10);
+    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(max_b) == 0, 11);
+    assert!(coin::burn_for_testing(max_q) == max_escrow, 12);
+
+    // (d) Two adjacent raw price ticks at a realistic fair-value level.
+    let mid_size = 1_000;
+    let mid_escrow = tiny_clob::bid_escrow_amount(&book, p_mid, mid_size);
+    let mid_payment = coin::mint_for_testing<SUI>(mid_escrow, scenario.ctx());
+    let (mid_ticket_opt, mid_matched, mid_leftover, mid_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid, mid_size, mid_payment, 10, scenario.ctx());
+    assert!(!mid_stopped, 13);
+    assert!(coin::burn_for_testing(mid_matched) == 0, 14);
+    assert!(coin::burn_for_testing(mid_leftover) == 0, 15);
+
+    let p_mid_next = p_mid + 1;
+    let mid_next_escrow = tiny_clob::bid_escrow_amount(&book, p_mid_next, mid_size);
+    let mid_next_payment = coin::mint_for_testing<SUI>(mid_next_escrow, scenario.ctx());
+    let (mid_next_ticket_opt, mid_next_matched, mid_next_leftover, mid_next_stopped) =
+        tiny_clob::place_limit_order_bid(&mut book, p_mid_next, mid_size, mid_next_payment, 10, scenario.ctx());
+    assert!(!mid_next_stopped, 16);
+    assert!(coin::burn_for_testing(mid_next_matched) == 0, 17);
+    assert!(coin::burn_for_testing(mid_next_leftover) == 0, 18);
+
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid) == mid_size, 19);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), p_mid_next) == mid_size, 20);
+    assert!(p_mid != p_mid_next, 21);
+
+    unit_test::destroy(mid_ticket_opt.destroy_some());
+    unit_test::destroy(mid_next_ticket_opt.destroy_some());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
 #[test]
 fun price_band_factor_just_inside_band_succeeds() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     // band: [1000/2, 1000*2] = [500, 2000]
     let low_ticket = rest_bid(&mut book, 500, MIN_SIZE, 10, scenario.ctx());
@@ -3172,7 +3545,7 @@ fun price_band_factor_just_inside_band_succeeds() {
 fun price_band_factor_just_outside_band_below_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     let ticket = rest_bid(&mut book, 499, MIN_SIZE, 10, scenario.ctx()); // just below the [500, 2000] band
     unit_test::destroy(ticket);
@@ -3185,7 +3558,7 @@ fun price_band_factor_just_outside_band_below_aborts() {
 fun price_band_factor_just_outside_band_above_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000);
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
     tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
     let ticket = rest_bid(&mut book, 2001, MIN_SIZE, 10, scenario.ctx()); // just above the [500, 2000] band
     unit_test::destroy(ticket);
@@ -3197,7 +3570,7 @@ fun price_band_factor_just_outside_band_above_aborts() {
 fun set_last_price_empty_book_is_unconstrained() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 12_345);
+    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx());
     assert!(tiny_clob::last_price_for_testing(&book) == 12_345, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3209,7 +3582,7 @@ fun set_last_price_below_best_bid_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 999);
+    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3220,9 +3593,9 @@ fun set_last_price_at_or_above_best_bid_succeeds_with_only_bid_present() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000); // exactly the best bid
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // exactly the best bid
     assert!(tiny_clob::last_price_for_testing(&book) == 1000, 0);
-    tiny_clob::set_last_price(&mut book, 5_000_000); // far above; no best ask to bound it
+    tiny_clob::set_last_price(&mut book, 5_000_000, scenario.ctx()); // far above; no best ask to bound it
     assert!(tiny_clob::last_price_for_testing(&book) == 5_000_000, 1);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -3235,7 +3608,7 @@ fun set_last_price_above_best_ask_aborts() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2001);
+    tiny_clob::set_last_price(&mut book, 2001, scenario.ctx());
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -3246,9 +3619,9 @@ fun set_last_price_at_or_below_best_ask_succeeds_with_only_ask_present() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2000); // exactly the best ask
+    tiny_clob::set_last_price(&mut book, 2000, scenario.ctx()); // exactly the best ask
     assert!(tiny_clob::last_price_for_testing(&book) == 2000, 0);
-    tiny_clob::set_last_price(&mut book, 1); // far below; no best bid to bound it
+    tiny_clob::set_last_price(&mut book, 1, scenario.ctx()); // far below; no best bid to bound it
     assert!(tiny_clob::last_price_for_testing(&book) == 1, 1);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -3261,7 +3634,7 @@ fun set_last_price_within_spread_both_sides_present_succeeds() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1500);
+    tiny_clob::set_last_price(&mut book, 1500, scenario.ctx());
     assert!(tiny_clob::last_price_for_testing(&book) == 1500, 0);
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
@@ -3276,7 +3649,7 @@ fun set_last_price_below_bid_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 999);
+    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -3290,7 +3663,7 @@ fun set_last_price_above_ask_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2001);
+    tiny_clob::set_last_price(&mut book, 2001, scenario.ctx());
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);

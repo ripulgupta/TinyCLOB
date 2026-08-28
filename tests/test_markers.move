@@ -5,3 +5,5 @@ module tiny_clob::test_markers;
 
 public struct BTC has drop {}
 public struct USDC has drop {}
+public struct SUI has drop {}
+public struct WAL has drop {}

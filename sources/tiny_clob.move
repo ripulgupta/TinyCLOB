@@ -768,6 +768,7 @@ public fun clob_admin_set_price_band_factor<Base, Quote>(
 public struct LastPriceSet has copy, drop {
     order_book_id: ID,
     last_price: u64,
+    setter: address,
 }
 
 /// Permissionless reset of the book's `last_price` reference point (see
@@ -791,9 +792,17 @@ public struct LastPriceSet has copy, drop {
 /// order placement. Now they can call this directly — optionally bundled
 /// with their order-placement call in the same PTB for atomicity — the
 /// moment the book is unconstrained at that price.
+///
+/// Since this is permissionless, the emitted `LastPriceSet` event carries
+/// `setter: ctx.sender()` so off-chain indexers can distinguish an
+/// admin-initiated reset from an anonymous caller's. No event is emitted
+/// when `new_last_price` equals the book's current `last_price` — a no-op
+/// reset is not an error, but it is not worth spamming the event stream
+/// either, since anyone can call this for free repeatedly.
 public fun set_last_price<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     new_last_price: u64,
+    ctx: &TxContext,
 ) {
     assert_book_version(book);
     assert!(new_last_price != 0, EZeroPrice);
@@ -808,9 +817,11 @@ public fun set_last_price<Base, Quote>(
     if (ask_opt.is_some()) {
         assert!(new_last_price <= *ask_opt.borrow(), EResetPriceAboveBestAsk);
     };
-    let event_book_id = book.event_id;
-    book.last_price = new_last_price;
-    event::emit(LastPriceSet { order_book_id: event_book_id, last_price: new_last_price });
+    if (new_last_price != book.last_price) {
+        let event_book_id = book.event_id;
+        book.last_price = new_last_price;
+        event::emit(LastPriceSet { order_book_id: event_book_id, last_price: new_last_price, setter: ctx.sender() });
+    };
 }
 
 public fun clob_admin_claim_fees<Base, Quote>(
@@ -2229,6 +2240,11 @@ public fun taker_fee_set_fields_for_testing(e: &TakerFeeSet): (ID, u64) { (e.ord
 
 #[test_only]
 public fun maker_fee_set_fields_for_testing(e: &MakerFeeSet): (ID, u64) { (e.order_book_id, e.rate_bps) }
+
+#[test_only]
+public fun last_price_set_fields_for_testing(e: &LastPriceSet): (ID, u64, address) {
+    (e.order_book_id, e.last_price, e.setter)
+}
 
 #[test_only]
 public fun event_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID { book.event_id }
