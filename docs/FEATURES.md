@@ -480,6 +480,12 @@ any), not just future fills — this affects both proceeds already credited
 before the call and any credited afterward. Aborts with `EWrongBook` if
 `ticket` was not minted by `book`.
 
+Emits `OrderOwnerUpdated { order_id, order_book_id, old_owner, new_owner }`
+whenever the order is found and reassigned — including when `new_owner`
+equals the order's current owner (the reassignment and its proceeds-owner
+sync still run in that case). Never emitted when the function returns
+`false`.
+
 ### `claim_proceeds`
 
 ```
@@ -627,6 +633,16 @@ escrow/proceeds to their respective owners as it goes. Callable repeatedly
 across multiple transactions to drain a large book incrementally; each call
 processes at most `max_items` items and simply does less if fewer remain.
 
+Emits `OrderCancelled` for every resting order it force-cancels and
+`ProceedsClaimed` for every nonzero pooled-proceeds entry it pays out (a
+zero-valued entry is skipped, matching `claim_proceeds`/`push_proceeds`'s
+own skip-on-zero convention) — i.e. up to one event per processed item,
+where previously this function emitted none. Sui enforces a hard cap of
+1024 events emitted per transaction, so an admin's `max_items` choice should
+stay comfortably under that limit (e.g. a few hundred), especially if
+multiple `clob_admin_drain_step` calls are batched into a single PTB, where
+the cap applies across the whole transaction, not per call.
+
 ```
 public fun clob_admin_finalize<Base, Quote>(cap: ClobAdminCap, book: OrderBook<Base, Quote>): ID
 ```
@@ -676,6 +692,10 @@ upgraded in place with no separate migration call required — this emits
 | `price_band_factor<Base, Quote>(book): Option<u64>` | the book's current price-band factor, or `None` (§4) |
 | `book_version<Base, Quote>(book): u64` | the book's current `version` (§11) |
 | `min_size<Base, Quote>(book): u64` | the book's `min_size` floor (§2) |
+| `bid_quote_escrow_at_price<Base, Quote>(book, price): u64` | the exact, maintained total of live `Quote` escrow held by every resting bid order at `price`; `0` if no bid level exists there. Bid-only (no `side` parameter) — an ask level's escrow is `Base`, already exactly equal to `depth_at_price(book, ask(), price)`, so there is no analogous "quote value" for it. |
+| `resting_order_escrow<Base, Quote>(book, side, price, order_id): Option<RestingOrderEscrow>` | the live state of one resting order, or `None` if that price level doesn't exist or holds no such order (fully filled, cancelled, or never placed). Never aborts, for any input. |
+| `resting_order_escrow_by_ticket<Base, Quote>(book, ticket): Option<RestingOrderEscrow>` | `resting_order_escrow` for the order `ticket` was minted for. Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. |
+| `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows); `remaining_size` is always the order's Base-denominated remaining size regardless of side. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. `(0, r)` with `r > 0` is a real, reachable state (escrow fully charged, order still resting with real remaining size) — distinct from `None` (not resting at all). |
 
 ## 13. Events reference
 
@@ -703,6 +723,7 @@ ordering within a transaction's effects is deterministic).
 | `OrderFilled` | `maker_order_id: u64`, `order_book_id: ID`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64`, `taker_fee_amount: u64`, `maker_fee_amount: u64` |
 | `OrderExecuted` | `order_book_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool` |
 | `ProceedsClaimed` | `claimant: address`, `order_book_id: ID`, `base_amount: u64`, `quote_amount: u64` |
+| `OrderOwnerUpdated` | `order_id: u64`, `order_book_id: ID`, `old_owner: address`, `new_owner: address` |
 
 `OrderPlaced.maker_fee_bps` is the maker-fee rate snapshotted into the
 resting order at placement time — permanent for the order's lifetime; later
@@ -828,6 +849,16 @@ something rested this call, else `None`.
   level to receive a nonzero fill within a single match, not the first
   level touched and not an aggregate/average across levels touched.
 - `bid_escrow_amount(book, 0, size)` returns `0` and does not abort.
+- `resting_order_escrow` can return `Some((0, r))` with `r > 0` — a resting
+  bid whose escrow is fully charged but which still has real remaining
+  size and stays on the book. This is distinct from `None` (not resting at
+  all) and is a real, reachable state, not an error condition.
+- `bid_quote_escrow_at_price` is an exact, maintained aggregate, not a
+  re-derivation — unlike computing `bid_escrow_amount(book, price,
+  depth_at_price(book, bid(), price))`, which can over- or under-count the
+  true live escrow by up to roughly one `Quote` atom per resting order at
+  that price, in either direction, depending on each order's own fill
+  history.
 - A `place_limit_order_bid` call's unmatched remainder may rest at a
   smaller size than requested if leftover escrow cannot fully back it at
   the ceiling-rounded rate; the returned ticket is `option::none()` when

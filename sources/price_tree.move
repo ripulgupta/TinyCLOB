@@ -98,21 +98,38 @@ public struct PriceTree<V: store> has store {
 public struct PriceLevel<phantom Base, phantom Quote> has store {
     orders: LinkedTable<u64, Order<Base, Quote>>,
     total_size: u64,
+    /// Incrementally maintained running total of live `Quote` escrow
+    /// (`order::escrow_quote_value`) across every order in this level —
+    /// mirrors `total_size`'s exact structure and is kept correct at the
+    /// same four mutation points (`level_insert_order`,
+    /// `level_insert_order_front`, `level_remove_order`,
+    /// `level_pop_front_order`). Meaningful for bid levels (where orders
+    /// carry live `Quote` escrow); always `0` for ask levels, since an
+    /// ask-side order's `escrow_quote_value` is always `0`.
+    total_quote_escrow: u64,
 }
 
 public(package) fun new_price_level<Base, Quote>(ctx: &mut TxContext): PriceLevel<Base, Quote> {
-    PriceLevel { orders: linked_table::new(ctx), total_size: 0 }
+    PriceLevel { orders: linked_table::new(ctx), total_size: 0, total_quote_escrow: 0 }
 }
 
 public(package) fun destroy_empty_price_level<Base, Quote>(level: PriceLevel<Base, Quote>) {
-    let PriceLevel { orders, total_size } = level;
+    let PriceLevel { orders, total_size, total_quote_escrow } = level;
     assert!(total_size == 0, EPriceLevelNotEmpty);
+    assert!(total_quote_escrow == 0, EPriceLevelNotEmpty);
     linked_table::destroy_empty(orders);
 }
 
 /// The maintained running total — O(1), replaces a linear-scan sum.
 public(package) fun level_total_size<Base, Quote>(level: &PriceLevel<Base, Quote>): u64 {
     level.total_size
+}
+
+/// The maintained running total of live `Quote` escrow across every order
+/// in this level — O(1), replaces a linear-scan sum. See
+/// `PriceLevel.total_quote_escrow`'s doc comment.
+public(package) fun level_total_quote_escrow<Base, Quote>(level: &PriceLevel<Base, Quote>): u64 {
+    level.total_quote_escrow
 }
 
 public(package) fun level_is_empty<Base, Quote>(level: &PriceLevel<Base, Quote>): bool {
@@ -141,6 +158,7 @@ public(package) fun level_insert_order<Base, Quote>(
     order: Order<Base, Quote>,
 ) {
     level.total_size = level.total_size + order::remaining_size(&order);
+    level.total_quote_escrow = level.total_quote_escrow + order::escrow_quote_value(&order);
     level.orders.push_back(order_id, order);
 }
 
@@ -155,6 +173,7 @@ public(package) fun level_insert_order_front<Base, Quote>(
     order: Order<Base, Quote>,
 ) {
     level.total_size = level.total_size + order::remaining_size(&order);
+    level.total_quote_escrow = level.total_quote_escrow + order::escrow_quote_value(&order);
     level.orders.push_front(order_id, order);
 }
 
@@ -169,6 +188,7 @@ public(package) fun level_remove_order<Base, Quote>(
 ): Order<Base, Quote> {
     let order = level.orders.remove(order_id);
     level.total_size = level.total_size - order::remaining_size(&order);
+    level.total_quote_escrow = level.total_quote_escrow - order::escrow_quote_value(&order);
     order
 }
 
@@ -181,6 +201,7 @@ public(package) fun level_pop_front_order<Base, Quote>(
 ): (u64, Order<Base, Quote>) {
     let (order_id, order) = level.orders.pop_front();
     level.total_size = level.total_size - order::remaining_size(&order);
+    level.total_quote_escrow = level.total_quote_escrow - order::escrow_quote_value(&order);
     (order_id, order)
 }
 

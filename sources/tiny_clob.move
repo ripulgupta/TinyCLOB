@@ -675,6 +675,33 @@ public fun depth_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, side: bool
     price_tree::level_total_size(level)
 }
 
+/// The exact, maintained total of live Quote escrow currently held by every
+/// resting BID order at `price` -- equivalently, the exact gross Quote
+/// (before any taker fee) that would be paid out if every resting bid at
+/// this price were fully drained via direct escrow refund. `0` if no bid
+/// level exists at `price`.
+///
+/// This is an O(1) running aggregate maintained at the same mutation points
+/// as `depth_at_price`'s underlying total, so it always equals the true sum
+/// of live per-order escrow -- unlike a re-derivation via
+/// `bid_escrow_amount(book, price, depth_at_price(book, bid(), price))`,
+/// which can be off in EITHER direction: a re-derivation over- or
+/// under-counts by up to roughly one Quote atom per resting order at that
+/// price, in either direction, depending on each order's own fill history.
+///
+/// Ask levels hold no Quote escrow at all (an ask escrows Base, exactly
+/// equal to `depth_at_price(book, ask(), price)`), which is why this
+/// function is deliberately bid-only rather than taking a `side` parameter.
+public fun bid_quote_escrow_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, price: u64): u64 {
+    let found = price_tree::find(&book.bids, price);
+    if (found.is_none()) {
+        return 0
+    };
+    let leaf_ptr = found.destroy_some();
+    let level = price_tree::borrow(&book.bids, leaf_ptr);
+    price_tree::level_total_quote_escrow(level)
+}
+
 /// The book's own `last_price` field, snapshotted the last time a fill
 /// occurred (see the `OrderBook` doc comment for full semantics).
 public fun last_price<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
@@ -692,6 +719,68 @@ public fun price_band_factor<Base, Quote>(book: &OrderBook<Base, Quote>): Option
 /// for how/when this can change.
 public fun book_version<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.version
+}
+
+/// Returns `Some((escrow, remaining_size))` for the resting order identified
+/// by `(side, price, order_id)`, or `None` if that price level doesn't exist
+/// or holds no such order (fully filled, cancelled, or never placed). Never
+/// aborts, for any input.
+///
+/// `escrow` is denominated in Quote for a bid (`side == true`), Base for an
+/// ask (`side == false`) -- the currency that side actually escrows. This is
+/// the order's remaining escrowed PRINCIPAL only: `cancel_order` may
+/// additionally pay out pooled proceeds in the OPPOSITE currency, which this
+/// value does not include. `Some({escrow: 0, remaining_size: r})` with `r >
+/// 0` is a real, reachable state (the order's escrow is fully charged but it
+/// is still resting with real remaining size) -- distinct from `None` (not
+/// resting at all).
+///
+/// Returns a small `RestingOrderEscrow` struct rather than a `(u64, u64)`
+/// tuple: Move does not support a bare tuple as a type argument (e.g.
+/// `Option<(u64, u64)>` does not compile), so a plain-data `copy, drop`
+/// struct is used instead — unwrap it with `resting_order_escrow_fields`.
+public fun resting_order_escrow<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    side: bool,
+    price: u64,
+    order_id: u64,
+): Option<RestingOrderEscrow> {
+    let tree: &PriceTree<PriceLevel<Base, Quote>> = if (side) &book.bids else &book.asks;
+    let found = price_tree::find(tree, price);
+    if (found.is_none()) {
+        return option::none()
+    };
+    let leaf_ptr = found.destroy_some();
+    let level = price_tree::borrow(tree, leaf_ptr);
+    if (!price_tree::level_contains_order(level, order_id)) {
+        return option::none()
+    };
+    let order = price_tree::level_borrow_order(level, order_id);
+    let escrow = if (side) order::escrow_quote_value(order) else order::remaining_size(order);
+    option::some(RestingOrderEscrow { escrow, remaining_size: order::remaining_size(order) })
+}
+
+/// `resting_order_escrow` for the order this ticket was minted for.
+/// Aborts with `EWrongBook` if `ticket` was not minted by `book`.
+public fun resting_order_escrow_by_ticket<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    ticket: &OrderTicket,
+): Option<RestingOrderEscrow> {
+    assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
+    resting_order_escrow(book, ticket.side, ticket.price, ticket.order_id)
+}
+
+/// Plain-data result of `resting_order_escrow`/`resting_order_escrow_by_ticket`
+/// -- see those functions' doc comments for what `escrow`/`remaining_size`
+/// mean. Exists only because Move does not support a bare tuple as a type
+/// argument.
+public struct RestingOrderEscrow has copy, drop {
+    escrow: u64,
+    remaining_size: u64,
+}
+
+public fun resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64) {
+    (e.escrow, e.remaining_size)
 }
 
 // === ClobAdminCap gate ===
@@ -947,6 +1036,13 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
     event::emit(OrderBookRetired { order_book_id: event_book_id });
 }
 
+/// Note: this function emits up to one event per processed item (one
+/// `OrderCancelled` per drained resting order, one `ProceedsClaimed` per
+/// nonzero pooled-proceeds entry drained). Sui enforces a hard cap of 1024
+/// events emitted per transaction, so `max_items` should stay comfortably
+/// under that limit (e.g. a few hundred) — especially if drain calls are
+/// batched into a single PTB, where the cap applies across the whole
+/// transaction, not per call.
 public fun clob_admin_drain_step<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -956,16 +1052,18 @@ public fun clob_admin_drain_step<Base, Quote>(
     assert_book_version(book);
     assert_clob_admin(cap, book);
     assert!(book.retiring, ENotRetiring);
+    let event_book_id = book.event_id;
     let mut remaining = max_items;
-    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, ctx);
-    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, ctx);
-    drain_proceeds(&mut book.proceeds, &mut remaining, ctx);
+    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, event_book_id, ctx);
+    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, event_book_id, ctx);
+    drain_proceeds(&mut book.proceeds, &mut remaining, event_book_id, ctx);
 }
 
 fun drain_side<Base, Quote>(
     tree: &mut PriceTree<PriceLevel<Base, Quote>>,
     remaining: &mut u64,
     want_max: bool,
+    event_book_id: ID,
     ctx: &mut TxContext,
 ) {
     while (*remaining > 0) {
@@ -978,10 +1076,11 @@ fun drain_side<Base, Quote>(
             loop {
                 if (*remaining == 0) break;
                 if (price_tree::level_is_empty(level)) break;
-                let (_, order) = price_tree::level_pop_front_order(level);
+                let (order_id, order) = price_tree::level_pop_front_order(level);
                 let owner = order::owner(&order);
                 let (escrow_base, escrow_quote) = order::destroy(order);
                 refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
+                event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
                 *remaining = *remaining - 1;
             };
             is_empty_now = price_tree::level_is_empty(level);
@@ -1039,13 +1138,19 @@ fun refund_order_escrow<Base, Quote>(
 fun drain_proceeds<Base, Quote>(
     proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
     remaining: &mut u64,
+    event_book_id: ID,
     ctx: &mut TxContext,
 ) {
     while (*remaining > 0 && !linked_table::is_empty(proceeds)) {
         let (_order_id, mb) = linked_table::pop_front(proceeds);
         let (owner, base, quote) = destroy_maker_balance(mb);
+        let base_amount = balance::value(&base);
+        let quote_amount = balance::value(&quote);
         transfer_or_destroy_zero(base, owner, ctx);
         transfer_or_destroy_zero(quote, owner, ctx);
+        if (base_amount != 0 || quote_amount != 0) {
+            event::emit(ProceedsClaimed { claimant: owner, order_book_id: event_book_id, base_amount, quote_amount });
+        };
         *remaining = *remaining - 1;
     };
 }
@@ -1448,8 +1553,12 @@ fun fill_level_ask<Base, Quote>(
             let cumulative_charged_u128 =
                 if (ceil_charged_u128 < total_reserved_u128) { ceil_charged_u128 } else { total_reserved_u128 };
             let cumulative_charged = cumulative_charged_u128 as u64;
-            let quote_cost = cumulative_charged - order::quote_charged_so_far(&maker_order);
-            order::set_quote_charged_so_far(&mut maker_order, cumulative_charged);
+            // Derived on the fly from the pre-fill live escrow balance:
+            // always exactly equals what was already charged, since every
+            // fill decrements the escrow by precisely the amount it charges
+            // (see `escrow_quote_value`'s doc comment).
+            let quote_charged_so_far = order::total_reserved(&maker_order) - order::escrow_quote_value(&maker_order);
+            let quote_cost = cumulative_charged - quote_charged_so_far;
 
             let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
             let maker_fee_bps = order::maker_fee_bps(&maker_order);
@@ -2184,10 +2293,23 @@ public fun cancel_order<Base, Quote>(
     (base_coin, quote_coin)
 }
 
+public struct OrderOwnerUpdated has copy, drop {
+    order_id: u64,
+    order_book_id: ID,
+    old_owner: address,
+    new_owner: address,
+}
+
 /// Finds the resting order identified by `ticket` and overwrites its
 /// `owner` field in place. Returns `true` if an order was found and
 /// updated, `false` if the price level or the order itself doesn't exist (a
 /// no-op, mirroring `cancel_order`'s own not-found-is-a-no-op handling).
+///
+/// Emits `OrderOwnerUpdated { order_id, order_book_id, old_owner, new_owner }`
+/// whenever an order is actually found and reassigned — including when
+/// `new_owner` equals the order's current owner, since the reassignment
+/// (and its unconditional proceeds-owner sync, see below) still runs in
+/// that case. Never emitted on either not-found path.
 ///
 /// Permissionless, but not unauthenticated: authority to redirect an order's
 /// proceeds destination follows `OrderTicket` possession, exactly
@@ -2231,6 +2353,7 @@ public fun update_resting_order<Base, Quote>(
 ): bool {
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
+    let event_book_id = book.event_id;
     let side = ticket.side;
     let price = ticket.price;
     let order_id = ticket.order_id;
@@ -2241,19 +2364,25 @@ public fun update_resting_order<Base, Quote>(
         return false
     };
     let leaf_ptr = leaf_opt.destroy_some();
-    let found = {
+    let old_owner_opt = {
         let level = price_tree::borrow_mut(tree, leaf_ptr);
         if (!price_tree::level_contains_order(level, order_id)) {
-            false
+            option::none()
         } else {
+            let old_owner = order::owner(price_tree::level_borrow_order(level, order_id));
             price_tree::level_set_order_owner(level, order_id, new_owner);
-            true
+            option::some(old_owner)
         }
     };
-    if (found) {
+    if (old_owner_opt.is_some()) {
+        let old_owner = old_owner_opt.destroy_some();
         sync_maker_balance_owner(&mut book.proceeds, order_id, new_owner);
-    };
-    found
+        event::emit(OrderOwnerUpdated { order_id, order_book_id: event_book_id, old_owner, new_owner });
+        true
+    } else {
+        old_owner_opt.destroy_none();
+        false
+    }
 }
 
 /// Ticket-gated: any accumulated proceeds for `ticket`'s `order_id` are paid
@@ -2448,6 +2577,11 @@ public fun fees_claimed_fields_for_testing(e: &FeesClaimed): (address, ID, u64, 
 #[test_only]
 public fun order_cancelled_fields_for_testing(e: &OrderCancelled): (u64, ID, address) {
     (e.order_id, e.order_book_id, e.trader)
+}
+
+#[test_only]
+public fun order_owner_updated_fields_for_testing(e: &OrderOwnerUpdated): (u64, ID, address, address) {
+    (e.order_id, e.order_book_id, e.old_owner, e.new_owner)
 }
 
 #[test_only]

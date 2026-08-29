@@ -36,10 +36,12 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// order that partially fills during its own placement sweep before
     /// resting, this is the post-sweep remainder, not the taker's original
     /// full requested size). Never mutated afterward. Together with
-    /// `quote_charged_so_far`, this lets `fill_level_ask` charge a resting
-    /// bid's escrow via a delta-of-cumulative-proportional-ceiling scheme
+    /// `escrow_quote_value` (the live escrow balance), this lets
+    /// `fill_level_ask` charge a resting bid's escrow via a
+    /// delta-of-cumulative-proportional-ceiling scheme
     /// (`ceil(total_reserved * cumulative_filled / original_size)`, clamped
-    /// at `total_reserved`, at each fill, minus what was already charged)
+    /// at `total_reserved`, at each fill, minus what was already charged —
+    /// the latter derived as `total_reserved - escrow_quote_value`)
     /// that telescopes to exactly the order's actual `total_reserved`
     /// escrow with zero dust, no matter how many separate fills/transactions
     /// the order is drained across. Only
@@ -47,10 +49,6 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// ask-side orders too, matching how `escrow_base`/`escrow_quote`
     /// already sit unused on one side or the other.
     original_size: u64,
-    /// Running total of `Quote` already drawn down from this (bid-side)
-    /// order's escrow across all fills so far. Starts at `0`. See
-    /// `original_size`'s doc comment for the scheme this supports.
-    quote_charged_so_far: u64,
     /// Set once, at construction, to the actual `Quote` balance value
     /// handed to this order's escrow at that moment (0 if none). For a
     /// bid-side order, this is the ground truth for how much quote is
@@ -60,10 +58,13 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// resting-remainder clamp). `fill_level_ask` charges each fill a
     /// proportional ceiling of this value, clamped at `total_reserved`
     /// itself, so the running total can never exceed what was actually
-    /// reserved. Only bid-side resting orders need this field; it
-    /// exists (unused) on ask-side orders too, matching how
-    /// `escrow_base`/`escrow_quote` already sit unused on one side or the
-    /// other.
+    /// reserved. The running total already charged so far is not stored
+    /// separately — it is always exactly `total_reserved -
+    /// escrow_quote_value(&order)`, since every fill decrements the live
+    /// escrow balance by precisely the amount it charges. Only bid-side
+    /// resting orders need this field; it exists (unused) on ask-side
+    /// orders too, matching how `escrow_base`/`escrow_quote` already sit
+    /// unused on one side or the other.
     total_reserved: u64,
 }
 
@@ -83,7 +84,6 @@ public(package) fun new<Base, Quote>(
     Order {
         order_id, owner, remaining_size, escrow_base, escrow_quote, maker_fee_bps,
         original_size: remaining_size,
-        quote_charged_so_far: 0,
         total_reserved,
     }
 }
@@ -109,7 +109,7 @@ public(package) fun destroy<Base, Quote>(
 ): (Option<Balance<Base>>, Option<Balance<Quote>>) {
     let Order {
         order_id: _, owner: _, remaining_size: _, escrow_base, escrow_quote, maker_fee_bps: _,
-        original_size: _, quote_charged_so_far: _, total_reserved: _,
+        original_size: _, total_reserved: _,
     } = o;
     (escrow_base, escrow_quote)
 }
@@ -119,8 +119,12 @@ public(package) fun owner<Base, Quote>(o: &Order<Base, Quote>): address { o.owne
 public(package) fun remaining_size<Base, Quote>(o: &Order<Base, Quote>): u64 { o.remaining_size }
 public(package) fun maker_fee_bps<Base, Quote>(o: &Order<Base, Quote>): u64 { o.maker_fee_bps }
 public(package) fun original_size<Base, Quote>(o: &Order<Base, Quote>): u64 { o.original_size }
-public(package) fun quote_charged_so_far<Base, Quote>(o: &Order<Base, Quote>): u64 { o.quote_charged_so_far }
-public(package) fun set_quote_charged_so_far<Base, Quote>(o: &mut Order<Base, Quote>, amount: u64) {
-    o.quote_charged_so_far = amount;
-}
 public(package) fun total_reserved<Base, Quote>(o: &Order<Base, Quote>): u64 { o.total_reserved }
+
+/// The live `Quote` escrow balance still held by this order (0 if none, or
+/// if this is an ask-side order with no `Quote` escrow leg). For a
+/// bid-side order this is the ground truth used to derive how much has
+/// already been charged so far: `total_reserved(o) - escrow_quote_value(o)`.
+public(package) fun escrow_quote_value<Base, Quote>(o: &Order<Base, Quote>): u64 {
+    if (o.escrow_quote.is_some()) balance::value(o.escrow_quote.borrow()) else 0
+}
