@@ -1,0 +1,250 @@
+#[test_only]
+module tiny_clob::order_owner_updated_and_drain_events_tests;
+
+use std::unit_test;
+use sui::balance;
+use sui::coin;
+use sui::event;
+use sui::test_scenario as ts;
+use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsClaimed};
+use tiny_clob::order;
+use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
+use tiny_clob::test_utils::{
+    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
+    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+};
+
+
+// === Change 4: `OrderOwnerUpdated` event ===
+
+#[test]
+fun update_resting_order_reassign_emits_order_owner_updated_with_correct_fields() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let order_id = tiny_clob::ticket_order_id(&bid_ticket);
+    let book_id = tiny_clob::id_for_testing(&book);
+
+    let found = tiny_clob::update_resting_order(&mut book, &bid_ticket, other());
+    assert!(found, 0);
+
+    let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
+    assert!(events.length() == 1, 1);
+    let (ev_order_id, ev_book_id, ev_old_owner, ev_new_owner) =
+        tiny_clob::order_owner_updated_fields_for_testing(&events[0]);
+    assert!(ev_order_id == order_id, 2);
+    assert!(ev_book_id == book_id, 3);
+    assert!(ev_old_owner == admin(), 4); // scenario sender at rest_bid time
+    assert!(ev_new_owner == other(), 5);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun update_resting_order_reassign_to_same_address_still_emits() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let order_id = tiny_clob::ticket_order_id(&bid_ticket);
+
+    // Reassigning to the SAME owner (admin(), unchanged) must still fire the
+    // event -- the write is unconditional on the found branch, regardless
+    // of whether the address actually changes.
+    let found = tiny_clob::update_resting_order(&mut book, &bid_ticket, admin());
+    assert!(found, 0);
+
+    let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
+    assert!(events.length() == 1, 1);
+    let (ev_order_id, _, ev_old_owner, ev_new_owner) =
+        tiny_clob::order_owner_updated_fields_for_testing(&events[0]);
+    assert!(ev_order_id == order_id, 2);
+    assert!(ev_old_owner == admin(), 3);
+    assert!(ev_new_owner == admin(), 4);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun update_resting_order_not_found_paths_emit_no_event() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    // Empty-book path: no price level exists at all.
+    let book_id = tiny_clob::id_for_testing(&book);
+    let empty_book_ticket =
+        tiny_clob::new_ticket_for_testing(0, book_id, tiny_clob::bid_for_testing(), default_price());
+    let found_empty = tiny_clob::update_resting_order(&mut book, &empty_book_ticket, other());
+    assert!(!found_empty, 0);
+    unit_test::destroy(empty_book_ticket);
+
+    // Level-exists-but-wrong-order-id path.
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let (order_id, _, side, price) = tiny_clob::ticket_fields_for_testing(&bid_ticket);
+    let wrong_id_ticket = tiny_clob::new_ticket_for_testing(order_id + 1, book_id, side, price);
+    let found_wrong_id = tiny_clob::update_resting_order(&mut book, &wrong_id_ticket, other());
+    assert!(!found_wrong_id, 1);
+    unit_test::destroy(wrong_id_ticket);
+
+    assert!(event::events_by_type<tiny_clob::OrderOwnerUpdated>().length() == 0, 2);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let order_id = tiny_clob::ticket_order_id(&bid_ticket);
+
+    let found = tiny_clob::update_resting_order(&mut book, &bid_ticket, other());
+    assert!(found, 0);
+    let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
+    assert!(events.length() == 1, 1);
+    let (_, _, ev_old_owner, ev_new_owner) = tiny_clob::order_owner_updated_fields_for_testing(&events[0]);
+    assert!(ev_old_owner == admin(), 2);
+    assert!(ev_new_owner == other(), 3);
+    unit_test::destroy(bid_ticket);
+
+    // Cross the reassigned resting bid; proceeds must land on the new owner
+    // (pooled-proceeds owner sync still works alongside the new event).
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
+        &mut book, default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    coin::burn_for_testing(leftover_payment);
+    coin::burn_for_testing(matched_quote);
+
+    tiny_clob::push_proceeds(&cap, &mut book, order_id, scenario.ctx());
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 4);
+    let (ev_claimant, _, _, _) = tiny_clob::proceeds_claimed_fields_for_testing(&claimed_events[0]);
+    assert!(ev_claimant == other(), 5);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Change 5: per-item events in `clob_admin_drain_step`'s helpers ===
+
+// A resting bid whose maker_fee_bps is (test-only, via direct `order::new`)
+// set to 100% has its entire matched Base payment consumed by the maker
+// fee, so the pooled `MakerBalance` entry `credit_maker_table` creates for
+// it is zero-valued in BOTH legs -- a real, reachable state distinct from
+// "no entry at all". `drain_proceeds` must skip emitting `ProceedsClaimed`
+// for that entry while still emitting it for an ordinary (nonzero) one.
+#[test]
+fun clob_admin_drain_step_skips_proceeds_claimed_for_zero_valued_entry_only() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let price = default_price();
+    let size_zero = min_size();
+    let size_normal = min_size();
+
+    scenario.next_tx(maker_a());
+    let order_id_zero = tiny_clob::next_order_id(&mut book);
+    let escrow_zero = balance::create_for_testing<USDC>(price * size_zero);
+    let order_zero =
+        order::new<BTC, USDC>(order_id_zero, maker_a(), size_zero, option::none(), option::some(escrow_zero), 10_000);
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order_zero, scenario.ctx());
+
+    scenario.next_tx(maker_b());
+    let order_id_normal = tiny_clob::next_order_id(&mut book);
+    let escrow_normal = balance::create_for_testing<USDC>(price * size_normal);
+    let order_normal =
+        order::new<BTC, USDC>(order_id_normal, maker_b(), size_normal, option::none(), option::some(escrow_normal), 0);
+    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order_normal, scenario.ctx());
+
+    // Cross both resting bids fully with a single market ask (FIFO: fills
+    // order_zero, then order_normal).
+    scenario.next_tx(taker());
+    let total_size = size_zero + size_normal;
+    let ask_payment = coin::mint_for_testing<BTC>(total_size, scenario.ctx());
+    let (leftover, matched_quote, _) = tiny_clob::place_market_order_ask(
+        &mut book, total_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    coin::burn_for_testing(leftover);
+    coin::burn_for_testing(matched_quote);
+
+    assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id_zero), 0);
+    assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id_normal), 1);
+
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 2);
+    let (ev_claimant, _, ev_base, ev_quote) = tiny_clob::proceeds_claimed_fields_for_testing(&claimed_events[0]);
+    assert!(ev_claimant == maker_b(), 3);
+    assert!(ev_base == size_normal, 4);
+    assert!(ev_quote == 0, 5);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// Merge item 3: this test used to have a sibling,
+// `clob_admin_drain_step_emits_order_cancelled_per_drained_order`, covering
+// a mixed bid/bid/ask drain but asserting only the event COUNT (not
+// per-event id/trader fields). That sibling is folded in here rather than
+// kept separate: a 4th resting order (an ask, from a distinct trader at a
+// distinct price) is added below to preserve its mixed-side-drain coverage,
+// while this test's stronger per-event id/trader assertions now cover it
+// too — `clob_admin_drain_step` always fully drains the bid side (in FIFO
+// order per level) before the ask side (see `clob_admin_drain_step`'s
+// body), so the ask's `OrderCancelled` is deterministically the 4th event.
+#[test]
+fun clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let ticket_a = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    scenario.next_tx(maker_b());
+    let ticket_b = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    scenario.next_tx(maker_c());
+    let ticket_c = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    scenario.next_tx(other());
+    let ticket_d = rest_ask(&mut book, default_price() + 137, default_size(), 10, scenario.ctx());
+
+    let id_a = tiny_clob::ticket_order_id(&ticket_a);
+    let id_b = tiny_clob::ticket_order_id(&ticket_b);
+    let id_c = tiny_clob::ticket_order_id(&ticket_c);
+    let id_d = tiny_clob::ticket_order_id(&ticket_d);
+
+    scenario.next_tx(admin());
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+
+    let events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(events.length() == 4, 0);
+    // FIFO order within the bid side: A, B, C were inserted in that order at
+    // the same price; the ask D drains only after the whole bid side does.
+    let (ev_id_a, _, ev_trader_a) = tiny_clob::order_cancelled_fields_for_testing(&events[0]);
+    let (ev_id_b, _, ev_trader_b) = tiny_clob::order_cancelled_fields_for_testing(&events[1]);
+    let (ev_id_c, _, ev_trader_c) = tiny_clob::order_cancelled_fields_for_testing(&events[2]);
+    let (ev_id_d, _, ev_trader_d) = tiny_clob::order_cancelled_fields_for_testing(&events[3]);
+    assert!(ev_id_a == id_a && ev_trader_a == maker_a(), 1);
+    assert!(ev_id_b == id_b && ev_trader_b == maker_b(), 2);
+    assert!(ev_id_c == id_c && ev_trader_c == maker_c(), 3);
+    assert!(ev_id_d == id_d && ev_trader_d == other(), 4);
+
+    unit_test::destroy(ticket_a);
+    unit_test::destroy(ticket_b);
+    unit_test::destroy(ticket_c);
+    unit_test::destroy(ticket_d);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}

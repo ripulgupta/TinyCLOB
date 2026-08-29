@@ -1391,13 +1391,13 @@ fun fill_level_bid<Base, Quote>(
             let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_base = fee_amount(fill_qty, taker_fee_bps);
-            let taker_fee_balance = balance::split(&mut base_out, taker_fee_base);
+            let base_fee_balance = balance::split(&mut base_out, taker_fee_base);
             matched_base.join(base_out); // remainder, net of taker fee
 
             let mut quote_payment = balance::split(budget, quote_cost);
             let maker_fee_quote = fee_amount(quote_cost, maker_fee_bps);
-            let maker_fee_balance = balance::split(&mut quote_payment, maker_fee_quote);
-            credit_fee_accumulator(fees, taker_fee_balance, maker_fee_balance);
+            let quote_fee_balance = balance::split(&mut quote_payment, maker_fee_quote);
+            credit_fee_accumulator(fees, base_fee_balance, quote_fee_balance);
             credit_maker_table(proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
 
             event::emit(OrderFilled {
@@ -1531,9 +1531,7 @@ fun fill_level_ask<Base, Quote>(
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
             // Maker-side (bid-resting-order) charge: a proportional ceiling
-            // of the order's actual `total_reserved`, clamped at
-            // `total_reserved` so the running charged total can never exceed
-            // what was truly reserved at placement time. Ceiling (not floor)
+            // of the order's actual `total_reserved`. Ceiling (not floor)
             // ensures any real, nonzero base fill charges at least 1 quote
             // atom, closing an exploit where a floor rounds a tiny fill's
             // charge down to 0 and lets the maker cancel afterward for a
@@ -1544,6 +1542,14 @@ fun fill_level_ask<Base, Quote>(
             // matter how many separate fills the order is drained across.
             // Read AFTER `decrease_remaining_size` so `cumulative_filled`
             // reflects this fill.
+            //
+            // `cumulative_filled <= original_size` always (checked-subtraction-
+            // enforced on `remaining_size`), so `ceil(total_reserved *
+            // cumulative_filled / original_size) <= total_reserved` always,
+            // with equality only at full drain. The `else` branch of the
+            // clamp below is therefore provably unreachable -- retained as a
+            // defensive backstop against a future change to this formula,
+            // not because it currently does any work.
             let cumulative_filled = order::original_size(&maker_order) - order::remaining_size(&maker_order);
             let total_reserved_u128 = order::total_reserved(&maker_order) as u128;
             let original_size_u128 = order::original_size(&maker_order) as u128;
@@ -1567,13 +1573,13 @@ fun fill_level_ask<Base, Quote>(
             let maker_remaining_after = order::remaining_size(&maker_order);
 
             let taker_fee_quote = fee_amount(quote_cost, taker_fee_bps);
-            let taker_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
+            let quote_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
             matched_quote.join(quote_out); // remainder, net of taker fee
 
             let mut base_payment = balance::split(escrow_base, fill_qty);
             let maker_fee_base = fee_amount(fill_qty, maker_fee_bps);
-            let maker_fee_balance = balance::split(&mut base_payment, maker_fee_base);
-            credit_fee_accumulator(fees, maker_fee_balance, taker_fee_balance);
+            let base_fee_balance = balance::split(&mut base_payment, maker_fee_base);
+            credit_fee_accumulator(fees, base_fee_balance, quote_fee_balance);
             credit_maker_table(proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
 
             event::emit(OrderFilled {
