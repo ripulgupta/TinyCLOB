@@ -309,9 +309,17 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
 
 // === ClobAdminCap ===
 
-public struct ClobAdminCap has key, store {
+/// `has store` only — deliberately no `key`. Just like `OrderBook` above,
+/// this makes it structurally impossible for `ClobAdminCap` to ever become a
+/// Sui shared/owned top-level object on its own; it can only be moved around
+/// as a plain value, or embedded as a field inside some other object that
+/// does have `key` (e.g. `CapHolder` in the tests). `id: UID` is retained
+/// purely as a globally-unique identity value this struct can hold as a
+/// plain `store`-only field — see `OrderBook`'s doc comment for the general
+/// rationale.
+#[allow(lint(missing_key))]
+public struct ClobAdminCap has store {
     id: UID,
-    for_book: ID,
 }
 
 public struct ClobAdminCapDiscarded has copy, drop {
@@ -480,8 +488,8 @@ fun new_impl<Base, Quote>(
 
     let book_uid = object::new(ctx);
     let book_id = object::uid_to_inner(&book_uid);
-    let cap = ClobAdminCap { id: object::new(ctx), for_book: book_id };
-    let cap_id = object::id(&cap);
+    let cap = ClobAdminCap { id: object::new(ctx) };
+    let cap_id = object::uid_to_inner(&cap.id);
     let event_id = if (event_id_override.is_some()) {
         event_id_override.destroy_some()
     } else {
@@ -689,7 +697,7 @@ public fun book_version<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
 // === ClobAdminCap gate ===
 
 fun assert_clob_admin<Base, Quote>(cap: &ClobAdminCap, book: &OrderBook<Base, Quote>) {
-    assert!(object::id(cap) == book.clob_admin_cap_id, EWrongClobAdminCap);
+    assert!(object::uid_to_inner(&cap.id) == book.clob_admin_cap_id, EWrongClobAdminCap);
 }
 
 // === Local pause/unpause ===
@@ -1087,7 +1095,7 @@ public fun clob_admin_finalize<Base, Quote>(
         quote: type_name::with_defining_ids<Quote>(),
     });
 
-    let ClobAdminCap { id: cap_id_uid, for_book: _ } = cap;
+    let ClobAdminCap { id: cap_id_uid } = cap;
     let cap_id = object::uid_to_inner(&cap_id_uid);
     object::delete(cap_id_uid);
     event::emit(ClobAdminCapDiscarded { cap_id, for_book: true_book_id });
@@ -1887,7 +1895,7 @@ public fun place_market_order_bid<Base, Quote>(
     max_quote_in: Option<u64>,
     min_base_out: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool) {
+): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     validate_size(book, size);
@@ -1913,6 +1921,8 @@ public fun place_market_order_bid<Base, Quote>(
         assert!(balance::value(&matched_base) >= *min_base_out.borrow(), ESlippageExceeded);
     };
 
+    coin::join(&mut payment, coin::from_balance(remaining_budget, ctx));
+
     event::emit(OrderExecuted {
         order_book_id: event_book_id,
         taker,
@@ -1926,12 +1936,7 @@ public fun place_market_order_bid<Base, Quote>(
         stopped_on_max_fills_while_crossing,
     });
 
-    (
-        coin::from_balance(matched_base, ctx),
-        coin::from_balance(remaining_budget, ctx),
-        payment,
-        stopped_on_max_fills_while_crossing,
-    )
+    (coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
 }
 
 public fun place_market_order_ask<Base, Quote>(
@@ -2000,7 +2005,7 @@ public fun swap_bid<Base, Quote>(
     max_quote_in: Option<u64>,
     min_base_out: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool) {
+): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
     let price_scale = book.price_scale;
@@ -2032,6 +2037,8 @@ public fun swap_bid<Base, Quote>(
         assert!(balance::value(&matched_base) >= *min_base_out.borrow(), ESlippageExceeded);
     };
 
+    coin::join(&mut payment, coin::from_balance(remaining_budget, ctx));
+
     event::emit(OrderExecuted {
         order_book_id: event_book_id,
         taker,
@@ -2045,12 +2052,7 @@ public fun swap_bid<Base, Quote>(
         stopped_on_max_fills_while_crossing,
     });
 
-    (
-        coin::from_balance(matched_base, ctx),
-        coin::from_balance(remaining_budget, ctx),
-        payment,
-        stopped_on_max_fills_while_crossing,
-    )
+    (coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
 }
 
 /// `limit_price`, when `Some`, is validated for representability via the
@@ -2389,8 +2391,8 @@ public fun credit_fee_accumulator_for_testing<Base, Quote>(
 }
 
 #[test_only]
-public fun for_book_for_testing(cap: &ClobAdminCap): ID {
-    cap.for_book
+public fun cap_id_for_testing(cap: &ClobAdminCap): ID {
+    object::uid_to_inner(&cap.id)
 }
 
 /// Test-only escape hatch to force a book's `version` field directly, so

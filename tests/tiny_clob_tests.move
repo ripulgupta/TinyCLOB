@@ -70,7 +70,7 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
 
     assert!(tiny_clob::min_size(&book) == MIN_SIZE, 1);
     assert!(!tiny_clob::is_paused(&book), 2);
-    assert!(tiny_clob::clob_admin_cap_id_for_testing(&book) == object::id(&cap), 3);
+    assert!(tiny_clob::clob_admin_cap_id_for_testing(&book) == tiny_clob::cap_id_for_testing(&cap), 3);
     let (taker_bps, maker_bps) = tiny_clob::fee_config(&book);
     assert!(taker_bps == 0, 4);
     assert!(maker_bps == 0, 5);
@@ -113,7 +113,7 @@ fun two_books_identical_types_fully_independent_construction() {
     let (mut book2, cap2) = new_book(&mut scenario);
 
     assert!(tiny_clob::id_for_testing(&book1) != tiny_clob::id_for_testing(&book2), 0);
-    assert!(object::id(&cap1) != object::id(&cap2), 1);
+    assert!(tiny_clob::cap_id_for_testing(&cap1) != tiny_clob::cap_id_for_testing(&cap2), 1);
 
     tiny_clob::clob_admin_set_taker_fee(&cap1, &mut book1, 5);
     let (taker1, _) = tiny_clob::fee_config(&book1);
@@ -143,7 +143,7 @@ fun clob_admin_cap_store_and_discard() {
     let CapHolder { id, cap } = holder;
     id.delete();
 
-    let cap_id = object::id(&cap);
+    let cap_id = tiny_clob::cap_id_for_testing(&cap);
 
     // The cap can now only be destroyed by consuming it inside
     // `clob_admin_finalize` — there is no standalone discard function
@@ -1398,12 +1398,39 @@ fun place_market_order_bid_matches_resting_ask() {
 
     let budget = tiny_clob::bid_escrow_amount(&book, CH2_PRICE, CH2_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment, _) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover_payment, _) = tiny_clob::place_market_order_bid(
         &mut book, CH2_SIZE, budget, bid_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == CH2_SIZE, 0);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 1);
-    assert!(coin::burn_for_testing(leftover_payment) == 0, 2);
+    assert!(coin::burn_for_testing(leftover_payment) == 0, 1);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Regression: `place_market_order_bid` must merge the two leftover
+/// `Coin<Quote>` pieces — the unspent portion of `budget` (from matching)
+/// and the portion of the caller's original `payment` never earmarked as
+/// `budget` — into a single returned coin. Here `budget` is fully spent
+/// (exact match against a same-sized resting ask), so the entire merged
+/// leftover must come from the untouched `payment - budget` slice alone.
+#[test]
+fun place_market_order_bid_merges_leftover_budget_and_payment_when_payment_exceeds_budget() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let ask_ticket = rest_ask(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
+    unit_test::destroy(ask_ticket);
+
+    let budget = tiny_clob::bid_escrow_amount(&book, CH2_PRICE, CH2_SIZE);
+    let bid_payment = coin::mint_for_testing<USDC>(budget + 777, scenario.ctx());
+    let (matched_base, leftover_payment, _) = tiny_clob::place_market_order_bid(
+        &mut book, CH2_SIZE, budget, bid_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(coin::burn_for_testing(matched_base) == CH2_SIZE, 0);
+    // budget is fully spent (0 leftover from matching) + 777 leftover from
+    // the untouched payment slice above budget.
+    assert!(coin::burn_for_testing(leftover_payment) == 777, 1);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1439,14 +1466,13 @@ fun swap_bid_matches_resting_ask() {
 
     let budget = tiny_clob::bid_escrow_amount(&book, CH2_PRICE, CH2_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment, stopped) = tiny_clob::swap_bid(
+    let (matched_base, leftover_payment, stopped) = tiny_clob::swap_bid(
         &mut book, CH2_SIZE, budget, bid_payment, 1_000_000_000,
         option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(coin::burn_for_testing(matched_base) == CH2_SIZE, 1);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
-    assert!(coin::burn_for_testing(leftover_payment) == 0, 3);
+    assert!(coin::burn_for_testing(leftover_payment) == 0, 2);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1468,6 +1494,39 @@ fun swap_ask_matches_resting_bid() {
     assert!(!stopped, 0);
     assert!(coin::burn_for_testing(leftover_payment) == 0, 1);
     assert!(coin::burn_for_testing(matched_quote) == escrow_amount, 2);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Regression: `swap_bid` must merge the two leftover `Coin<Quote>` pieces
+/// into a single returned coin, mirroring the equivalent
+/// `place_market_order_bid` regression test above. Here `budget` is only
+/// partially spent — the resting ask covers only half the requested taker
+/// size, so half the `budget` balance is never matched — so the merged
+/// leftover must equal the sum of the matching engine's own unspent
+/// `budget` remainder AND the untouched `payment - budget` slice.
+#[test]
+fun swap_bid_merges_leftover_budget_and_payment_when_payment_exceeds_budget() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let requested_size = CH2_SIZE * 2;
+    let ask_ticket = rest_ask(&mut book, CH2_PRICE, CH2_SIZE, 1_000_000_000, scenario.ctx());
+    unit_test::destroy(ask_ticket);
+
+    let budget = tiny_clob::bid_escrow_amount(&book, CH2_PRICE, requested_size);
+    let expected_spent = tiny_clob::bid_escrow_amount(&book, CH2_PRICE, CH2_SIZE);
+    let bid_payment = coin::mint_for_testing<USDC>(budget + 777, scenario.ctx());
+    let (matched_base, leftover_payment, stopped) = tiny_clob::swap_bid(
+        &mut book, requested_size, budget, bid_payment, 1_000_000_000,
+        option::none(), option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(matched_base) == CH2_SIZE, 1);
+    // (budget - expected_spent) leftover from matching + 777 leftover from
+    // the untouched payment slice above budget.
+    assert!(coin::burn_for_testing(leftover_payment) == (budget - expected_spent) + 777, 2);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -2092,12 +2151,11 @@ fun place_market_order_bid_ask_happy_path() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, _) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, _) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == PLACEMENT_SIZE, 0);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 1);
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(coin::burn_for_testing(leftover) == 0, 1);
 
     scenario.next_tx(TAKER);
     let bid_ticket2 = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
@@ -2123,11 +2181,10 @@ fun place_market_order_bid_slippage_bound_aborts() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, _) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, _) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::some(PLACEMENT_SIZE + 1), scenario.ctx(),
     );
     coin::burn_for_testing(matched_base);
-    coin::burn_for_testing(remaining_budget);
     coin::burn_for_testing(leftover);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -2144,13 +2201,12 @@ fun swap_bid_ask_happy_path_and_max_fills_stop_signal() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stop) = tiny_clob::swap_bid(
+    let (matched_base, leftover, stop) = tiny_clob::swap_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == PLACEMENT_SIZE, 0);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 1);
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
-    assert!(!stop, 3);
+    assert!(coin::burn_for_testing(leftover) == 0, 1);
+    assert!(!stop, 2);
 
     // max_fills = 0 against a crossing resting ask signals the stop-reason.
     scenario.next_tx(TAKER);
@@ -2158,13 +2214,12 @@ fun swap_bid_ask_happy_path_and_max_fills_stop_signal() {
     scenario.next_tx(TAKER);
     let budget2 = tiny_clob::bid_escrow_amount(&book, PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment2 = coin::mint_for_testing<USDC>(budget2, scenario.ctx());
-    let (matched_base2, remaining_budget2, leftover2, stop2) = tiny_clob::swap_bid(
+    let (matched_base2, leftover2, stop2) = tiny_clob::swap_bid(
         &mut book, PLACEMENT_SIZE, budget2, bid_payment2, 0, option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base2) == 0, 4);
-    assert!(coin::burn_for_testing(remaining_budget2) == budget2, 5);
-    assert!(coin::burn_for_testing(leftover2) == 0, 6);
-    assert!(stop2, 7);
+    assert!(coin::burn_for_testing(leftover2) == budget2, 5);
+    assert!(stop2, 6);
 
     unit_test::destroy(ask_ticket);
     unit_test::destroy(ask_ticket2);
@@ -2186,13 +2241,12 @@ fun place_market_order_bid_returns_true_when_truncated_by_max_fills() {
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
     // max_fills = 0 against a crossing resting ask: nothing can be matched,
     // and the truncation signal must now come back as `true`.
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 0, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == 0, 0);
-    assert!(coin::burn_for_testing(remaining_budget) == budget, 1);
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
-    assert!(stopped, 3);
+    assert!(coin::burn_for_testing(leftover) == budget, 1);
+    assert!(stopped, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -2208,13 +2262,12 @@ fun place_market_order_bid_returns_false_when_fully_filled_within_max_fills() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
         &mut book, PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(coin::burn_for_testing(matched_base) == PLACEMENT_SIZE, 0);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 1);
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
-    assert!(!stopped, 3);
+    assert!(coin::burn_for_testing(leftover) == 0, 1);
+    assert!(!stopped, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -3693,14 +3746,13 @@ fun last_price_updates_on_real_fill_not_on_zero_qty_iteration() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, 100, MIN_SIZE); // exactly covers ask1, nothing left for ask2
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
         &mut book, MIN_SIZE * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 1);
     assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 2); // only ask1 filled
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 3);
-    assert!(coin::burn_for_testing(leftover) == 0, 4);
-    assert!(tiny_clob::last_price(&book) == 100, 5); // ask1's price, not ask2's
+    assert!(coin::burn_for_testing(leftover) == 0, 3);
+    assert!(tiny_clob::last_price(&book) == 100, 4); // ask1's price, not ask2's
 
     unit_test::destroy(ask1);
     unit_test::destroy(ask2);
@@ -3752,14 +3804,13 @@ fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
     scenario.next_tx(TAKER);
     let budget: u64 = 20_000_000_000; // 2e10 quote atoms
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover_payment, stopped) = tiny_clob::place_market_order_bid(
         &mut book, 1_000, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     // The resting ask only has 1_000 base atoms available, so the fill is
     // capped by natural_fill_qty (1_000), not by an abort.
     assert!(coin::burn_for_testing(matched_base) == 1_000, 1);
     assert!(!stopped, 2);
-    coin::burn_for_testing(remaining_budget);
     coin::burn_for_testing(leftover_payment);
 
     unit_test::destroy(ask_ticket);
@@ -4204,14 +4255,13 @@ fun last_price_reflects_last_of_two_fully_filled_ask_levels() {
     let budget = tiny_clob::bid_escrow_amount(&book, 100, MIN_SIZE)
         + tiny_clob::bid_escrow_amount(&book, 200, MIN_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
         &mut book, MIN_SIZE * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(coin::burn_for_testing(matched_base) == MIN_SIZE * 2, 1); // both levels fully filled
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
-    assert!(coin::burn_for_testing(leftover) == 0, 3);
-    assert!(tiny_clob::last_price(&book) == 200, 4); // the LAST level touched, not the first
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(tiny_clob::last_price(&book) == 200, 3); // the LAST level touched, not the first
 
     unit_test::destroy(ask1);
     unit_test::destroy(ask2);
@@ -4269,13 +4319,12 @@ fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
         &mut book, MIN_SIZE, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1); // filled despite being outside the band
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
-    assert!(coin::burn_for_testing(leftover) == 0, 3);
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -4296,13 +4345,12 @@ fun swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band() {
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::swap_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::swap_bid(
         &mut book, MIN_SIZE, budget, payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1); // filled despite being outside the band
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
-    assert!(coin::burn_for_testing(leftover) == 0, 3);
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -4446,7 +4494,7 @@ fun swap_bid_with_off_band_limit_price_fills_against_resting_ask_outside_band() 
     scenario.next_tx(TAKER);
     let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::swap_bid(
+    let (matched_base, leftover, stopped) = tiny_clob::swap_bid(
         &mut book, MIN_SIZE, budget, payment, 10, option::some(5000), option::none(), option::none(),
         scenario.ctx(),
     );
@@ -4455,8 +4503,7 @@ fun swap_bid_with_off_band_limit_price_fills_against_resting_ask_outside_band() 
     // being outside the band -- proving the band no longer gates the
     // taker's protective cap at all, not just the no-limit-price path.
     assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1);
-    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
-    assert!(coin::burn_for_testing(leftover) == 0, 3);
+    assert!(coin::burn_for_testing(leftover) == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -4787,11 +4834,10 @@ fun order_executed_fires_from_place_market_order_bid_fully_filled() {
 
     let budget = tiny_clob::bid_escrow_amount(&book, OE_PRICE, OE_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment, stopped) = tiny_clob::place_market_order_bid(
+    let (matched_base, leftover_payment, stopped) = tiny_clob::place_market_order_bid(
         &mut book, OE_SIZE, budget, payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(matched_base);
-    coin::burn_for_testing(remaining_budget);
     coin::burn_for_testing(leftover_payment);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
@@ -4853,12 +4899,11 @@ fun order_executed_fires_from_swap_bid_fully_filled() {
 
     let budget = tiny_clob::bid_escrow_amount(&book, OE_PRICE, OE_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, remaining_budget, leftover_payment, stopped) = tiny_clob::swap_bid(
+    let (matched_base, leftover_payment, stopped) = tiny_clob::swap_bid(
         &mut book, OE_SIZE, budget, payment, 1_000_000_000,
         option::some(OE_PRICE), option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(matched_base);
-    coin::burn_for_testing(remaining_budget);
     coin::burn_for_testing(leftover_payment);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
@@ -4938,12 +4983,11 @@ fun order_executed_entry_point_distinguishes_limit_bid_from_swap_bid_at_same_pri
     seed_resting_ask(&mut book, OE_PRICE, OE_SIZE, scenario.ctx());
     let budget_2 = tiny_clob::bid_escrow_amount(&book, OE_PRICE, OE_SIZE);
     let payment_2 = coin::mint_for_testing<USDC>(budget_2, scenario.ctx());
-    let (matched_base_2, remaining_budget_2, leftover_payment_2, _stopped_2) = tiny_clob::swap_bid(
+    let (matched_base_2, leftover_payment_2, _stopped_2) = tiny_clob::swap_bid(
         &mut book, OE_SIZE, budget_2, payment_2, 1_000_000_000,
         option::some(OE_PRICE), option::none(), option::none(), scenario.ctx(),
     );
     coin::burn_for_testing(matched_base_2);
-    coin::burn_for_testing(remaining_budget_2);
     coin::burn_for_testing(leftover_payment_2);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();

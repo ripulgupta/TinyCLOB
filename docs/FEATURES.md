@@ -13,9 +13,11 @@ the reasoning behind any design choice.
 - `OrderBook<Base, Quote>` has `store` only, no `key`. It cannot become a
   standalone Sui object or be shared via `sui::transfer::share_object`; it is
   meant to be embedded as a field inside an integrator's own object.
-- `ClobAdminCap` has `key, store`. It is minted once per book, at
-  construction, and is the capability required by every function whose name
-  begins with `clob_admin_`.
+- `ClobAdminCap` has `store` only, no `key`. Like `OrderBook`, it cannot
+  become a standalone Sui object or be independently transferred; it must be
+  embedded as a field inside some other object with `key` to persist. It is
+  minted once per book, at construction, and is the capability required by
+  every function whose name begins with `clob_admin_`.
 - `OrderTicket` has `store` only, no `key`. It is a plain value returned to a
   caller when a limit order rests on the book, and is required to cancel
   that order, reassign its owner, or claim its proceeds later. It is bound
@@ -316,16 +318,16 @@ public fun place_market_order_bid<Base, Quote>(
     max_quote_in: Option<u64>,
     min_base_out: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool)
+): (Coin<Base>, Coin<Quote>, bool)
 ```
 
 No price parameter; no declared-range check and no price-band check apply
 at all — this fills at whatever prices the book's resting orders currently
 offer. Aborts if the book is paused, or if `size < min_size`. `budget` is
 the amount of `payment` escrowed for this buy; any part of `payment` beyond
-`budget` is returned untouched as a separate `Coin<Quote>` from the unspent
-portion of `budget` itself, so the two remainder coins returned are
-distinct. Never rests an order — anything unfilled is simply returned.
+`budget`, together with any unspent portion of `budget` itself left over
+from matching, is merged into and returned as a single `Coin<Quote>`. Never
+rests an order — anything unfilled is simply returned.
 
 Optional slippage guards, checked after matching completes: `max_quote_in`
 aborts with `ESlippageExceeded` (17) if the quote actually spent exceeds it;
@@ -339,8 +341,8 @@ actual amount spent, which can be tighter than `budget` without requiring
 the caller to compute a precisely-sized `budget` coin in advance. A caller
 may pass a generously large `budget` and rely on `max_quote_in` to bound
 real spend — the unspent difference is always returned automatically as
-`remaining_budget` — rather than needing to pre-split `payment` down to an
-exact amount themselves.
+part of the merged leftover `Coin<Quote>` — rather than needing to
+pre-split `payment` down to an exact amount themselves.
 
 ### `place_market_order_ask`
 
@@ -374,7 +376,7 @@ public fun swap_bid<Base, Quote>(
     max_quote_in: Option<u64>,
     min_base_out: Option<u64>,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, Coin<Quote>, bool)
+): (Coin<Base>, Coin<Quote>, bool)
 ```
 
 Behaves like `place_market_order_bid`, with one addition: an optional
@@ -413,18 +415,21 @@ Mirrors `swap_bid` for the ask side, with the same `limit_price` contract.
 | `swap_bid` | `limit_price: Option<u64>` | Yes, only if `Some` | No, never | No |
 | `swap_ask` | `limit_price: Option<u64>` | Yes, only if `Some` | No, never | No |
 
-`place_market_order_bid` returns four values (two separate `Coin<Quote>`
-values) while `place_market_order_ask` returns three. This is not an
-arbitrary asymmetry: the ask side's escrow (`payment: Coin<Base>`) is split
-by `size` directly — an exact base amount, no price conversion — so there is
-exactly one leftover quantity (the unmatched portion of `payment` beyond
-`size`). The bid side separately tracks `budget` (the quote amount actually
-escrowed for this buy) against `payment` (the full coin the caller supplied,
-which may exceed `budget`); matching can leave both an unspent portion of
-`budget` and a portion of `payment` that was never earmarked as `budget` in
-the first place, which is why two independent leftover coins are returned
-rather than one. `swap_bid`/`swap_ask` follow the same pattern as their
-respective market-order counterparts for this reason.
+All four of `place_market_order_bid`/`place_market_order_ask`/`swap_bid`/
+`swap_ask` return three values: a matched-side coin, a single merged
+leftover coin, and the `stopped_on_max_fills_while_crossing` flag — but the
+order differs by side. `place_market_order_bid`/`swap_bid` return
+`(Coin<Base>, Coin<Quote>, bool)`: matched base first, merged leftover quote
+second. `place_market_order_ask`/`swap_ask` return
+`(Coin<Base>, Coin<Quote>, bool)` too, but the first position is the
+leftover (unmatched) base returned to the caller and the second is the
+matched quote received — see each function's own signature for which is
+which. On the bid side, `budget`'s own unspent remainder from matching and
+the portion of `payment` never earmarked as `budget` are joined into that
+one leftover `Coin<Quote>` before it is returned, mirroring how
+`place_limit_order_bid`/`place_limit_order_ask` already merge their own
+internal escrow/payment
+splits into a single returned coin.
 
 ## 7. Order lifecycle: tickets, cancellation, ownership
 
