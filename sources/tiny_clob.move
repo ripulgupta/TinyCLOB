@@ -270,7 +270,10 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     /// when set, every placed order's `price` must fall within
     /// `[last_price / price_band_factor, last_price * price_band_factor]`.
     /// `None` (the default) disables this check entirely. See
-    /// `clob_admin_set_price_band_factor`.
+    /// `clob_admin_set_price_band_factor`. This band is only as trustworthy
+    /// as `last_price` itself — see `set_last_price`'s doc comment for a
+    /// known, accepted limitation (permissionless, capital-free griefing of
+    /// this band's position on an empty book).
     price_band_factor: Option<u64>,
     /// The id every event this module emits stamps as `order_book_id`.
     /// Write-once: fixed at construction time (defaults to the book's own
@@ -512,9 +515,11 @@ fun new_impl<Base, Quote>(
     (book, cap)
 }
 
-// === Package-private field accessors ===
+// === Field accessors ===
+// `min_size` is public (integrators need it to pre-validate order size before
+// calling); the rest below are package-private.
 
-public(package) fun min_size<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+public fun min_size<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.min_size
 }
 
@@ -662,6 +667,25 @@ public fun depth_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, side: bool
     price_tree::level_total_size(level)
 }
 
+/// The book's own `last_price` field, snapshotted the last time a fill
+/// occurred (see the `OrderBook` doc comment for full semantics).
+public fun last_price<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+    book.last_price
+}
+
+/// The book's own optional price-band factor — see
+/// `clob_admin_set_price_band_factor`'s doc comment for what this value
+/// gates.
+public fun price_band_factor<Base, Quote>(book: &OrderBook<Base, Quote>): Option<u64> {
+    book.price_band_factor
+}
+
+/// The book's own `version` field. See `assert_book_version`'s doc comment
+/// for how/when this can change.
+public fun book_version<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
+    book.version
+}
+
 // === ClobAdminCap gate ===
 
 fun assert_clob_admin<Base, Quote>(cap: &ClobAdminCap, book: &OrderBook<Base, Quote>) {
@@ -784,14 +808,32 @@ public struct LastPriceSet has copy, drop {
 /// it can only move `last_price` to somewhere at least as constrained as
 /// the live spread already permits. When the book is empty near the
 /// reference price, the check is unconstrained (no best bid/ask means no
-/// bound applies) — but that state is already reachable cheaply by anyone
-/// via self-crossing trades, so gating this setter behind `ClobAdminCap`
-/// blocked no real attack while adding pure friction: a genuine caller
-/// recovering from a stale or walked-away `last_price` had to run multiple
-/// self-crossing rounds, or wait on the admin, just to unblock their own
-/// order placement. Now they can call this directly — optionally bundled
-/// with their order-placement call in the same PTB for atomicity — the
-/// moment the book is unconstrained at that price.
+/// bound applies), and gating this setter behind `ClobAdminCap` blocked no
+/// meaningful attack downward — a resting-order self-cross can walk
+/// `last_price` down cheaply regardless — while adding pure friction: a
+/// genuine caller recovering from a stale or walked-away `last_price` had
+/// to run multiple self-crossing rounds, or wait on the admin, just to
+/// unblock their own order placement. Now they can call this directly —
+/// optionally bundled with their order-placement call in the same PTB for
+/// atomicity — the moment the book is unconstrained at that price.
+///
+/// Known limitation, accepted as documented rather than fixed (see the
+/// project's audit notes, finding M-01): walking `last_price` UP via a
+/// self-cross is not actually cheap — each round requires escrowing real
+/// quote proportional to the new, higher price — but this permissionless
+/// setter has no such cost in either direction. On an empty book, anyone
+/// can jump `last_price` to any declared-range value in a single, capital-
+/// free call, which can push `price_band_factor`'s band far enough from the
+/// true price that every legitimate `place_limit_order_bid`/`_ask` at the
+/// true price starts aborting on `EPriceBelowBand`/`EPriceAboveBand`. This
+/// is pure griefing, not a fund-loss vector — `last_price` is never read by
+/// any escrow, fee, or proceeds computation, and `cancel_order`/
+/// `clob_admin_cancel_order` are never gated by it — and recovery is just
+/// as cheap and permissionless as the griefing call: any caller can bundle
+/// their own corrective `set_last_price` with their order placement in one
+/// atomic PTB and always succeed. Integrators relying on `price_band_factor`
+/// as protection against a determined, motivated griefer (rather than
+/// purely a fat-finger guard) should account for this.
 ///
 /// Since this is permissionless, the emitted `LastPriceSet` event carries
 /// `setter: ctx.sender()` so off-chain indexers can distinguish an
@@ -1055,6 +1097,18 @@ public fun clob_admin_finalize<Base, Quote>(
 
 // === Matching engine, escrow/fee math, OrderTicket ===
 
+/// Each party's fee is denominated in the asset that party receives. When
+/// `maker_side == false` (maker was a resting ask): the taker receives Base
+/// (so `taker_fee_amount` is in Base) and the maker receives Quote (so
+/// `maker_fee_amount` is in Quote). When `maker_side == true` (maker was a
+/// resting bid): the taker receives Quote (`taker_fee_amount` in Quote) and
+/// the maker receives Base (`maker_fee_amount` in Base). `quote_amount` and
+/// `taker_fee_amount`/`maker_fee_amount` are all gross amounts — each fee is
+/// deducted FROM its respective gross leg, not added on top. On the
+/// maker-bid side (`maker_side == true`), `quote_amount` is derived from a
+/// proportional slice of the maker's original escrow reservation (not a
+/// direct `price * size` recomputation) and may differ by rounding from
+/// `ceil(price * size / price_scale)` — this is expected.
 public struct OrderFilled has copy, drop {
     maker_order_id: u64,
     order_book_id: ID,
@@ -1062,6 +1116,10 @@ public struct OrderFilled has copy, drop {
     size: u64,
     maker: address,
     taker: address,
+    maker_side: bool,
+    quote_amount: u64,
+    taker_fee_amount: u64,
+    maker_fee_amount: u64,
 }
 
 /// `ceil(price * size / book.price_scale)`. `size` is always
@@ -1236,6 +1294,10 @@ fun fill_level_bid<Base, Quote>(
                 size: fill_qty,
                 maker: maker_addr,
                 taker,
+                maker_side: false,
+                quote_amount: quote_cost,
+                taker_fee_amount: taker_fee_base,
+                maker_fee_amount: maker_fee_quote,
             });
 
             *remaining_size = *remaining_size - fill_qty;
@@ -1404,6 +1466,10 @@ fun fill_level_ask<Base, Quote>(
                 size: fill_qty,
                 maker: maker_addr,
                 taker,
+                maker_side: true,
+                quote_amount: quote_cost,
+                taker_fee_amount: taker_fee_quote,
+                maker_fee_amount: maker_fee_base,
             });
 
             *remaining_size = *remaining_size - fill_qty;
@@ -1552,6 +1618,7 @@ public struct OrderPlaced has copy, drop {
     price: u64,
     size: u64,
     trader: address,
+    maker_fee_bps: u64,
 }
 
 public struct ProceedsClaimed has copy, drop {
@@ -1559,6 +1626,47 @@ public struct ProceedsClaimed has copy, drop {
     order_book_id: ID,
     base_amount: u64,
     quote_amount: u64,
+}
+
+/// Emitted exactly once, unconditionally, as the final event of every call to
+/// `place_limit_order_bid`/`place_limit_order_ask`/`place_market_order_bid`/
+/// `place_market_order_ask`/`swap_bid`/`swap_ask` (identified by
+/// `entry_point`, see below) — after any slippage-guard asserts in the
+/// market/swap functions, so an abort emits nothing.
+///
+/// Event-ordering contract: within one call, the sequence is zero-or-more
+/// `OrderFilled`, then an optional `OrderPlaced`, then exactly one
+/// `OrderExecuted` as a trailer — correlating fills to their triggering call
+/// relies on this within-transaction ordering (Sui's event ordering within a
+/// transaction's effects is deterministic).
+public struct OrderExecuted has copy, drop {
+    order_book_id: ID,
+    taker: address,
+    taker_side: bool,
+    /// 0 = place_limit_order_bid, 1 = place_limit_order_ask,
+    /// 2 = place_market_order_bid, 3 = place_market_order_ask,
+    /// 4 = swap_bid, 5 = swap_ask
+    entry_point: u8,
+    /// `None` for market orders; for `place_limit_order_*`, the
+    /// resting/placement price; for `swap_*`, the taker's protective
+    /// slippage cap (exempt from the price band — see `swap_bid`/`swap_ask`'s
+    /// own doc comment).
+    limit_price: Option<u64>,
+    /// The caller's own `size` argument.
+    requested_size: u64,
+    /// Remaining size after matching (gross base; NOT reduced by taker fee,
+    /// so `requested_size - unmatched_size` does not equal the base actually
+    /// returned to the taker when `taker_fee_bps > 0`).
+    unmatched_size: u64,
+    /// 0 if nothing ends up resting. On the bid limit path this can be LESS
+    /// than `unmatched_size` even when something rests, because
+    /// `place_limit_order_bid` clamps the resting size to what leftover
+    /// escrow can actually back (ceiling-division superadditivity) — this is
+    /// expected, not a bug.
+    rested_size: u64,
+    /// `Some(id)` iff something rested this call, else `None`.
+    rested_order_id: Option<u64>,
+    stopped_on_max_fills_while_crossing: bool,
 }
 
 /// `price` is a raw, book-relative unit; see the module doc comment for how
@@ -1649,6 +1757,7 @@ public fun place_limit_order_bid<Base, Quote>(
             price,
             size: actual_resting_size,
             trader: taker,
+            maker_fee_bps: maker_fee_bps_snapshot,
         });
         option::some(OrderTicket {
             order_id,
@@ -1660,6 +1769,21 @@ public fun place_limit_order_bid<Base, Quote>(
         coin::join(&mut payment, coin::from_balance(escrow, ctx));
         option::none()
     };
+
+    let rested_size = if (should_rest) actual_resting_size else 0;
+    let rested_order_id = if (should_rest) option::some(order_id) else option::none();
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: true,
+        entry_point: 0,
+        limit_price: option::some(price),
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size,
+        rested_order_id,
+        stopped_on_max_fills_while_crossing,
+    });
 
     (ticket_opt, coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
 }
@@ -1723,6 +1847,7 @@ public fun place_limit_order_ask<Base, Quote>(
             price,
             size: remaining_size,
             trader: taker,
+            maker_fee_bps: maker_fee_bps_snapshot,
         });
         option::some(OrderTicket {
             order_id,
@@ -1734,6 +1859,21 @@ public fun place_limit_order_ask<Base, Quote>(
         coin::join(&mut payment, coin::from_balance(remaining_escrow, ctx));
         option::none()
     };
+
+    let rested_size = if (should_rest) remaining_size else 0;
+    let rested_order_id = if (should_rest) option::some(order_id) else option::none();
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: false,
+        entry_point: 1,
+        limit_price: option::some(price),
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size,
+        rested_order_id,
+        stopped_on_max_fills_while_crossing,
+    });
 
     (ticket_opt, payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
@@ -1759,7 +1899,7 @@ public fun place_market_order_bid<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, option::none(), size, budget_balance, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -1772,6 +1912,19 @@ public fun place_market_order_bid<Base, Quote>(
     if (min_base_out.is_some()) {
         assert!(balance::value(&matched_base) >= *min_base_out.borrow(), ESlippageExceeded);
     };
+
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: true,
+        entry_point: 2,
+        limit_price: option::none(),
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size: 0,
+        rested_order_id: option::none(),
+        stopped_on_max_fills_while_crossing,
+    });
 
     (
         coin::from_balance(matched_base, ctx),
@@ -1800,7 +1953,7 @@ public fun place_market_order_ask<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, _remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -1815,6 +1968,20 @@ public fun place_market_order_ask<Base, Quote>(
     };
 
     coin::join(&mut payment, coin::from_balance(remaining_escrow, ctx));
+
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: false,
+        entry_point: 3,
+        limit_price: option::none(),
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size: 0,
+        rested_order_id: option::none(),
+        stopped_on_max_fills_while_crossing,
+    });
+
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
@@ -1851,7 +2018,7 @@ public fun swap_bid<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, limit_price, size, budget_balance, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -1864,6 +2031,19 @@ public fun swap_bid<Base, Quote>(
     if (min_base_out.is_some()) {
         assert!(balance::value(&matched_base) >= *min_base_out.borrow(), ESlippageExceeded);
     };
+
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: true,
+        entry_point: 4,
+        limit_price,
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size: 0,
+        rested_order_id: option::none(),
+        stopped_on_max_fills_while_crossing,
+    });
 
     (
         coin::from_balance(matched_base, ctx),
@@ -1904,7 +2084,7 @@ public fun swap_ask<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, _remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, limit_price, size, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -1919,6 +2099,20 @@ public fun swap_ask<Base, Quote>(
     };
 
     coin::join(&mut payment, coin::from_balance(remaining_escrow, ctx));
+
+    event::emit(OrderExecuted {
+        order_book_id: event_book_id,
+        taker,
+        taker_side: false,
+        entry_point: 5,
+        limit_price,
+        requested_size: size,
+        unmatched_size: remaining_size,
+        rested_size: 0,
+        rested_order_id: option::none(),
+        stopped_on_max_fills_while_crossing,
+    });
+
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
 }
 
@@ -2161,11 +2355,6 @@ public fun bids_size_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): u6
     price_tree::size(&book.bids)
 }
 
-#[test_only]
-public fun last_price_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
-    book.last_price
-}
-
 /// The book's own object id, derived from its `id: UID` field directly
 /// (`object::id` requires `key`, which this struct deliberately does not
 /// have — see the struct's own doc comment above).
@@ -2202,11 +2391,6 @@ public fun credit_fee_accumulator_for_testing<Base, Quote>(
 #[test_only]
 public fun for_book_for_testing(cap: &ClobAdminCap): ID {
     cap.for_book
-}
-
-#[test_only]
-public fun book_version_is_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>, expected: u64): bool {
-    book.version == expected
 }
 
 /// Test-only escape hatch to force a book's `version` field directly, so
@@ -2265,8 +2449,8 @@ public fun order_cancelled_fields_for_testing(e: &OrderCancelled): (u64, ID, add
 }
 
 #[test_only]
-public fun order_placed_fields_for_testing(e: &OrderPlaced): (u64, ID, bool, u64, u64, address) {
-    (e.order_id, e.order_book_id, e.side, e.price, e.size, e.trader)
+public fun order_placed_fields_for_testing(e: &OrderPlaced): (u64, ID, bool, u64, u64, address, u64) {
+    (e.order_id, e.order_book_id, e.side, e.price, e.size, e.trader, e.maker_fee_bps)
 }
 
 #[test_only]
@@ -2314,6 +2498,16 @@ public fun ticket_fields_for_testing(t: &OrderTicket): (u64, ID, bool, u64) {
 #[test_only]
 public fun order_filled_fields_for_testing(e: &OrderFilled): (u64, ID, u64, u64, address, address) {
     (e.maker_order_id, e.order_book_id, e.price, e.size, e.maker, e.taker)
+}
+
+#[test_only]
+public fun order_filled_fee_fields_for_testing(e: &OrderFilled): (bool, u64, u64, u64) {
+    (e.maker_side, e.quote_amount, e.taker_fee_amount, e.maker_fee_amount)
+}
+
+#[test_only]
+public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool) {
+    (e.order_book_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing)
 }
 
 /// Direct `match_bid` exposure, used by behavioral-equivalence tests that
