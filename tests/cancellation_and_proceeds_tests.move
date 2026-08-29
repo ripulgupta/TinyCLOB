@@ -634,6 +634,135 @@ fun destroy_orphaned_ticket_wrong_book_aborts() {
     scenario.end();
 }
 
+// A resting bid of size 1 at a price where `bid_escrow_amount`/fill quote
+// cost is 1, with even the minimum nonzero maker_fee_bps (1), has its
+// entire matched Base leg consumed by the fee ceiling (`fee_amount(1, 1)
+// == 1`) -- so the fill credits (0 base, 0 quote) to the maker via the
+// real production placement/matching path, not a synthetic order. Before
+// the fix to `credit_maker_table`, this would have created a pooled
+// zero-valued `MakerBalance` entry that blocked `destroy_orphaned_ticket`
+// despite protecting no real funds; now no entry is created at all, and
+// disposal succeeds immediately once the (now fully-drained) order is
+// gone.
+#[test]
+fun destroy_orphaned_ticket_after_all_zero_credited_fill_disposes_cleanly() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+
+    tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, 1);
+
+    scenario.next_tx(maker_a());
+    let bid_ticket = rest_bid(&mut book, shortfall_price(), 1, 1_000_000_000, scenario.ctx());
+    let order_id = tiny_clob::ticket_order_id(&bid_ticket);
+
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
+        &mut book, 1, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    coin::burn_for_testing(leftover_payment);
+    coin::burn_for_testing(matched_quote);
+
+    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
+    tiny_clob::destroy_orphaned_ticket(&book, bid_ticket); // must NOT abort
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === `destroy_ticket_unconditionally` ===
+
+// The headline new capability: unlike `destroy_orphaned_ticket`, this
+// succeeds even while the order still has real escrow AND real pooled
+// proceeds attached -- and neither is stranded, because the admin can
+// still reach both without the ticket afterward.
+#[test]
+fun destroy_ticket_unconditionally_disposes_with_real_escrow_and_proceeds_still_attached() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let size = 300;
+    let fill_size = 100;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = tiny_clob::ticket_order_id(&bid_ticket);
+    let side = tiny_clob::ticket_side(&bid_ticket);
+    let price = tiny_clob::ticket_price(&bid_ticket);
+
+    // Partially fill it so book.proceeds[order_id] holds a real, nonzero
+    // pooled Base credit, while the order keeps resting with real Quote
+    // escrow still locked for the unfilled remainder.
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = tiny_clob::place_market_order_ask(
+        &mut book, fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    );
+    coin::burn_for_testing(leftover_payment);
+    coin::burn_for_testing(matched_quote);
+    assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id), 0);
+
+    // Snapshot the still-resting remainder's real, nonzero live escrow
+    // before the ticket that could otherwise self-serve it is gone.
+    let escrow_before = tiny_clob::resting_order_escrow(&book, side, price, order_id);
+    let (expected_refund, _) = tiny_clob::resting_order_escrow_fields(escrow_before.borrow());
+    assert!(expected_refund > 0, 5);
+    unit_test::destroy(escrow_before);
+
+    // Would have aborted EProceedsNotEmpty via destroy_orphaned_ticket;
+    // this succeeds instead, with no book reference at all.
+    tiny_clob::destroy_ticket_unconditionally(bid_ticket);
+
+    // Neither leg is stranded: the admin can still force-cancel the
+    // still-resting remainder's escrow, and still push out the pooled
+    // proceeds, using only (side, price, order_id) -- no ticket needed.
+    scenario.next_tx(admin());
+    tiny_clob::clob_admin_cancel_order(&cap, &mut book, side, price, order_id, scenario.ctx());
+    tiny_clob::push_proceeds(&cap, &mut book, order_id, scenario.ctx());
+
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled_events.length() == 1, 1);
+    let claimed_events = event::events_by_type<ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 2);
+    let (ev_claimant, _, ev_base, _) = tiny_clob::proceeds_claimed_fields_for_testing(&claimed_events[0]);
+    assert!(ev_claimant == admin(), 3); // rest_bid's caller here (no next_tx before it)
+    assert!(ev_base == fill_size, 4);
+
+    // Confirm the escrow refund itself actually reached the owner, in the
+    // exact amount snapshotted above, not just that a cancellation event
+    // fired.
+    scenario.next_tx(admin());
+    let refunded_quote = scenario.take_from_address<coin::Coin<USDC>>(admin());
+    assert!(refunded_quote.value() == expected_refund, 6);
+    coin::burn_for_testing(refunded_quote);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// The actual motivating scenario: a ticket that survives all the way past
+// `clob_admin_finalize`, when the book it referenced no longer exists at
+// all. No other disposal function can ever be called on it again -- this
+// one takes no book reference, so it doesn't need to.
+#[test]
+fun destroy_ticket_unconditionally_disposes_ticket_after_book_finalized() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+
+    // Retire + drain refunds the resting order's escrow to its owner
+    // (independent of the ticket), leaving the book empty and finalizable.
+    // The ticket itself is never touched by any of this.
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+    let _deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    // `book`/`cap` no longer exist -- there is no way to construct a
+    // `destroy_orphaned_ticket`/`cancel_order`/`claim_proceeds` call for
+    // `bid_ticket` ever again. This is the only remaining disposal path.
+    tiny_clob::destroy_ticket_unconditionally(bid_ticket);
+
+    scenario.end();
+}
+
 #[test]
 fun destroy_orphaned_ticket_zero_proceeds_on_own_book_disposes_cleanly() {
     let mut scenario = ts::begin(admin());

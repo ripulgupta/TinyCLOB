@@ -145,7 +145,21 @@ fun credit_maker_table<Base, Quote>(
     base: Balance<Base>,
     quote: Balance<Quote>,
 ) {
-    if (!linked_table::contains(proceeds, order_id)) {
+    let already_exists = linked_table::contains(proceeds, order_id);
+    if (!already_exists && balance::value(&base) == 0 && balance::value(&quote) == 0) {
+        // A zero-valued credit that would otherwise create a fresh ledger
+        // entry holding nothing -- e.g. a fee-ceiling-consumes-everything
+        // fill (see `fee_amount`) -- is skipped entirely rather than
+        // creating a real entry with nothing pooled in it. Such an entry
+        // would block `destroy_orphaned_ticket`'s presence check even
+        // though it protects no real funds. If a LATER fill on this same
+        // order credits a genuinely nonzero amount, the `push_back` below
+        // still runs then, at that point.
+        balance::destroy_zero(base);
+        balance::destroy_zero(quote);
+        return
+    };
+    if (!already_exists) {
         linked_table::push_back(proceeds, order_id, MakerBalance { owner, base: balance::zero(), quote: balance::zero() });
     };
     let mb = linked_table::borrow_mut(proceeds, order_id);
@@ -603,7 +617,7 @@ public fun assert_book_version<Base, Quote>(book: &mut OrderBook<Base, Quote>) {
         let from = book.version;
         book.version = CURRENT_VERSION;
         event::emit(BookVersionUpgraded {
-            book_id: object::uid_to_inner(&book.id),
+            book_id: book.event_id,
             from,
             to: CURRENT_VERSION,
         });
@@ -1203,7 +1217,7 @@ public fun clob_admin_finalize<Base, Quote>(
     let ClobAdminCap { id: cap_id_uid } = cap;
     let cap_id = object::uid_to_inner(&cap_id_uid);
     object::delete(cap_id_uid);
-    event::emit(ClobAdminCapDiscarded { cap_id, for_book: true_book_id });
+    event::emit(ClobAdminCapDiscarded { cap_id, for_book: event_book_id });
 
     true_book_id
 }
@@ -1705,11 +1719,13 @@ public fun ticket_price(t: &OrderTicket): u64 {
 }
 
 /// Unconditional disposal — no liveness check of its own. Package-private:
-/// safe only because its sole caller, `claim_proceeds`, guarantees by
-/// construction that `book.proceeds` holds no entry for this ticket's
-/// `order_id` before calling this (it has just drained that entry via
-/// `claim_maker_balance`). Any other caller must use the guarded public
-/// `destroy_orphaned_ticket` below instead.
+/// used by two callers, each safe for a different reason. `claim_proceeds`
+/// calls it having just guaranteed by construction that `book.proceeds`
+/// holds no entry for this ticket's `order_id` (it has just drained that
+/// entry via `claim_maker_balance`). `destroy_ticket_unconditionally`
+/// (below) calls it with no such guarantee at all, by design — see that
+/// function's own doc comment for why that is still safe. Any other caller
+/// must use the guarded public `destroy_orphaned_ticket` below instead.
 public(package) fun destroy_orphaned_ticket_unchecked(ticket: OrderTicket) {
     let OrderTicket { order_id: _, order_book_id: _, side: _, price: _ } = ticket;
 }
@@ -1729,6 +1745,33 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 ) {
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     assert!(!linked_table::contains(&book.proceeds, ticket.order_id), EProceedsNotEmpty);
+    destroy_orphaned_ticket_unchecked(ticket);
+}
+
+/// Unconditionally destroys `ticket` with no liveness or safety check of
+/// any kind, and — unlike every other ticket function — no `OrderBook`
+/// parameter at all. This is intentional, not an oversight: `OrderBook`
+/// has `store` only, and once `clob_admin_finalize` consumes and deletes
+/// one, nothing in Move can ever again prove whether a given book still
+/// exists. Requiring a live book reference (as `destroy_orphaned_ticket`
+/// does) therefore has no answer once the book is genuinely gone — this
+/// function exists specifically to dispose of a ticket in that situation.
+///
+/// It is safe to call even while the referenced book is still alive,
+/// including when its order might still hold real escrow or pooled
+/// proceeds: a ticket has never been the *only* path back to either.
+/// `clob_admin_cancel_order` force-cancels a still-resting order using
+/// just `(side, price, order_id)` — all public via `OrderPlaced` — with no
+/// ticket needed, and `push_proceeds`/`clob_admin_drain_step` reach pooled
+/// proceeds by `order_id` alone. Calling this function only ever gives up
+/// the ticket holder's own convenient self-service path
+/// (`cancel_order`/`claim_proceeds`/`destroy_orphaned_ticket`); it never
+/// strands anything the book's admin-gated recovery paths can't still
+/// reach. And if the book has already been finalized, `clob_admin_finalize`'s
+/// own precondition (zero resting orders, zero pooled proceeds, zero fee
+/// balances) guarantees nothing of value was ever left attached to any
+/// ticket for it in the first place.
+public fun destroy_ticket_unconditionally(ticket: OrderTicket) {
     destroy_orphaned_ticket_unchecked(ticket);
 }
 

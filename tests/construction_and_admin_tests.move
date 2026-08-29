@@ -382,6 +382,46 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     scenario.end();
 }
 
+// `BookVersionUpgraded.book_id` and `ClobAdminCapDiscarded.for_book` used to
+// stamp the book's true, unforgeable id while every other event in this
+// module stamps `event_id` -- an inconsistency that broke correlation for
+// any indexer joining on `order_book_id`/`for_book` for a book constructed
+// with an override. Both now stamp `event_id` like every other event.
+#[test]
+fun book_version_upgraded_and_cap_discarded_stamp_event_id_override_not_true_id() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let override_id = object::uid_to_inner(&wrapper_uid);
+    let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
+        min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
+    );
+    let true_book_id = tiny_clob::id_for_testing(&book);
+    assert!(true_book_id != override_id, 0);
+
+    tiny_clob::set_book_version_for_testing(&mut book, 0);
+    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+
+    let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
+    assert!(upgraded_events.length() == 1, 1);
+    let (ev_book_id, _, _) = tiny_clob::book_version_upgraded_fields_for_testing(&upgraded_events[0]);
+    assert!(ev_book_id == override_id, 2);
+    assert!(ev_book_id != true_book_id, 3);
+
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    assert!(deleted_id == true_book_id, 4);
+
+    let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
+    assert!(discarded_events.length() == 1, 5);
+    let (_, ev_for_book) = tiny_clob::clob_admin_cap_discarded_fields_for_testing(&discarded_events[0]);
+    assert!(ev_for_book == override_id, 6);
+    assert!(ev_for_book != true_book_id, 7);
+
+    object::delete(wrapper_uid);
+    scenario.end();
+}
+
 #[test, expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
 fun finalize_aborts_when_fee_accumulator_nonzero() {
     let mut scenario = ts::begin(admin());

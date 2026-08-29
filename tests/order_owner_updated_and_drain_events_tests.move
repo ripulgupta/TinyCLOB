@@ -140,12 +140,20 @@ fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
 
 // A resting bid whose maker_fee_bps is (test-only, via direct `order::new`)
 // set to 100% has its entire matched Base payment consumed by the maker
-// fee, so the pooled `MakerBalance` entry `credit_maker_table` creates for
-// it is zero-valued in BOTH legs -- a real, reachable state distinct from
-// "no entry at all". `drain_proceeds` must skip emitting `ProceedsClaimed`
-// for that entry while still emitting it for an ordinary (nonzero) one.
+// fee, so its credited proceeds are zero in BOTH legs. `credit_maker_table`
+// deliberately skips creating a pooled `MakerBalance` entry for a credit
+// that is entirely zero-valued when no entry exists yet (closing a footgun
+// where such an entry would otherwise block `destroy_orphaned_ticket`'s
+// presence check despite protecting no real funds) -- so no entry ever
+// exists for this order at all. `drain_proceeds` therefore has nothing to
+// find for it and emits no `ProceedsClaimed`, while still emitting one for
+// the ordinary (nonzero) order alongside it. NOTE: this does NOT exercise
+// `drain_proceeds`'s own zero-value skip-guard -- since `credit_maker_table`
+// is the only creator of `MakerBalance` entries and never creates one this
+// way, that guard is unreachable in production and is not covered by this
+// (or any) test; it remains only as defensive dead code.
 #[test]
-fun clob_admin_drain_step_skips_proceeds_claimed_for_zero_valued_entry_only() {
+fun clob_admin_drain_step_emits_proceeds_claimed_only_for_the_nonzero_order() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -178,7 +186,9 @@ fun clob_admin_drain_step_skips_proceeds_claimed_for_zero_valued_entry_only() {
     coin::burn_for_testing(leftover);
     coin::burn_for_testing(matched_quote);
 
-    assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id_zero), 0);
+    // No entry is ever created for the zero-fee order -- there is nothing
+    // to skip at drain time, only nothing to find.
+    assert!(!tiny_clob::proceeds_contains_for_testing(&book, order_id_zero), 0);
     assert!(tiny_clob::proceeds_contains_for_testing(&book, order_id_normal), 1);
 
     tiny_clob::clob_admin_retire(&cap, &mut book);

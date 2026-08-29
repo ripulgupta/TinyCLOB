@@ -519,6 +519,26 @@ those funds). Does not check whether the order is still resting — destroying
 a ticket for a still-resting order with zero pooled proceeds is a valid
 choice (e.g. abandoning a dust order).
 
+### `destroy_ticket_unconditionally`
+
+```
+public fun destroy_ticket_unconditionally(ticket: OrderTicket)
+```
+
+Disposes of a ticket with no check of any kind and no `OrderBook` parameter
+at all — the only ticket-disposal function that doesn't take one. Always
+succeeds. This is the only disposal path available once the ticket's book
+has already been deleted via `clob_admin_finalize`, since nothing can ever
+prove a deleted book's non-existence to `destroy_orphaned_ticket`'s
+liveness check again. It is equally safe to call while the book is still
+alive, even if the ticket's order still has real escrow or pooled
+proceeds attached: neither is exclusively reachable through the ticket —
+`clob_admin_cancel_order` reaches a still-resting order's escrow by
+`(side, price, order_id)` alone, and `push_proceeds`/`clob_admin_drain_step`
+reach pooled proceeds by `order_id` alone, neither requiring a ticket.
+Calling this only ever gives up the ticket holder's own convenient
+self-service disposal path, never the underlying funds.
+
 ## 8. Proceeds — admin rescue path
 
 ```
@@ -867,6 +887,12 @@ something rested this call, else `None`.
 - `min_size` is checked only at placement time, never against a post-fill
   remainder; a resting order can end up smaller than `min_size` ("dust")
   and will persist until cancelled, fully filled, or admin-removed.
+- A fill whose entire credited proceeds round to zero in both `Base` and
+  `Quote` (e.g. a fee ceiling consuming the whole leg on a dust-sized fill)
+  never creates a pooled proceeds entry for that order id in the first
+  place — it is not created and later skipped, there is simply nothing to
+  find. This is what lets `destroy_orphaned_ticket` dispose of such a
+  ticket without hitting `EProceedsNotEmpty`.
 - Pausing blocks all order-placement/market/swap entry points but never
   `cancel_order`, `claim_proceeds`, `update_resting_order`, `set_last_price`,
   or `clob_admin_cancel_order`.
@@ -879,6 +905,9 @@ something rested this call, else `None`.
   that order id, never caller-suppliable, even by the admin.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has
   pooled, unclaimed proceeds attached to its order id.
+  `destroy_ticket_unconditionally` has no such restriction and takes no
+  `OrderBook` parameter — it is the only disposal path left once a
+  ticket's book has already been deleted.
 - `clob_admin_finalize` requires zero resting orders on both sides, zero
   pooled proceeds entries, and a zero fee-accumulator balance on both legs
   simultaneously before it will succeed.
