@@ -4062,3 +4062,355 @@ fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
     scenario.end();
 }
 
+// === Coverage-audit gap closures ===
+//
+// The tests below close specific gaps identified by a blind test-coverage
+// audit of `assert_price_in_declared_range`'s reject side, `last_price`
+// across multi-level matches, the price-band's market-order exemption,
+// `EZeroPriceBandFactor`, `EZeroPrice` at all four call sites, and
+// `EDecimalsTooLarge`, plus an ask-side boundary-tick counterpart to the
+// existing bid-side decimal-pair tests.
+
+// --- `assert_price_in_declared_range` reject-side boundaries ---
+//
+// The four `*_price_extremes_and_adjacent_ticks` tests above prove `p_min`/
+// `p_max` are ACCEPTED; the tests below prove `p_min - 1`/`p_max + 1` are
+// REJECTED, on two independently-derived decimal pairs (USDC/BTC reversed,
+// BTC/SUI), plus two construction-site (`new_impl`) tests proving the same
+// check is wired at a call site other than order placement.
+
+#[test]
+#[expected_failure(abort_code = 21, location = tiny_clob)] // EPriceBelowDeclaredMin
+fun usdc_btc_reversed_pair_price_just_below_min_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 184_467_440_738;
+    let p_mid: u64 = 156_797_403_025_233;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_mid, scenario.ctx());
+    let payment = coin::mint_for_testing<BTC>(1_000_000, scenario.ctx());
+    let (ticket_opt, mb, ml, _) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min - 1, MIN_SIZE, payment, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 22, location = tiny_clob)] // EPriceAboveDeclaredMax
+fun usdc_btc_reversed_pair_price_just_above_max_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_max: u64 = 18_446_744_073_709_551_600;
+    let p_mid: u64 = 156_797_403_025_233;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_mid, scenario.ctx());
+    let payment = coin::mint_for_testing<BTC>(1_000_000, scenario.ctx());
+    let (ticket_opt, mb, ml, _) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max + 1, MIN_SIZE, payment, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 21, location = tiny_clob)] // EPriceBelowDeclaredMin
+fun btc_sui_pair_price_just_below_min_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 18_446_744_073_700;
+    let p_mid: u64 = 621_913_529_700_721_800;
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(MIN_SIZE, 8, 9, 0, 6, p_mid, scenario.ctx());
+    let payment = coin::mint_for_testing<SUI>(1_000_000, scenario.ctx());
+    let (ticket_opt, mb, ml, _) =
+        tiny_clob::place_limit_order_bid(&mut book, p_min - 1, MIN_SIZE, payment, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 22, location = tiny_clob)] // EPriceAboveDeclaredMax
+fun btc_sui_pair_price_just_above_max_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_max: u64 = 18_446_744_073_700_000_000;
+    let p_mid: u64 = 621_913_529_700_721_800;
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(MIN_SIZE, 8, 9, 0, 6, p_mid, scenario.ctx());
+    let payment = coin::mint_for_testing<SUI>(1_000_000, scenario.ctx());
+    let (ticket_opt, mb, ml, _) =
+        tiny_clob::place_limit_order_bid(&mut book, p_max + 1, MIN_SIZE, payment, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+/// Proves `assert_price_in_declared_range`'s reject side is also wired at
+/// the construction call site (`new_impl`), not only at order placement —
+/// same USDC/BTC-reversed pair and `p_min` as the order-placement test
+/// above, but passed as `initial_last_price` to `new` directly.
+#[test]
+#[expected_failure(abort_code = 21, location = tiny_clob)] // EPriceBelowDeclaredMin
+fun new_initial_last_price_just_below_declared_min_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 184_467_440_738;
+    let (book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_min - 1, scenario.ctx());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+/// Mirrors the test above for the max-side construction-site check.
+#[test]
+#[expected_failure(abort_code = 22, location = tiny_clob)] // EPriceAboveDeclaredMax
+fun new_initial_last_price_just_above_declared_max_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_max: u64 = 18_446_744_073_709_551_600;
+    let (book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_max + 1, scenario.ctx());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// --- `last_price` across multiple fully-filled price levels in one match ---
+//
+// Unlike `last_price_updates_on_real_fill_not_on_zero_qty_iteration` above
+// (where the second level is touched but never actually fills), the tests
+// below fully drain BOTH resting levels in a single match and assert
+// `last_price` reflects the LAST level touched, not the first.
+
+#[test]
+fun last_price_reflects_last_of_two_fully_filled_ask_levels() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask1 = rest_ask(&mut book, 100, MIN_SIZE, 10, scenario.ctx());
+    let ask2 = rest_ask(&mut book, 200, MIN_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    // Exactly covers both levels: 100*MIN_SIZE + 200*MIN_SIZE.
+    let budget = tiny_clob::bid_escrow_amount(&book, 100, MIN_SIZE)
+        + tiny_clob::bid_escrow_amount(&book, 200, MIN_SIZE);
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+        &mut book, MIN_SIZE * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(matched_base) == MIN_SIZE * 2, 1); // both levels fully filled
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
+    assert!(coin::burn_for_testing(leftover) == 0, 3);
+    assert!(tiny_clob::last_price_for_testing(&book) == 200, 4); // the LAST level touched, not the first
+
+    unit_test::destroy(ask1);
+    unit_test::destroy(ask2);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Mirrors the test above for two fully-drained bid levels swept by one
+/// market ask order: best bid (300) is consumed first, then the next-best
+/// (200) — `last_price` must land on 200, the last level touched.
+#[test]
+fun last_price_reflects_last_of_two_fully_filled_bid_levels() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let bid1 = rest_bid(&mut book, 300, MIN_SIZE, 10, scenario.ctx());
+    let bid2 = rest_bid(&mut book, 200, MIN_SIZE, 10, scenario.ctx());
+
+    scenario.next_tx(TAKER);
+    let payment = coin::mint_for_testing<BTC>(MIN_SIZE * 2, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) = tiny_clob::place_market_order_ask(
+        &mut book, MIN_SIZE * 2, payment, 10, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(leftover_base) == 0, 1); // both levels fully filled
+    assert!(coin::burn_for_testing(matched_quote) == 300 * MIN_SIZE + 200 * MIN_SIZE, 2);
+    assert!(tiny_clob::last_price_for_testing(&book) == 200, 3); // the LAST level touched, not the first
+
+    unit_test::destroy(bid1);
+    unit_test::destroy(bid2);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Price-band exemption for market orders / no-limit swaps ---
+//
+// `place_market_order_bid`/`_ask` and `swap_bid`/`_ask` (when called with
+// `limit_price = option::none()`) never read `book.price_band_factor` at
+// all in the source — the band only ever gates a NEW RESTING limit-order
+// price, never a taker fill. The tests below pin this down concretely: a
+// resting ask is placed outside a band that is tightened only afterward,
+// then a market order / swap with no limit price is shown to fill against
+// it anyway.
+
+#[test]
+fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    // Rest the ask BEFORE any band exists, at a price far outside the band
+    // that will be set below.
+    let ask_ticket = rest_ask(&mut book, 5000, MIN_SIZE, 10, scenario.ctx());
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // <= best_ask (5000), so this succeeds
+    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    // band is now [500, 2000] -- 5000 is well outside it.
+
+    scenario.next_tx(TAKER);
+    let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::place_market_order_bid(
+        &mut book, MIN_SIZE, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1); // filled despite being outside the band
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
+    assert!(coin::burn_for_testing(leftover) == 0, 3);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Mirrors the test above for `swap_bid` called with `limit_price =
+/// option::none()`.
+#[test]
+fun swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask_ticket = rest_ask(&mut book, 5000, MIN_SIZE, 10, scenario.ctx());
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
+    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    // band is now [500, 2000] -- 5000 is well outside it.
+
+    scenario.next_tx(TAKER);
+    let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::swap_bid(
+        &mut book, MIN_SIZE, budget, payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1); // filled despite being outside the band
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
+    assert!(coin::burn_for_testing(leftover) == 0, 3);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- `EZeroPriceBandFactor` ---
+
+#[test]
+#[expected_failure(abort_code = 25, location = tiny_clob)] // EZeroPriceBandFactor
+fun clob_admin_set_price_band_factor_zero_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(0));
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- `EZeroPrice` at all four call sites ---
+
+#[test]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
+fun new_zero_initial_last_price_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 19, 0, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
+fun set_last_price_zero_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::set_last_price(&mut book, 0, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
+fun place_limit_order_bid_zero_price_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ticket = rest_bid(&mut book, 0, MIN_SIZE, 10, scenario.ctx());
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
+fun place_limit_order_ask_zero_price_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ticket = rest_ask(&mut book, 0, MIN_SIZE, 10, scenario.ctx());
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- `EDecimalsTooLarge` ---
+
+#[test]
+#[expected_failure(abort_code = 28, location = tiny_clob)] // EDecimalsTooLarge
+fun new_base_decimals_over_max_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    // MAX_DECIMALS = 38; 39 is one over.
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MIN_SIZE, 39, 0, 0, 19, 1, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- `place_limit_order_ask` boundary-tick coverage ---
+//
+// Analogous to `usdc_btc_reversed_pair_price_extremes_and_adjacent_ticks`
+// above, but through `place_limit_order_ask` instead of `_bid`, to catch a
+// site-specific bug in the ask copy of the range/band check that the
+// bid-side tests wouldn't catch.
+#[test]
+fun usdc_btc_reversed_pair_ask_side_price_extremes() {
+    let mut scenario = ts::begin(ADMIN);
+    let p_min: u64 = 184_467_440_738;
+    let p_max: u64 = 18_446_744_073_709_551_600;
+    let p_mid: u64 = 156_797_403_025_233;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(MIN_SIZE, 6, 8, 8, 0, p_mid, scenario.ctx());
+    let size = MIN_SIZE;
+
+    // (a) Extreme minimum representable raw price: rests, checks depth,
+    // cancels, verifies exact base refund.
+    let min_payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
+    let (min_ticket_opt, min_leftover, min_matched, min_stopped) =
+        tiny_clob::place_limit_order_ask(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+    assert!(!min_stopped, 0);
+    assert!(coin::burn_for_testing(min_leftover) == 0, 1);
+    assert!(coin::burn_for_testing(min_matched) == 0, 2);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::ask_for_testing(), p_min) == size, 3);
+    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(min_b) == size, 4);
+    assert!(coin::burn_for_testing(min_q) == 0, 5);
+
+    // (b) Extreme maximum representable raw price: same checks.
+    let max_payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
+    let (max_ticket_opt, max_leftover, max_matched, max_stopped) =
+        tiny_clob::place_limit_order_ask(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+    assert!(!max_stopped, 6);
+    assert!(coin::burn_for_testing(max_leftover) == 0, 7);
+    assert!(coin::burn_for_testing(max_matched) == 0, 8);
+    assert!(tiny_clob::depth_at_price(&book, tiny_clob::ask_for_testing(), p_max) == size, 9);
+    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(coin::burn_for_testing(max_b) == size, 10);
+    assert!(coin::burn_for_testing(max_q) == 0, 11);
+
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
