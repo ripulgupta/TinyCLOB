@@ -3593,10 +3593,16 @@ fun set_last_price_at_or_above_best_bid_succeeds_with_only_bid_present() {
     let mut scenario = ts::begin(ADMIN);
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, MIN_SIZE, 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // exactly the best bid
-    assert!(tiny_clob::last_price_for_testing(&book) == 1000, 0);
+    // Pin down the pre-call value so the assertions below genuinely prove
+    // each `set_last_price` call changed the value, rather than merely
+    // being consistent with a silent no-op (the audit's L-02 finding: a
+    // target value equal to the already-current `last_price` wouldn't
+    // distinguish "the call worked" from "the call did nothing").
+    assert!(tiny_clob::last_price_for_testing(&book) == 1, 0); // book's initial_last_price, untouched so far
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // exactly the best bid; differs from the initial 1
+    assert!(tiny_clob::last_price_for_testing(&book) == 1000, 1);
     tiny_clob::set_last_price(&mut book, 5_000_000, scenario.ctx()); // far above; no best ask to bound it
-    assert!(tiny_clob::last_price_for_testing(&book) == 5_000_000, 1);
+    assert!(tiny_clob::last_price_for_testing(&book) == 5_000_000, 2);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -4411,6 +4417,187 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
 
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// === L-02 coverage gaps: swap band-check removal, `LastPriceSet`, and ===
+// === `set_last_price`'s permissionless / pause-and-retire-agnostic surface ===
+
+// --- Gap 1: `swap_bid`/`swap_ask` with an explicit `Some(limit_price)` ---
+// --- outside the active band must still fill (the band never gated a ---
+// --- taker's own protective limit_price, even before this diff removed ---
+// --- the check for `limit_price = option::none()`). ---
+
+/// Mirrors `swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band`,
+/// but the CHANGED case: an explicit `Some(price)` limit_price that is
+/// itself outside the band. Before the diff under audit, this exact call
+/// would have aborted with `EPriceAboveBand`; it must now succeed.
+#[test]
+fun swap_bid_with_off_band_limit_price_fills_against_resting_ask_outside_band() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask_ticket = rest_ask(&mut book, 5000, MIN_SIZE, 10, scenario.ctx());
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
+    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    // band is now [500, 2000] -- 5000 is well outside it, and the taker's
+    // own limit_price below is ALSO 5000 (outside the band).
+
+    scenario.next_tx(TAKER);
+    let budget = tiny_clob::bid_escrow_amount(&book, 5000, MIN_SIZE);
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, remaining_budget, leftover, stopped) = tiny_clob::swap_bid(
+        &mut book, MIN_SIZE, budget, payment, 10, option::some(5000), option::none(), option::none(),
+        scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    // Fills despite both the resting price AND the taker's own limit_price
+    // being outside the band -- proving the band no longer gates the
+    // taker's protective cap at all, not just the no-limit-price path.
+    assert!(coin::burn_for_testing(matched_base) == MIN_SIZE, 1);
+    assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
+    assert!(coin::burn_for_testing(leftover) == 0, 3);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Mirrors the test above for `swap_ask`: a resting bid rests below a band
+/// that is subsequently tightened around it, and the taker's own
+/// `Some(limit_price)` -- also below the band -- must still fill against it.
+#[test]
+fun swap_ask_with_off_band_limit_price_fills_against_resting_bid_outside_band() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let bid_ticket = rest_bid(&mut book, 100, MIN_SIZE, 10, scenario.ctx());
+    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // >= best_bid (100), so this succeeds
+    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    // band is now [500, 2000] -- 100 is well outside it (below), and the
+    // taker's own limit_price below is ALSO 100 (outside the band).
+
+    scenario.next_tx(TAKER);
+    let payment = coin::mint_for_testing<BTC>(MIN_SIZE, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) = tiny_clob::swap_ask(
+        &mut book, MIN_SIZE, payment, 10, option::some(100), option::none(), option::none(), scenario.ctx(),
+    );
+    assert!(!stopped, 0);
+    assert!(coin::burn_for_testing(leftover_base) == 0, 1);
+    assert!(coin::burn_for_testing(matched_quote) == 100 * MIN_SIZE, 2);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Gap 2: `LastPriceSet` event fields (`setter`, `last_price`) are ---
+// --- otherwise never asserted anywhere in this file. ---
+
+/// A genuinely value-changing `set_last_price` call, from a specific
+/// non-admin sender, must emit exactly one `LastPriceSet` event whose
+/// `setter` field is that sender's address (not the admin's, not some
+/// other fixed address) and whose `last_price` field is the new value.
+#[test]
+fun last_price_set_event_records_setter_and_value() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let book_id = tiny_clob::id_for_testing(&book);
+
+    scenario.next_tx(MAKER_A);
+    assert!(tiny_clob::last_price_for_testing(&book) == 1, 0); // initial_last_price, not yet touched
+    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx());
+    assert!(tiny_clob::last_price_for_testing(&book) == 12_345, 1);
+
+    let events = event::events_by_type<tiny_clob::LastPriceSet>();
+    assert!(events.length() == 1, 2);
+    let (ev_book_id, ev_last_price, ev_setter) = tiny_clob::last_price_set_fields_for_testing(&events[0]);
+    assert!(ev_book_id == book_id, 3);
+    assert!(ev_last_price == 12_345, 4);
+    assert!(ev_setter == MAKER_A, 5); // the actual caller, not ADMIN
+    assert!(ev_setter != ADMIN, 6);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// A `set_last_price` call whose `new_last_price` equals the book's
+/// current `last_price` is a no-op: it must not emit a second
+/// `LastPriceSet` event on top of the one from the real, preceding change.
+#[test]
+fun last_price_set_noop_emits_no_additional_event() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx()); // real change: 1 -> 12_345
+    let events_after_real_change = event::events_by_type<tiny_clob::LastPriceSet>();
+    assert!(events_after_real_change.length() == 1, 0);
+
+    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx()); // no-op: already 12_345
+    assert!(tiny_clob::last_price_for_testing(&book) == 12_345, 1);
+    let events_after_noop = event::events_by_type<tiny_clob::LastPriceSet>();
+    assert!(events_after_noop.length() == 1, 2); // unchanged -- no new event from the no-op call
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Gap 3: `set_last_price` is deliberately not pause/retire-gated -- ---
+// --- confirm it actually works on a paused book, and on a retiring one ---
+// --- through to `clob_admin_finalize`. ---
+
+#[test]
+fun set_last_price_succeeds_on_paused_book() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    assert!(tiny_clob::is_book_paused(&book), 0);
+
+    // Not pause-gated: succeeds despite the book being paused.
+    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
+    assert!(tiny_clob::last_price_for_testing(&book) == 999, 1);
+
+    // Pausing/unpausing still works normally afterward -- `set_last_price`
+    // didn't interfere with the pause lifecycle.
+    tiny_clob::clob_admin_unpause_book(&cap, &mut book);
+    assert!(!tiny_clob::is_book_paused(&book), 2);
+    assert!(tiny_clob::last_price_for_testing(&book) == 999, 3); // stuck through the unpause
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun set_last_price_succeeds_on_retiring_book_and_finalize_still_works() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+    let book_id = tiny_clob::id_for_testing(&book);
+    tiny_clob::clob_admin_retire(&cap, &mut book);
+
+    // Not gated on `retiring` either: succeeds on a retiring book.
+    tiny_clob::set_last_price(&mut book, 4_242, scenario.ctx());
+    assert!(tiny_clob::last_price_for_testing(&book) == 4_242, 0);
+
+    // The deletion lifecycle proceeds normally afterward: an empty book
+    // drains trivially and finalizes.
+    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    assert!(deleted_id == book_id, 1);
+
+    scenario.end();
+}
+
+// --- Gap 4: a non-admin sender can successfully call `set_last_price` ---
+// --- without ever constructing or referencing a `ClobAdminCap`. ---
+
+#[test]
+fun set_last_price_succeeds_from_non_admin_sender_without_admin_cap() {
+    let mut scenario = ts::begin(ADMIN);
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(OTHER); // switch to a sender that never held the ClobAdminCap
+    tiny_clob::set_last_price(&mut book, 777, scenario.ctx()); // no cap argument exists on this function at all
+    assert!(tiny_clob::last_price_for_testing(&book) == 777, 0);
+
+    destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
