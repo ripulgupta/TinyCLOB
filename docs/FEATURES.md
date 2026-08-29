@@ -714,13 +714,28 @@ is denominated in the asset that party receives. When `maker_side == false`
 (`taker_fee_amount` in Base) and the maker receives Quote (`maker_fee_amount`
 in Quote). When `maker_side == true` (the resting maker order was a bid):
 the taker receives Quote (`taker_fee_amount` in Quote) and the maker
-receives Base (`maker_fee_amount` in Base). `quote_amount`,
+receives Base (`maker_fee_amount` in Base). `size` and `price` are the
+exception to the flip: `size` is always denominated in `Base` atomic units
+and `price` is always the raw, book-relative price of the resting maker
+order (§3), regardless of `maker_side`. `quote_amount`,
 `taker_fee_amount`, and `maker_fee_amount` are all gross amounts — each fee
 is deducted FROM its respective gross leg, not added on top. On the
 maker-bid side (`maker_side == true`), `quote_amount` is derived from a
 proportional slice of the maker's original escrow reservation (not a direct
 `price * size` recomputation) and may differ by rounding from
 `ceil(price * size / price_scale)` — this is expected.
+
+Although any single `quote_amount` may deviate by rounding on the maker-bid
+side, the sum is exact: for a given `maker_order_id`, the total of
+`quote_amount` across every `OrderFilled` event with `maker_side == true`
+emitted over that order's entire lifetime equals exactly the amount debited
+from that order's quote escrow — and equals exactly the full escrow
+originally reserved for it if the order is filled to completion, with zero
+residual dust, no matter how many separate fills or transactions it was
+drained across. If the order is only partially filled, the sum is strictly
+less than the original reservation, and the exact difference is what
+`cancel_order` (or `clob_admin_cancel_order` / `clob_admin_drain_step`)
+refunds.
 
 `OrderExecuted` is emitted exactly once, unconditionally, as the last event
 of every call to `place_limit_order_bid` / `place_limit_order_ask` /
