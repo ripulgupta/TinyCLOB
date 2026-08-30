@@ -87,13 +87,21 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     //   maker_fee_quote = ceil(quote_cost * maker_bps / 10_000)
     //                   = ceil(161_500_000 * 3 / 10_000) = 48_450 (exact)
     //   remaining_budget = payment - quote_cost = 0 (exact full fill)
+    // The taker fee is charged once, in aggregate, at the end of the
+    // matching loop -- with a single fill this equals the old per-fill
+    // amount exactly. The maker fee, by contrast, is now only SET ASIDE in
+    // the resting ask's own `fee_reserve_quote` at fill time -- since this
+    // resting order is only partially filled here (4_000 > 3_400) and
+    // therefore never concludes, its maker fee is never actually
+    // transferred into the book's fee accumulator; see
+    // `resting_maker_order_defers_fee_until_conclusion` below for that
+    // transfer actually happening.
     let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
     let expected_taker_fee_base = 3;
     let expected_matched_base = FEE_TEST_TAKER_SIZE - expected_taker_fee_base;
-    let expected_maker_fee_quote = 48_450;
 
     let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE), scenario.ctx());
-    let (matched_base, remaining_budget, remaining_size, stopped) = tiny_clob::match_bid_for_testing(
+    let (matched_base, remaining_budget, remaining_size, stopped, taker_fee_amount) = tiny_clob::match_bid_for_testing(
         &mut book, option::some(FEE_TEST_PRICE), FEE_TEST_TAKER_SIZE, payment, FEE_TEST_MAX_FILLS, scenario.ctx(),
     );
 
@@ -105,8 +113,10 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     assert!(remaining_budget_val == tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE) - expected_quote_cost, 1);
     assert!(remaining_size == 0, 2);
     assert!(stopped == false, 3);
-    assert!(fee_base_after == expected_taker_fee_base, 4);
-    assert!(fee_quote_after == expected_maker_fee_quote, 5);
+    assert!(taker_fee_amount == expected_taker_fee_base, 4);
+    assert!(fee_base_after == expected_taker_fee_base, 5);
+    // Maker fee (Quote) not yet collected -- the maker's order still rests.
+    assert!(fee_quote_after == 0, 6);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -136,13 +146,17 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
     //                  = ceil(3_400 * 3 / 10_000) = ceil(1.02) = 2
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
+    // As in `match_bid_produces_expected_fill_and_fee_amounts` above, the
+    // taker fee is charged once in aggregate (equal to the old per-fill
+    // amount for this single-fill case); the maker fee is only set aside in
+    // the resting bid's `fee_reserve_base` -- it never concludes here
+    // (4_000 > 3_400), so it's never actually collected.
     let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
     let expected_taker_fee_quote = 113_050;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
-    let expected_maker_fee_base = 2;
 
     let payment = coin::mint_for_testing<BTC>(FEE_TEST_TAKER_SIZE, scenario.ctx());
-    let (matched_quote, remaining_escrow, remaining_size, stopped) = tiny_clob::match_ask_for_testing(
+    let (matched_quote, remaining_escrow, remaining_size, stopped, taker_fee_amount) = tiny_clob::match_ask_for_testing(
         &mut book, option::some(FEE_TEST_PRICE), FEE_TEST_TAKER_SIZE, payment, FEE_TEST_MAX_FILLS, scenario.ctx(),
     );
 
@@ -154,8 +168,10 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     assert!(remaining_escrow_val == 0, 1);
     assert!(remaining_size == 0, 2);
     assert!(stopped == false, 3);
-    assert!(fee_base_after == expected_maker_fee_base, 4);
+    assert!(taker_fee_amount == expected_taker_fee_quote, 4);
     assert!(fee_quote_after == expected_taker_fee_quote, 5);
+    // Maker fee (Base) not yet collected -- the maker's order still rests.
+    assert!(fee_base_after == 0, 6);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -175,7 +191,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     // Fill 999 units: ceil(999 * 10 / 10_000) = ceil(0.999) = 1 — under the
     // old floor division this collected 0 fee; the fix now collects 1.
     let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FEE_ROUND_PRICE, 999), scenario.ctx());
-    let (matched_base1, remaining_budget1, remaining_size1, _) =
+    let (matched_base1, remaining_budget1, remaining_size1, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(FEE_ROUND_PRICE), 999, payment1, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base1);
     coin::burn_for_testing(remaining_budget1);
@@ -187,7 +203,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     // an exact-division case — confirms ceiling division doesn't
     // over-round when the division is already exact.
     let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FEE_ROUND_PRICE, 1000), scenario.ctx());
-    let (matched_base2, remaining_budget2, remaining_size2, _) =
+    let (matched_base2, remaining_budget2, remaining_size2, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(FEE_ROUND_PRICE), 1000, payment2, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base2);
     coin::burn_for_testing(remaining_budget2);
@@ -223,7 +239,7 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
         let payment = coin::mint_for_testing<USDC>(
             tiny_clob::bid_escrow_amount(&book, FEE_ROUND_PRICE, dust_fill_size), scenario.ctx(),
         );
-        let (matched_base, remaining_budget, remaining_size, _) = tiny_clob::match_bid_for_testing(
+        let (matched_base, remaining_budget, remaining_size, _, _) = tiny_clob::match_bid_for_testing(
             &mut book, option::some(FEE_ROUND_PRICE), dust_fill_size, payment, 1_000_000, scenario.ctx(),
         );
         coin::burn_for_testing(matched_base);
@@ -266,7 +282,7 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
 
     // Partial fill of A (front order) — must remain in place at the front.
     let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FILL_INPLACE_PRICE, 100), scenario.ctx());
-    let (matched_base1, remaining_budget1, remaining_size1, _) =
+    let (matched_base1, remaining_budget1, remaining_size1, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 100, payment1, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base1);
     coin::burn_for_testing(remaining_budget1);
@@ -277,7 +293,7 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
     // been silently demoted behind B, the first `OrderFilled` event here
     // would be for B instead of A.
     let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FILL_INPLACE_PRICE, 250), scenario.ctx());
-    let (matched_base2, remaining_budget2, remaining_size2, _) =
+    let (matched_base2, remaining_budget2, remaining_size2, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 250, payment2, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base2);
     coin::burn_for_testing(remaining_budget2);
@@ -312,7 +328,7 @@ fun fill_in_place_full_drain_removes_order_and_frees_level() {
     assert!(tiny_clob::depth_at_price(&book, false, FILL_INPLACE_PRICE) == 150, 0);
 
     let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FILL_INPLACE_PRICE, 150), scenario.ctx());
-    let (matched_base, remaining_budget, remaining_size, _) =
+    let (matched_base, remaining_budget, remaining_size, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(FILL_INPLACE_PRICE), 150, payment, 1_000_000, scenario.ctx());
     assert!(coin::burn_for_testing(matched_base) == 150, 1);
     assert!(coin::burn_for_testing(remaining_budget) == 0, 2);
@@ -366,7 +382,7 @@ fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() 
         let payment = coin::mint_for_testing<USDC>(
             tiny_clob::bid_escrow_amount(&book, FILL_INPLACE_PRICE, fill_size), scenario.ctx(),
         );
-        let (matched_base, remaining_budget, remaining_size, _) = tiny_clob::match_bid_for_testing(
+        let (matched_base, remaining_budget, remaining_size, _, _) = tiny_clob::match_bid_for_testing(
             &mut book, option::some(FILL_INPLACE_PRICE), fill_size, payment, 1_000_000, scenario.ctx(),
         );
         coin::burn_for_testing(matched_base);
@@ -433,7 +449,7 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     // reinserted at the FRONT of the queue, ahead of B and C.
     scenario.next_tx(taker());
     let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 100), scenario.ctx());
-    let (matched_base1, remaining_budget1, remaining_size1, _) =
+    let (matched_base1, remaining_budget1, remaining_size1, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base1);
     coin::burn_for_testing(remaining_budget1);
@@ -442,7 +458,7 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     // Second taker buys 500 more: must drain A's remaining 200 first, then
     // B's full 200, then C's partial 100 — in that order.
     let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 500), scenario.ctx());
-    let (matched_base2, remaining_budget2, remaining_size2, _) =
+    let (matched_base2, remaining_budget2, remaining_size2, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base2);
     coin::burn_for_testing(remaining_budget2);
@@ -499,7 +515,7 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     // reinserted at the FRONT of the queue, ahead of B and C.
     scenario.next_tx(taker());
     let payment1 = coin::mint_for_testing<BTC>(100, scenario.ctx());
-    let (matched_quote1, remaining_escrow1, remaining_size1, _) =
+    let (matched_quote1, remaining_escrow1, remaining_size1, _, _) =
         tiny_clob::match_ask_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_quote1);
     coin::burn_for_testing(remaining_escrow1);
@@ -508,7 +524,7 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     // Second taker sells 500 more: must drain A's remaining 200 first, then
     // B's full 200, then C's partial 100 — in that order.
     let payment2 = coin::mint_for_testing<BTC>(500, scenario.ctx());
-    let (matched_quote2, remaining_escrow2, remaining_size2, _) =
+    let (matched_quote2, remaining_escrow2, remaining_size2, _, _) =
         tiny_clob::match_ask_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_quote2);
     coin::burn_for_testing(remaining_escrow2);
@@ -562,7 +578,7 @@ fun repeated_partial_fills_of_head_never_reorder() {
     let mut i = 0;
     while (i < 5) {
         let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 100), scenario.ctx());
-        let (matched_base, remaining_budget, remaining_size, _) =
+        let (matched_base, remaining_budget, remaining_size, _, _) =
             tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment, 1_000_000, scenario.ctx());
         coin::burn_for_testing(matched_base);
         coin::burn_for_testing(remaining_budget);
@@ -573,7 +589,7 @@ fun repeated_partial_fills_of_head_never_reorder() {
 
     // A is now fully drained, so the sixth fill must land on B.
     let payment6 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 100), scenario.ctx());
-    let (matched_base6, remaining_budget6, remaining_size6, _) =
+    let (matched_base6, remaining_budget6, remaining_size6, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment6, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base6);
     coin::burn_for_testing(remaining_budget6);
@@ -616,7 +632,7 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     // Partially fill A by 100, leaving 200 resting, reinserted at the front.
     scenario.next_tx(taker());
     let payment1 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 100), scenario.ctx());
-    let (matched_base1, remaining_budget1, remaining_size1, _) =
+    let (matched_base1, remaining_budget1, remaining_size1, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(price), 100, payment1, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base1);
     coin::burn_for_testing(remaining_budget1);
@@ -635,7 +651,7 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     // freshly numbered [0, 1] here, independent of the earlier partial fill.
     scenario.next_tx(taker());
     let payment2 = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, price, 500), scenario.ctx());
-    let (matched_base2, remaining_budget2, remaining_size2, _) =
+    let (matched_base2, remaining_budget2, remaining_size2, _, _) =
         tiny_clob::match_bid_for_testing(&mut book, option::some(price), 500, payment2, 1_000_000, scenario.ctx());
     coin::burn_for_testing(matched_base2);
     coin::burn_for_testing(remaining_budget2);

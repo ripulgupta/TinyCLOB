@@ -80,7 +80,7 @@ fun order_filled_taker_buy_records_maker_side_false() {
     let payment = coin::mint_for_testing<USDC>(
         tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE), scenario.ctx(),
     );
-    let (matched_base, remaining_budget, _remaining_size, _stopped) = tiny_clob::match_bid_for_testing(
+    let (matched_base, remaining_budget, _remaining_size, _stopped, taker_fee_amount) = tiny_clob::match_bid_for_testing(
         &mut book, option::some(FEE_TEST_PRICE), FEE_TEST_TAKER_SIZE, payment, FEE_TEST_MAX_FILLS, scenario.ctx(),
     );
     coin::burn_for_testing(matched_base);
@@ -88,12 +88,13 @@ fun order_filled_taker_buy_records_maker_side_false() {
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 1, 0);
-    let (maker_side, quote_amount, taker_fee_amount, maker_fee_amount) =
-        tiny_clob::order_filled_fee_fields_for_testing(&fills[0]);
+    let (maker_side, quote_amount) = tiny_clob::order_filled_side_and_quote_fields_for_testing(&fills[0]);
     assert!(maker_side == false, 1);
     assert!(quote_amount == FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE, 2);
-    assert!(taker_fee_amount == 3, 3); // taker fee in Base, see match_bid_produces_expected_fill_and_fee_amounts
-    assert!(maker_fee_amount == 48_450, 4); // maker fee in Quote
+    // Single fill, so the once-per-call aggregate taker fee equals what the
+    // old per-fill computation would have charged -- see
+    // match_bid_produces_expected_fill_and_fee_amounts.
+    assert!(taker_fee_amount == 3, 3); // taker fee in Base
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -116,7 +117,7 @@ fun order_filled_taker_sell_records_maker_side_true() {
     tiny_clob::insert_resting_order_for_testing(&mut book, true, FEE_TEST_PRICE, bid, scenario.ctx());
 
     let payment = coin::mint_for_testing<BTC>(FEE_TEST_TAKER_SIZE, scenario.ctx());
-    let (matched_quote, remaining_escrow, _remaining_size, _stopped) = tiny_clob::match_ask_for_testing(
+    let (matched_quote, remaining_escrow, _remaining_size, _stopped, taker_fee_amount) = tiny_clob::match_ask_for_testing(
         &mut book, option::some(FEE_TEST_PRICE), FEE_TEST_TAKER_SIZE, payment, FEE_TEST_MAX_FILLS, scenario.ctx(),
     );
     coin::burn_for_testing(matched_quote);
@@ -124,12 +125,13 @@ fun order_filled_taker_sell_records_maker_side_true() {
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 1, 0);
-    let (maker_side, quote_amount, taker_fee_amount, maker_fee_amount) =
-        tiny_clob::order_filled_fee_fields_for_testing(&fills[0]);
+    let (maker_side, quote_amount) = tiny_clob::order_filled_side_and_quote_fields_for_testing(&fills[0]);
     assert!(maker_side == true, 1);
     assert!(quote_amount == FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE, 2);
+    // Single fill, so the once-per-call aggregate taker fee equals what the
+    // old per-fill computation would have charged -- see
+    // match_ask_produces_expected_fill_and_fee_amounts.
     assert!(taker_fee_amount == 113_050, 3); // taker fee in Quote
-    assert!(maker_fee_amount == 2, 4); // maker fee in Base, see match_ask_produces_expected_fill_and_fee_amounts
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -152,7 +154,7 @@ fun order_executed_fires_from_place_limit_order_bid_with_partial_rest() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == true, 2);
@@ -186,7 +188,7 @@ fun order_executed_fires_from_place_limit_order_ask_with_partial_rest() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == false, 2);
@@ -220,7 +222,7 @@ fun order_executed_fires_from_place_market_order_bid_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == true, 2);
@@ -252,7 +254,7 @@ fun order_executed_fires_from_place_market_order_ask_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == false, 2);
@@ -286,7 +288,7 @@ fun order_executed_fires_from_swap_bid_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == true, 2);
@@ -319,7 +321,7 @@ fun order_executed_fires_from_swap_ask_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag) =
+    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
     assert!(taker == admin(), 1);
     assert!(taker_side == false, 2);
@@ -370,9 +372,9 @@ fun order_executed_entry_point_distinguishes_limit_bid_from_swap_bid_at_same_pri
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 2, 1);
-    let (_bid1, _t1, _ts1, entry_point_1, limit_price_1, _rs1, unmatched_1, rested_size_1, rested_order_id_1, _stopped_flag_1) =
+    let (_bid1, _t1, _ts1, entry_point_1, limit_price_1, _rs1, unmatched_1, rested_size_1, rested_order_id_1, _stopped_flag_1, _fee1) =
         tiny_clob::order_executed_fields_for_testing(&executed[0]);
-    let (_bid2, _t2, _ts2, entry_point_2, limit_price_2, _rs2, unmatched_2, rested_size_2, rested_order_id_2, _stopped_flag_2) =
+    let (_bid2, _t2, _ts2, entry_point_2, limit_price_2, _rs2, unmatched_2, rested_size_2, rested_order_id_2, _stopped_flag_2, _fee2) =
         tiny_clob::order_executed_fields_for_testing(&executed[1]);
 
     // Everything else about the two events lines up...

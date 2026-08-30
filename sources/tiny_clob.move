@@ -72,6 +72,14 @@ const EResetPriceAboveBestAsk: u64 = 27;
 /// exceeded `MAX_DECIMALS`.
 const EDecimalsTooLarge: u64 = 28;
 
+/// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
+/// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
+/// consumed by its own fee (see `fee_amount`'s doc comment, and the project's
+/// audit notes, finding L-01). At today's values this is mathematically
+/// impossible to violate for any `x > 1` (it would require `bps` close to
+/// `10_000`), so no explicit clamp is implemented in `fee_amount` — this is
+/// pure defense-in-depth. If either cap is ever raised meaningfully, revisit
+/// `fee_amount` for an explicit clamp before shipping the change.
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
 const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
@@ -1024,7 +1032,13 @@ public fun clob_admin_cancel_order<Base, Quote>(
     if (order_opt.is_none()) { order_opt.destroy_none(); return };
     let live_order = order_opt.destroy_some();
     let owner = order::owner(&live_order);
-    let (escrow_base, escrow_quote) = order::destroy(live_order);
+    let fee_basis = order::fee_basis_accumulated(&live_order);
+    let mfee_bps = order::maker_fee_bps(&live_order);
+    let (escrow_base, escrow_quote, frb, frq) = order::destroy(live_order);
+    let (escrow_base, escrow_quote) = fold_maker_fee_slack(
+        escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, owner,
+        &mut book.fee_accumulator,
+    );
     refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
     event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
 }
@@ -1050,13 +1064,18 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
     event::emit(OrderBookRetired { order_book_id: event_book_id });
 }
 
-/// Note: this function emits up to one event per processed item (one
-/// `OrderCancelled` per drained resting order, one `ProceedsClaimed` per
-/// nonzero pooled-proceeds entry drained). Sui enforces a hard cap of 1024
-/// events emitted per transaction, so `max_items` should stay comfortably
-/// under that limit (e.g. a few hundred) — especially if drain calls are
-/// batched into a single PTB, where the cap applies across the whole
-/// transaction, not per call.
+/// Note: this function emits up to TWO events per drained resting order (one
+/// `OrderCancelled`, plus one `MakerFeeSettled` from the centralized
+/// maker-fee true-up — see `conclude_order_fee` — that now runs at every
+/// order conclusion, drain included) and one `ProceedsClaimed` per nonzero
+/// pooled-proceeds entry drained. Sui enforces a hard cap of 1024 events
+/// emitted per transaction, so `max_items` should stay comfortably under
+/// that limit (e.g. a few hundred) — especially if drain calls are batched
+/// into a single PTB, where the cap applies across the whole transaction,
+/// not per call. The added `MakerFeeSettled` roughly halves this function's
+/// previous safe per-call margin against that cap (up to 2 events per
+/// drained order now, versus 1 before), so an admin relying on a
+/// previously-safe `max_items` value should reassess it accordingly.
 public fun clob_admin_drain_step<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -1068,8 +1087,9 @@ public fun clob_admin_drain_step<Base, Quote>(
     assert!(book.retiring, ENotRetiring);
     let event_book_id = book.event_id;
     let mut remaining = max_items;
-    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, event_book_id, ctx);
-    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, event_book_id, ctx);
+    let fees = &mut book.fee_accumulator;
+    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, event_book_id, fees, ctx);
+    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, event_book_id, fees, ctx);
     drain_proceeds(&mut book.proceeds, &mut remaining, event_book_id, ctx);
 }
 
@@ -1078,6 +1098,7 @@ fun drain_side<Base, Quote>(
     remaining: &mut u64,
     want_max: bool,
     event_book_id: ID,
+    fees: &mut FeeAccumulator<Base, Quote>,
     ctx: &mut TxContext,
 ) {
     while (*remaining > 0) {
@@ -1092,7 +1113,12 @@ fun drain_side<Base, Quote>(
                 if (price_tree::level_is_empty(level)) break;
                 let (order_id, order) = price_tree::level_pop_front_order(level);
                 let owner = order::owner(&order);
-                let (escrow_base, escrow_quote) = order::destroy(order);
+                let fee_basis = order::fee_basis_accumulated(&order);
+                let mfee_bps = order::maker_fee_bps(&order);
+                let (escrow_base, escrow_quote, frb, frq) = order::destroy(order);
+                let (escrow_base, escrow_quote) = fold_maker_fee_slack(
+                    escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, owner, fees,
+                );
                 refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
                 event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
                 *remaining = *remaining - 1;
@@ -1224,18 +1250,17 @@ public fun clob_admin_finalize<Base, Quote>(
 
 // === Matching engine, escrow/fee math, OrderTicket ===
 
-/// Each party's fee is denominated in the asset that party receives. When
-/// `maker_side == false` (maker was a resting ask): the taker receives Base
-/// (so `taker_fee_amount` is in Base) and the maker receives Quote (so
-/// `maker_fee_amount` is in Quote). When `maker_side == true` (maker was a
-/// resting bid): the taker receives Quote (`taker_fee_amount` in Quote) and
-/// the maker receives Base (`maker_fee_amount` in Base). `quote_amount` and
-/// `taker_fee_amount`/`maker_fee_amount` are all gross amounts — each fee is
-/// deducted FROM its respective gross leg, not added on top. On the
-/// maker-bid side (`maker_side == true`), `quote_amount` is derived from a
-/// proportional slice of the maker's original escrow reservation (not a
-/// direct `price * size` recomputation) and may differ by rounding from
-/// `ceil(price * size / price_scale)` — this is expected.
+/// Per-fill notification only — carries no fee information. Taker fees are
+/// now computed once per call, in aggregate, after matching completes (see
+/// `OrderExecuted.taker_fee_amount`); maker fees are set aside per-fill into
+/// a per-order reserve and only actually settled — with any superadditive
+/// slack refunded — when the order concludes (see `MakerFeeSettled`). Both
+/// changes replace the old, exploitable per-fill-ceiling-rounded model (see
+/// the project's audit notes, findings L-01/F-6). On the maker-bid side
+/// (`maker_side == true`), `quote_amount` is derived from a proportional
+/// slice of the maker's original escrow reservation (not a direct `price *
+/// size` recomputation) and may differ by rounding from `ceil(price * size /
+/// price_scale)` — this is expected.
 public struct OrderFilled has copy, drop {
     maker_order_id: u64,
     order_book_id: ID,
@@ -1245,8 +1270,29 @@ public struct OrderFilled has copy, drop {
     taker: address,
     maker_side: bool,
     quote_amount: u64,
-    taker_fee_amount: u64,
-    maker_fee_amount: u64,
+}
+
+/// Emitted exactly once for every order that concludes — fully filled
+/// (drained by a fill), cancelled by its own ticket holder
+/// (`cancel_order`), force-cancelled (`clob_admin_cancel_order`), or drained
+/// (`clob_admin_drain_step`) — alongside whatever conclusion event that
+/// site already emits (e.g. `OrderCancelled`). `amount` is the CORRECT
+/// aggregate maker fee actually owed across the order's entire fill
+/// history, `fee_amount(fee_basis_accumulated, maker_fee_bps)` — computed
+/// once, at conclusion, from the order's own running fee-basis total, not
+/// summed from each fill's independently ceiling-rounded per-fill fee
+/// (which can over-collect — see the project's audit notes, finding F-6).
+/// `amount` is denominated in Base for a bid-side order, Quote for an
+/// ask-side order (whichever currency that order's maker fee is actually
+/// paid in). An order that rests indefinitely without ever concluding
+/// defers this event (and the fee's actual transfer into the book's fee
+/// accumulator) indefinitely along with it — the fee isn't lost, just not
+/// yet finalized, exactly like the order's own escrow/proceeds.
+public struct MakerFeeSettled has copy, drop {
+    order_id: u64,
+    order_book_id: ID,
+    maker: address,
+    amount: u64,
 }
 
 /// `ceil(price * size / book.price_scale)`. `size` is always
@@ -1333,6 +1379,116 @@ fun destroy_drained_bid_escrow<Base, Quote>(
     balance::destroy_zero(escrow_quote.destroy_some());
 }
 
+// === Maker-fee reserve conclusion (Part C) ===
+//
+// Every one of `order::destroy`'s 5 call sites must run its concluding
+// order's maker-fee reserve through `conclude_order_fee` below exactly
+// once, rather than reimplementing the true-up computation itself. The two
+// `extract_drained_*_fee_reserve` helpers unwrap `order::destroy`'s
+// `(fee_reserve_base, fee_reserve_quote)` pair for the two fill-drain call
+// sites, which already know their order's side unconditionally (mirroring
+// `destroy_drained_ask_escrow`/`destroy_drained_bid_escrow` above);
+// `fold_maker_fee_slack` is the side-generic version used by the other 3
+// call sites, which handle a resting order of either side.
+
+/// Centralized maker-fee true-up — the one place `correct_total_fee` is
+/// ever computed. Computes the CORRECT aggregate fee owed across the
+/// order's entire fill history, `fee_amount(fee_basis_accumulated,
+/// maker_fee_bps)`, transfers exactly that amount out of `reserve` into
+/// `fee_leg` (the book's fee-accumulator leg for this reserve's currency),
+/// emits `MakerFeeSettled`, and returns whatever's left in `reserve` — the
+/// superadditive slack — for the caller to fold into whatever refund
+/// mechanism it already uses.
+///
+/// `reserve` is guaranteed to hold at least `correct_total_fee`: it is the
+/// sum of independently ceiling-rounded per-fill fees taken over the same
+/// running `fee_basis_accumulated` total, and ceiling division is
+/// superadditive (the sum of ceilings is never less than the ceiling of the
+/// sum), so the `balance::split` below can never abort.
+fun conclude_order_fee<T>(
+    mut reserve: Balance<T>,
+    fee_basis_accumulated: u64,
+    maker_fee_bps: u64,
+    fee_leg: &mut Balance<T>,
+    order_id: u64,
+    event_book_id: ID,
+    owner: address,
+): Balance<T> {
+    let correct_total_fee = fee_amount(fee_basis_accumulated, maker_fee_bps);
+    let to_accumulator = balance::split(&mut reserve, correct_total_fee);
+    fee_leg.join(to_accumulator);
+    event::emit(MakerFeeSettled { order_id, order_book_id: event_book_id, maker: owner, amount: correct_total_fee });
+    reserve
+}
+
+/// Unwraps a fully-drained ASK-side maker order's `(fee_reserve_base,
+/// fee_reserve_quote)` pair from `order::destroy`: asserts away the
+/// always-`None` `fee_reserve_base` half (ask-side orders never populate
+/// it — see `order::new`) and returns the always-`Some` `fee_reserve_quote`
+/// balance.
+fun extract_drained_ask_fee_reserve<Base, Quote>(
+    fee_reserve_base: Option<Balance<Base>>,
+    fee_reserve_quote: Option<Balance<Quote>>,
+): Balance<Quote> {
+    fee_reserve_base.destroy_none();
+    fee_reserve_quote.destroy_some()
+}
+
+/// The BID-side mirror of `extract_drained_ask_fee_reserve` above.
+fun extract_drained_bid_fee_reserve<Base, Quote>(
+    fee_reserve_base: Option<Balance<Base>>,
+    fee_reserve_quote: Option<Balance<Quote>>,
+): Balance<Base> {
+    fee_reserve_quote.destroy_none();
+    fee_reserve_base.destroy_some()
+}
+
+/// The side-generic version of `extract_drained_*_fee_reserve` above, used
+/// by the 3 conclusion call sites (`cancel_order`, `clob_admin_cancel_order`,
+/// `drain_side`) that handle a resting order of either side: runs
+/// `conclude_order_fee` against whichever one of `fee_reserve_base`/
+/// `fee_reserve_quote` this order actually populated (exactly one, per
+/// `order::new`'s bid/ask-exclusive construction), and folds the resulting
+/// slack into the correspondingly-sided leg of `(escrow_base, escrow_quote)`
+/// — creating that leg fresh via `option::some` if the order's own escrow
+/// never held that currency to begin with (e.g. a bid order's `Base`-side
+/// fee slack, since a bid order's `escrow_base` is always `None`).
+fun fold_maker_fee_slack<Base, Quote>(
+    mut escrow_base: Option<Balance<Base>>,
+    mut escrow_quote: Option<Balance<Quote>>,
+    fee_reserve_base: Option<Balance<Base>>,
+    fee_reserve_quote: Option<Balance<Quote>>,
+    fee_basis_accumulated: u64,
+    maker_fee_bps: u64,
+    order_id: u64,
+    event_book_id: ID,
+    owner: address,
+    fees: &mut FeeAccumulator<Base, Quote>,
+): (Option<Balance<Base>>, Option<Balance<Quote>>) {
+    if (fee_reserve_base.is_some()) {
+        fee_reserve_quote.destroy_none();
+        let reserve = fee_reserve_base.destroy_some();
+        let slack = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, &mut fees.base, order_id, event_book_id, owner);
+        if (escrow_base.is_some()) {
+            escrow_base.borrow_mut().join(slack);
+        } else {
+            escrow_base.destroy_none();
+            escrow_base = option::some(slack);
+        };
+    } else {
+        fee_reserve_base.destroy_none();
+        let reserve = fee_reserve_quote.destroy_some();
+        let slack = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, &mut fees.quote, order_id, event_book_id, owner);
+        if (escrow_quote.is_some()) {
+            escrow_quote.borrow_mut().join(slack);
+        } else {
+            escrow_quote.destroy_none();
+            escrow_quote = option::some(slack);
+        };
+    };
+    (escrow_base, escrow_quote)
+}
+
 fun insert_resting_order<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     side: bool,
@@ -1359,9 +1515,9 @@ fun fill_level_bid<Base, Quote>(
     event_book_id: ID,
     fills_consumed: &mut u64,
     max_fills: u64,
-    taker_fee_bps: u64,
     price_scale: u64,
     last_price: &mut u64,
+    taker_fee_basis: &mut u64,
 ): (bool, bool) {
     let mut budget_exhausted = false;
     let mut hit_max_fills = false;
@@ -1398,21 +1554,33 @@ fun fill_level_bid<Base, Quote>(
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
-            let mut base_out = order::split_escrow_base(&mut maker_order, fill_qty);
+            let base_out = order::split_escrow_base(&mut maker_order, fill_qty);
+            // Taker fee (Base) is no longer deducted per-fill: the full,
+            // gross `base_out` is joined as-is, and this fill's raw
+            // pre-fee quantity is accumulated for a single aggregate
+            // deduction once the whole matching loop (across every price
+            // level) concludes -- see `match_bid` -- avoiding the
+            // superadditive over-collection an independent per-fill
+            // ceiling would otherwise cause (finding F-6).
+            matched_base.join(base_out);
+            *taker_fee_basis = *taker_fee_basis + fill_qty;
+
+            let mut quote_payment = balance::split(budget, quote_cost);
+            // Maker fee (Quote, this is an ask-side maker) is likewise no
+            // longer credited to the book's fee accumulator per-fill:
+            // this fill's own ceiling-rounded contribution is set aside in
+            // the maker order's own `fee_reserve_quote`, and only the
+            // CORRECT aggregate fee is ever actually collected, at order
+            // conclusion -- see `conclude_order_fee`.
             let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_fee_quote_this_fill = fee_amount(quote_cost, maker_fee_bps);
+            let quote_fee_balance = balance::split(&mut quote_payment, maker_fee_quote_this_fill);
+            order::join_fee_reserve_quote(&mut maker_order, quote_fee_balance);
+            order::increase_fee_basis_accumulated(&mut maker_order, quote_cost);
+
             let maker_addr = order::owner(&maker_order);
             let maker_order_id = order::id(&maker_order);
             let maker_remaining_after = order::remaining_size(&maker_order);
-
-            let taker_fee_base = fee_amount(fill_qty, taker_fee_bps);
-            let base_fee_balance = balance::split(&mut base_out, taker_fee_base);
-            matched_base.join(base_out); // remainder, net of taker fee
-
-            let mut quote_payment = balance::split(budget, quote_cost);
-            let maker_fee_quote = fee_amount(quote_cost, maker_fee_bps);
-            let quote_fee_balance = balance::split(&mut quote_payment, maker_fee_quote);
-            credit_fee_accumulator(fees, base_fee_balance, quote_fee_balance);
-            credit_maker_table(proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
 
             event::emit(OrderFilled {
                 maker_order_id,
@@ -1423,17 +1591,24 @@ fun fill_level_bid<Base, Quote>(
                 taker,
                 maker_side: false,
                 quote_amount: quote_cost,
-                taker_fee_amount: taker_fee_base,
-                maker_fee_amount: maker_fee_quote,
             });
 
             *remaining_size = *remaining_size - fill_qty;
             *last_price = best_price;
 
             if (maker_remaining_after == 0) {
-                let (eb, eq) = order::destroy(maker_order);
+                let fee_basis = order::fee_basis_accumulated(&maker_order);
+                let mfee_bps = order::maker_fee_bps(&maker_order);
+                let (eb, eq, frb, frq) = order::destroy(maker_order);
                 destroy_drained_ask_escrow(eb, eq);
+                let reserve_quote = extract_drained_ask_fee_reserve(frb, frq);
+                let slack_quote = conclude_order_fee(
+                    reserve_quote, fee_basis, mfee_bps, &mut fees.quote, maker_order_id, event_book_id, maker_addr,
+                );
+                quote_payment.join(slack_quote);
+                credit_maker_table(proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
             } else {
+                credit_maker_table(proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
                 price_tree::level_insert_order_front(level, head_key, maker_order);
             };
 
@@ -1464,12 +1639,17 @@ fun match_bid<Base, Quote>(
     max_fills: u64,
     price_scale: u64,
     last_price: &mut u64,
-): (Balance<Base>, Balance<Quote>, u64, bool) {
+): (Balance<Base>, Balance<Quote>, u64, bool, u64) {
     let mut remaining_size = remaining_size_in;
     let mut budget = budget_in;
     let mut matched_base = balance::zero<Base>();
     let mut fills_consumed: u64 = 0;
     let mut stopped_on_max_fills_while_crossing = false;
+    // Raw (pre-fee), aggregate taker fill quantity across every price level
+    // this call sweeps -- the taker's fee basis. The taker's fee is
+    // computed once, in aggregate, from this total after the loop below
+    // concludes, rather than per fill (finding F-6/L-01).
+    let mut taker_fee_basis: u64 = 0;
 
     loop {
         if (remaining_size == 0) break;
@@ -1497,15 +1677,25 @@ fun match_bid<Base, Quote>(
             event_book_id,
             &mut fills_consumed,
             max_fills,
-            taker_fee_bps,
             price_scale,
             last_price,
+            &mut taker_fee_basis,
         );
         if (hit_max_fills) stopped_on_max_fills_while_crossing = true;
         if (stop) break;
     };
 
-    (matched_base, budget, remaining_size, stopped_on_max_fills_while_crossing)
+    // Taker fee (Base) charged exactly once, in aggregate, against the raw
+    // total fill quantity accumulated above -- always <= the sum of what
+    // independent per-fill ceiling rounding would have charged (ceiling
+    // division is superadditive), and this single, once-per-call ceiling
+    // never collects zero fee on a genuinely nonzero aggregate fill even
+    // though any one contributing fill might be arbitrarily small.
+    let taker_fee_amount = fee_amount(taker_fee_basis, taker_fee_bps);
+    let taker_fee_balance = balance::split(&mut matched_base, taker_fee_amount);
+    fees.base.join(taker_fee_balance);
+
+    (matched_base, budget, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount)
 }
 
 fun fill_level_ask<Base, Quote>(
@@ -1521,8 +1711,8 @@ fun fill_level_ask<Base, Quote>(
     event_book_id: ID,
     fills_consumed: &mut u64,
     max_fills: u64,
-    taker_fee_bps: u64,
     last_price: &mut u64,
+    taker_fee_basis: &mut u64,
 ): (bool, bool) {
     let mut stop = false;
     let mut hit_max_fills = false;
@@ -1580,21 +1770,25 @@ fun fill_level_ask<Base, Quote>(
             let quote_charged_so_far = order::total_reserved(&maker_order) - order::escrow_quote_value(&maker_order);
             let quote_cost = cumulative_charged - quote_charged_so_far;
 
-            let mut quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
+            let quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
+            // Taker fee (Quote) is no longer deducted per-fill -- see the
+            // matching comment in `fill_level_bid`.
+            matched_quote.join(quote_out);
+            *taker_fee_basis = *taker_fee_basis + quote_cost;
+
+            let mut base_payment = balance::split(escrow_base, fill_qty);
+            // Maker fee (Base, this is a bid-side maker) is set aside in
+            // the maker order's own `fee_reserve_base` -- see the matching
+            // comment in `fill_level_bid`.
             let maker_fee_bps = order::maker_fee_bps(&maker_order);
+            let maker_fee_base_this_fill = fee_amount(fill_qty, maker_fee_bps);
+            let base_fee_balance = balance::split(&mut base_payment, maker_fee_base_this_fill);
+            order::join_fee_reserve_base(&mut maker_order, base_fee_balance);
+            order::increase_fee_basis_accumulated(&mut maker_order, fill_qty);
+
             let maker_addr = order::owner(&maker_order);
             let maker_order_id = order::id(&maker_order);
             let maker_remaining_after = order::remaining_size(&maker_order);
-
-            let taker_fee_quote = fee_amount(quote_cost, taker_fee_bps);
-            let quote_fee_balance = balance::split(&mut quote_out, taker_fee_quote);
-            matched_quote.join(quote_out); // remainder, net of taker fee
-
-            let mut base_payment = balance::split(escrow_base, fill_qty);
-            let maker_fee_base = fee_amount(fill_qty, maker_fee_bps);
-            let base_fee_balance = balance::split(&mut base_payment, maker_fee_base);
-            credit_fee_accumulator(fees, base_fee_balance, quote_fee_balance);
-            credit_maker_table(proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
 
             event::emit(OrderFilled {
                 maker_order_id,
@@ -1605,17 +1799,24 @@ fun fill_level_ask<Base, Quote>(
                 taker,
                 maker_side: true,
                 quote_amount: quote_cost,
-                taker_fee_amount: taker_fee_quote,
-                maker_fee_amount: maker_fee_base,
             });
 
             *remaining_size = *remaining_size - fill_qty;
             *last_price = best_price;
 
             if (maker_remaining_after == 0) {
-                let (eb, eq) = order::destroy(maker_order);
+                let fee_basis = order::fee_basis_accumulated(&maker_order);
+                let mfee_bps = order::maker_fee_bps(&maker_order);
+                let (eb, eq, frb, frq) = order::destroy(maker_order);
                 destroy_drained_bid_escrow(eb, eq);
+                let reserve_base = extract_drained_bid_fee_reserve(frb, frq);
+                let slack_base = conclude_order_fee(
+                    reserve_base, fee_basis, mfee_bps, &mut fees.base, maker_order_id, event_book_id, maker_addr,
+                );
+                base_payment.join(slack_base);
+                credit_maker_table(proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
             } else {
+                credit_maker_table(proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
                 price_tree::level_insert_order_front(level, head_key, maker_order);
             };
         };
@@ -1640,12 +1841,14 @@ fun match_ask<Base, Quote>(
     event_book_id: ID,
     max_fills: u64,
     last_price: &mut u64,
-): (Balance<Quote>, Balance<Base>, u64, bool) {
+): (Balance<Quote>, Balance<Base>, u64, bool, u64) {
     let mut remaining_size = remaining_size_in;
     let mut escrow_base = escrow_base_in;
     let mut matched_quote = balance::zero<Quote>();
     let mut fills_consumed: u64 = 0;
     let mut stopped_on_max_fills_while_crossing = false;
+    // See `match_bid`'s matching field for what this accumulates.
+    let mut taker_fee_basis: u64 = 0;
 
     loop {
         if (remaining_size == 0) break;
@@ -1673,14 +1876,19 @@ fun match_ask<Base, Quote>(
             event_book_id,
             &mut fills_consumed,
             max_fills,
-            taker_fee_bps,
             last_price,
+            &mut taker_fee_basis,
         );
         if (hit_max_fills) stopped_on_max_fills_while_crossing = true;
         if (stop) break;
     };
 
-    (matched_quote, escrow_base, remaining_size, stopped_on_max_fills_while_crossing)
+    // Taker fee (Quote), charged once in aggregate -- see `match_bid`.
+    let taker_fee_amount = fee_amount(taker_fee_basis, taker_fee_bps);
+    let taker_fee_balance = balance::split(&mut matched_quote, taker_fee_amount);
+    fees.quote.join(taker_fee_balance);
+
+    (matched_quote, escrow_base, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount)
 }
 
 // === OrderTicket ===
@@ -1833,6 +2041,17 @@ public struct OrderExecuted has copy, drop {
     /// `Some(id)` iff something rested this call, else `None`.
     rested_order_id: Option<u64>,
     stopped_on_max_fills_while_crossing: bool,
+    /// The taker's own fee for this call, computed once, in aggregate,
+    /// after matching completes — `fee_amount(taker_fee_basis,
+    /// taker_fee_bps)` — and already deducted from `matched_base`/
+    /// `matched_quote` (whichever the taker receives) before the slippage
+    /// checks in `place_market_order_*`/`swap_*` and before the coin(s)
+    /// returned to the taker. Denominated in Base for a bid-side taker
+    /// (`taker_side == true`), Quote for an ask-side taker
+    /// (`taker_side == false`). Replaces the old per-fill
+    /// `OrderFilled.taker_fee_amount` field, which could over-collect across
+    /// many small fills (finding F-6).
+    taker_fee_amount: u64,
 }
 
 /// `price` is a raw, book-relative unit; see the module doc comment for how
@@ -1870,7 +2089,7 @@ public fun place_limit_order_bid<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, option::some(price), size, escrow, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -1949,6 +2168,7 @@ public fun place_limit_order_bid<Base, Quote>(
         rested_size,
         rested_order_id,
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (ticket_opt, coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
@@ -1984,7 +2204,7 @@ public fun place_limit_order_ask<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, option::some(price), size, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -2039,6 +2259,7 @@ public fun place_limit_order_ask<Base, Quote>(
         rested_size,
         rested_order_id,
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (ticket_opt, payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
@@ -2065,7 +2286,7 @@ public fun place_market_order_bid<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, option::none(), size, budget_balance, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -2092,6 +2313,7 @@ public fun place_market_order_bid<Base, Quote>(
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
@@ -2116,7 +2338,7 @@ public fun place_market_order_ask<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -2143,6 +2365,7 @@ public fun place_market_order_ask<Base, Quote>(
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
@@ -2181,7 +2404,7 @@ public fun swap_bid<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, limit_price, size, budget_balance, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -2208,6 +2431,7 @@ public fun swap_bid<Base, Quote>(
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (coin::from_balance(matched_base, ctx), payment, stopped_on_max_fills_while_crossing)
@@ -2244,7 +2468,7 @@ public fun swap_ask<Base, Quote>(
     let taker_fee_bps = taker_fee_bps(book);
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, limit_price, size, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -2271,6 +2495,7 @@ public fun swap_ask<Base, Quote>(
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     });
 
     (payment, coin::from_balance(matched_quote, ctx), stopped_on_max_fills_while_crossing)
@@ -2299,7 +2524,12 @@ public fun cancel_order<Base, Quote>(
     } else {
         let live_order = order_opt.destroy_some();
         let trader = order::owner(&live_order);
-        let (eb, eq) = order::destroy(live_order);
+        let fee_basis = order::fee_basis_accumulated(&live_order);
+        let mfee_bps = order::maker_fee_bps(&live_order);
+        let (eb, eq, frb, frq) = order::destroy(live_order);
+        let (eb, eq) = fold_maker_fee_slack(
+            eb, eq, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, trader, &mut book.fee_accumulator,
+        );
         event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader });
         (eb, eq)
     };
@@ -2686,13 +2916,18 @@ public fun order_filled_fields_for_testing(e: &OrderFilled): (u64, ID, u64, u64,
 }
 
 #[test_only]
-public fun order_filled_fee_fields_for_testing(e: &OrderFilled): (bool, u64, u64, u64) {
-    (e.maker_side, e.quote_amount, e.taker_fee_amount, e.maker_fee_amount)
+public fun order_filled_side_and_quote_fields_for_testing(e: &OrderFilled): (bool, u64) {
+    (e.maker_side, e.quote_amount)
 }
 
 #[test_only]
-public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool) {
-    (e.order_book_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing)
+public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool, u64) {
+    (e.order_book_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing, e.taker_fee_amount)
+}
+
+#[test_only]
+public fun maker_fee_settled_fields_for_testing(e: &MakerFeeSettled): (u64, ID, address, u64) {
+    (e.order_id, e.order_book_id, e.maker, e.amount)
 }
 
 /// Direct `match_bid` exposure, used by behavioral-equivalence tests that
@@ -2706,7 +2941,7 @@ public fun match_bid_for_testing<Base, Quote>(
     payment: Coin<Quote>,
     max_fills: u64,
     ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, u64, bool) {
+): (Coin<Base>, Coin<Quote>, u64, bool, u64) {
     let taker = ctx.sender();
     let event_book_id = book.event_id;
     let budget = coin::into_balance(payment);
@@ -2714,7 +2949,7 @@ public fun match_bid_for_testing<Base, Quote>(
     let price_scale = book.price_scale;
     let (asks, proceeds, fees, last_price) =
         (&mut book.asks, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_bid(
             asks, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, budget, taker, event_book_id,
             max_fills, price_scale, last_price,
@@ -2724,6 +2959,7 @@ public fun match_bid_for_testing<Base, Quote>(
         coin::from_balance(remaining_budget, ctx),
         remaining_size,
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     )
 }
 
@@ -2737,14 +2973,14 @@ public fun match_ask_for_testing<Base, Quote>(
     payment: Coin<Base>,
     max_fills: u64,
     ctx: &mut TxContext,
-): (Coin<Quote>, Coin<Base>, u64, bool) {
+): (Coin<Quote>, Coin<Base>, u64, bool, u64) {
     let taker = ctx.sender();
     let event_book_id = book.event_id;
     let escrow_base = coin::into_balance(payment);
     let taker_fee_bps = book.taker_fee_bps;
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
-    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
+    let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, escrow_base, taker, event_book_id,
             max_fills, last_price,
@@ -2754,5 +2990,6 @@ public fun match_ask_for_testing<Base, Quote>(
         coin::from_balance(remaining_escrow, ctx),
         remaining_size,
         stopped_on_max_fills_while_crossing,
+        taker_fee_amount,
     )
 }

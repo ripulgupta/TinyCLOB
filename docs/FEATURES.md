@@ -70,6 +70,16 @@ order's remaining size below `min_size`. Such a remainder persists on the
 book until it is cancelled by its ticket holder, fully consumed by a later
 fill, or removed by `clob_admin_cancel_order`/`clob_admin_drain_step`.
 
+Integrators/deployers should ensure `min_size * price / price_scale` (the
+Quote value of the smallest permitted fill) stays well above 1 atom of the
+escrowed currency. A leg worth exactly 1 atom is the one case where a
+nonzero fee rate necessarily either consumes the entire leg or collects no
+fee at all — this is an accepted, unavoidable tradeoff of integer fee math,
+not a bug (see §11, Fees). This guidance only bounds *initial placement*
+size, however — it does nothing to bound a post-fill dust remainder, which
+can still end up arbitrarily small regardless of `min_size`, per the
+dust-remainder behavior described above.
+
 ### `base_decimals` / `quote_decimals` / `precision` / `exponent` /
 ### `initial_last_price`
 
@@ -453,12 +463,16 @@ public fun cancel_order<Base, Quote>(
 Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. Not
 gated by pause. If the order is still resting, its remaining escrow is
 returned along with any already-pooled, unclaimed proceeds for that order
-id, combined into the two returned coins. If the order is no longer resting
-(already fully filled and removed, or never found), only the pooled
-proceeds (if any) are returned; calling this on an already-fully-consumed
-or nonexistent order is not an error. Emits `OrderCancelled { order_id,
-order_book_id, trader }` only if a still-resting order was actually found
-and removed; emits `ProceedsClaimed { claimant, order_book_id, base_amount,
+id, combined into the two returned coins — this escrow leg also includes
+that order's maker-fee true-up (§9's Fees section): the CORRECT aggregate
+fee is computed and moved into the book's fee accumulator, and any
+superadditive slack left in the order's reserve is folded into the returned
+escrow. If the order is no longer resting (already fully filled and
+removed, or never found), only the pooled proceeds (if any) are returned;
+calling this on an already-fully-consumed or nonexistent order is not an
+error. Emits `OrderCancelled { order_id, order_book_id, trader }` and
+`MakerFeeSettled` (§13) only if a still-resting order was actually found and
+removed; emits `ProceedsClaimed { claimant, order_book_id, base_amount,
 quote_amount }` only if nonzero pooled proceeds were paid out alongside.
 
 ### `update_resting_order`
@@ -586,11 +600,55 @@ and `<= 5` for the maker fee (else `EMakerFeeRateTooHigh`, 9). Both default
 to `0` at construction. A change takes effect for fills from that point
 forward; a resting order snapshots the maker-fee rate in effect at the
 moment it was placed, so later maker-fee changes never retroactively affect
-an already-resting order. Fee amounts are computed as `ceil(receive_amount *
-rate_bps / 10_000)` — any nonzero receive amount at a nonzero rate pays at
-least 1 unit of fee. Emits `TakerFeeSet { order_book_id, rate_bps }` /
-`MakerFeeSet { order_book_id, rate_bps }` unconditionally, including a
-same-value call.
+an already-resting order. Every individual fee amount is computed as
+`ceil(receive_amount * rate_bps / 10_000)` — any nonzero receive amount at a
+nonzero rate pays at least 1 unit of fee. A receive amount of exactly 1 atom
+is the one case where this necessarily either consumes the entire leg (fee
+== the full 1 atom) or collects nothing (fee rounds down to 0 only if
+`rate_bps == 0`) — an accepted tradeoff of integer math at today's fee caps,
+not a bug (see §2's `min_size` guidance). Emits `TakerFeeSet { order_book_id,
+rate_bps }` / `MakerFeeSet { order_book_id, rate_bps }` unconditionally,
+including a same-value call.
+
+**Taker fee — computed once per call, in aggregate.** Each of the six
+order-placement/market/swap entry points computes its own taker fee exactly
+once, after its entire matching sweep completes (across every price level it
+touched), from the aggregate raw (pre-fee) quantity the taker filled that
+call — never per individual fill. This aggregate fee is deducted from the
+taker's matched proceeds *before* any slippage checks (`max_quote_in`/
+`min_base_out` on the bid side, `max_base_in`/`min_quote_out` on the ask
+side) and before the coin(s) returned to the taker, and is reported via
+`OrderExecuted.taker_fee_amount` (§13). Because ceiling division is
+superadditive, this once-per-call aggregate is always less than or equal to
+what summing each individual fill's own independently-ceiling-rounded fee
+would have charged — it can never make a slippage check that would have
+passed under the old per-fill model fail, only the reverse.
+
+**Maker fee — set aside per-fill, collected once at conclusion.** Each fill
+still computes its own ceiling-rounded maker fee and immediately splits it
+out of the maker's proceeds for that fill, but instead of crediting the
+book's fee accumulator immediately, that per-fill amount is set aside in a
+reserve private to the resting order itself. Only when the order
+*concludes* — fully filled (drained by a fill), cancelled by its own ticket
+holder (`cancel_order`), force-cancelled (`clob_admin_cancel_order`), or
+swept up by `clob_admin_drain_step` — is the CORRECT aggregate fee actually
+computed (from the order's own running total of fill basis across its
+entire lifetime) and transferred into the book's fee accumulator; any
+superadditive slack left over in the reserve is refunded back to the maker
+through whatever mechanism that conclusion event already uses to pay the
+maker (pooled proceeds for a fill-drain, the escrow/coin(s) returned for a
+cancellation or force-drain). This transfer is reported via a new event,
+`MakerFeeSettled { order_id, order_book_id, maker, amount }` (§13), emitted
+exactly once per concluded order, alongside whatever event that conclusion
+already emits (e.g. `OrderCancelled`).
+
+Accepted tradeoff: an order that rests indefinitely without ever concluding
+defers both its maker-fee collection and its `MakerFeeSettled` event
+indefinitely along with it. The fee isn't lost — it's already been set
+aside, fill by fill, in the order's own reserve — it's simply not yet
+finalized into the book's fee accumulator, exactly the same way the order's
+own unspent escrow and pooled fill proceeds aren't paid out until that same
+conclusion.
 
 ```
 public fun clob_admin_claim_fees<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>, ctx: &mut TxContext): (Coin<Base>, Coin<Quote>)
@@ -618,10 +676,13 @@ public fun clob_admin_cancel_order<Base, Quote>(
 Removes a specific resting order by side/price/order id and refunds its
 escrow to its owner. A no-op (no abort, no event) if no such order exists.
 Not gated by pause. Emits `OrderCancelled { order_id, order_book_id,
-trader }` only when an order was actually found and removed. Does not touch
-or pay out that order's already-pooled proceeds (if any) — those remain
-claimable separately via the order's `OrderTicket`, if the caller who placed
-it still holds one, or payable via `push_proceeds`.
+trader }` and `MakerFeeSettled` (§9's Fees section, §13) only when an order
+was actually found and removed — the latter is this order's conclusion,
+which trues up its maker-fee reserve and folds any superadditive slack into
+the escrow refunded here. Does not touch or pay out that order's
+already-pooled proceeds (if any) — those remain claimable separately via
+the order's `OrderTicket`, if the caller who placed it still holds one, or
+payable via `push_proceeds`.
 
 ### Price band and last-price reset
 
@@ -653,15 +714,21 @@ escrow/proceeds to their respective owners as it goes. Callable repeatedly
 across multiple transactions to drain a large book incrementally; each call
 processes at most `max_items` items and simply does less if fewer remain.
 
-Emits `OrderCancelled` for every resting order it force-cancels and
-`ProceedsClaimed` for every nonzero pooled-proceeds entry it pays out (a
-zero-valued entry is skipped, matching `claim_proceeds`/`push_proceeds`'s
-own skip-on-zero convention) — i.e. up to one event per processed item,
-where previously this function emitted none. Sui enforces a hard cap of
-1024 events emitted per transaction, so an admin's `max_items` choice should
-stay comfortably under that limit (e.g. a few hundred), especially if
-multiple `clob_admin_drain_step` calls are batched into a single PTB, where
-the cap applies across the whole transaction, not per call.
+Emits `OrderCancelled` **and** `MakerFeeSettled` (§13) for every resting
+order it force-cancels — the latter from the same centralized maker-fee
+true-up that runs at every order conclusion — and `ProceedsClaimed` for
+every nonzero pooled-proceeds entry it pays out (a zero-valued entry is
+skipped, matching `claim_proceeds`/`push_proceeds`'s own skip-on-zero
+convention). That is up to **two** events per drained resting order, plus
+one per nonzero proceeds entry. Sui enforces a hard cap of 1024 events
+emitted per transaction, so an admin's `max_items` choice should stay
+comfortably under that limit (e.g. a few hundred), especially if multiple
+`clob_admin_drain_step` calls are batched into a single PTB, where the cap
+applies across the whole transaction, not per call. The `MakerFeeSettled`
+addition roughly halves this function's previous safe per-call margin
+against that cap (up to 2 events per drained order now, versus 1 before) —
+an admin relying on a previously-safe `max_items` value should reassess it
+accordingly.
 
 ```
 public fun clob_admin_finalize<Base, Quote>(cap: ClobAdminCap, book: OrderBook<Base, Quote>): ID
@@ -740,8 +807,9 @@ ordering within a transaction's effects is deterministic).
 | `OrderBookDeleted` | `order_book_id: ID`, `base: TypeName`, `quote: TypeName` |
 | `ClobAdminCapDiscarded` | `cap_id: ID`, `for_book: ID` |
 | `OrderPlaced` | `order_id: u64`, `order_book_id: ID`, `side: bool`, `price: u64`, `size: u64`, `trader: address`, `maker_fee_bps: u64` |
-| `OrderFilled` | `maker_order_id: u64`, `order_book_id: ID`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64`, `taker_fee_amount: u64`, `maker_fee_amount: u64` |
-| `OrderExecuted` | `order_book_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool` |
+| `OrderFilled` | `maker_order_id: u64`, `order_book_id: ID`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64` |
+| `OrderExecuted` | `order_book_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool`, `taker_fee_amount: u64` |
+| `MakerFeeSettled` | `order_id: u64`, `order_book_id: ID`, `maker: address`, `amount: u64` |
 | `ProceedsClaimed` | `claimant: address`, `order_book_id: ID`, `base_amount: u64`, `quote_amount: u64` |
 | `OrderOwnerUpdated` | `order_id: u64`, `order_book_id: ID`, `old_owner: address`, `new_owner: address` |
 
@@ -749,21 +817,15 @@ ordering within a transaction's effects is deterministic).
 resting order at placement time — permanent for the order's lifetime; later
 `MakerFeeSet` changes never retroactively affect it.
 
-`OrderFilled`'s new fields follow a currency truth table: each party's fee
-is denominated in the asset that party receives. When `maker_side == false`
-(the resting maker order was an ask): the taker receives Base
-(`taker_fee_amount` in Base) and the maker receives Quote (`maker_fee_amount`
-in Quote). When `maker_side == true` (the resting maker order was a bid):
-the taker receives Quote (`taker_fee_amount` in Quote) and the maker
-receives Base (`maker_fee_amount` in Base). `size` and `price` are the
-exception to the flip: `size` is always denominated in `Base` atomic units
-and `price` is always the raw, book-relative price of the resting maker
-order (§3), regardless of `maker_side`. `quote_amount`,
-`taker_fee_amount`, and `maker_fee_amount` are all gross amounts — each fee
-is deducted FROM its respective gross leg, not added on top. On the
-maker-bid side (`maker_side == true`), `quote_amount` is derived from a
-proportional slice of the maker's original escrow reservation (not a direct
-`price * size` recomputation) and may differ by rounding from
+`OrderFilled` carries no fee information — it is a pure per-fill
+notification. Taker fees are now computed once per call, in aggregate, and
+reported on `OrderExecuted.taker_fee_amount` below; maker fees are set
+aside per-fill into a reserve private to the resting order and only
+actually collected — and reported via `MakerFeeSettled` — when that order
+concludes. See §9's Fees section for the full model. On the maker-bid side
+(`maker_side == true`), `quote_amount` is derived from a proportional slice
+of the maker's original escrow reservation (not a direct `price * size`
+recomputation) and may differ by rounding from
 `ceil(price * size / price_scale)` — this is expected.
 
 Although any single `quote_amount` may deviate by rounding on the maker-bid
@@ -802,7 +864,20 @@ to the taker when `taker_fee_bps > 0`. `rested_size` is `0` if nothing rests;
 on the bid limit path it can be less than `unmatched_size` even when
 something rests, because `place_limit_order_bid` clamps the resting size to
 what leftover escrow can actually back. `rested_order_id` is `Some(id)` iff
-something rested this call, else `None`.
+something rested this call, else `None`. `taker_fee_amount` is this call's
+own taker fee, computed once in aggregate after matching completes and
+already deducted from the matched proceeds returned to the taker — see §9's
+Fees section. It is denominated in Base for a bid-side taker
+(`taker_side == true`) and Quote for an ask-side taker (`taker_side ==
+false`).
+
+`MakerFeeSettled` is emitted exactly once for every order that concludes —
+see §9's Fees section for the full model and the four ways an order can
+conclude. `amount` is the CORRECT aggregate maker fee actually collected
+across that order's entire fill history (not the sum of each fill's own
+independently-ceiling-rounded fee), denominated in Base for a bid-side
+order and Quote for an ask-side order (whichever currency that order's
+maker fee is actually paid in).
 
 ## 14. Error code reference
 

@@ -15,6 +15,7 @@
 #[test_only]
 module tiny_clob::price_tree_tests;
 
+use sui::balance;
 use sui::test_scenario as ts;
 use tiny_clob::order::{Self, Order};
 use tiny_clob::price_tree::{Self, PriceTree, PriceLevel};
@@ -55,9 +56,15 @@ fun teardown_levels(scenario: ts::Scenario, tree: PriceTree<PriceLevel<BTC, USDC
 fun destroy_level(mut level: PriceLevel<BTC, USDC>) {
     while (!price_tree::level_is_empty(&level)) {
         let (_id, order) = price_tree::level_pop_front_order(&mut level);
-        let (escrow_base, escrow_quote) = order::destroy(order);
+        let (escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote) = order::destroy(order);
         escrow_base.destroy_none();
         escrow_quote.destroy_none();
+        // `mock_order` constructs orders with both escrow legs `none()`, so
+        // `order::new` treats them as ask-side (`fee_reserve_quote` — see
+        // its doc comment); `fee_reserve_base` is therefore always `none()`
+        // and `fee_reserve_quote` is always a zero-valued `Some`.
+        fee_reserve_base.destroy_none();
+        balance::destroy_zero(fee_reserve_quote.destroy_some());
     };
     price_tree::destroy_empty_price_level(level);
 }

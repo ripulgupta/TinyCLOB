@@ -49,7 +49,7 @@ fun bid_quote_escrow_at_price_matches_single_order_after_partial_fill() {
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 1, 3);
-    let (ev_maker_side, ev_quote_amount, _, _) = tiny_clob::order_filled_fee_fields_for_testing(&fills[0]);
+    let (ev_maker_side, ev_quote_amount) = tiny_clob::order_filled_side_and_quote_fields_for_testing(&fills[0]);
     assert!(ev_maker_side, 4);
     assert!(ev_quote_amount == quote_charged, 5);
 

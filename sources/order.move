@@ -66,6 +66,34 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// orders too, matching how `escrow_base`/`escrow_quote` already sit
     /// unused on one side or the other.
     total_reserved: u64,
+    /// Running sum of this order's maker-fee BASIS contribution across every
+    /// fill it has ever taken part in — incremented identically by
+    /// `fill_level_bid`/`fill_level_ask` regardless of side: `fill_qty`
+    /// (Base) for a bid-side maker fill, `quote_cost` (Quote) for an
+    /// ask-side maker fill (whichever currency this order's own maker fee is
+    /// actually denominated in — see `fee_reserve_base`/`fee_reserve_quote`
+    /// below). Used at order conclusion (see `tiny_clob::conclude_order_fee`)
+    /// to compute the CORRECT aggregate fee owed,
+    /// `fee_amount(fee_basis_accumulated, maker_fee_bps)`, instead of
+    /// summing each fill's independently ceiling-rounded fee — the latter
+    /// can over-collect when an order fills across many small fills (see the
+    /// project's audit notes, finding F-6).
+    fee_basis_accumulated: u64,
+    /// Per-fill maker-fee set-aside for a BID-side order (populated only
+    /// then; `None` for an ask-side order) — mirrors `escrow_base`/
+    /// `escrow_quote`'s optional-pair pattern. Each fill splits that fill's
+    /// own ceiling-rounded fee off the maker's proceeds and joins it in here
+    /// instead of crediting the book's fee accumulator immediately. Only the
+    /// CORRECT aggregate fee (computed once, at conclusion, from
+    /// `fee_basis_accumulated`) is ever actually transferred to the
+    /// accumulator; any superadditive slack left over in this reserve is
+    /// refunded back to the maker at that same conclusion — see
+    /// `tiny_clob::conclude_order_fee`.
+    fee_reserve_base: Option<Balance<Base>>,
+    /// Per-fill maker-fee set-aside for an ASK-side order — the `Quote`-side
+    /// mirror of `fee_reserve_base` above (populated only for ask-side
+    /// orders, `None` for a bid-side order).
+    fee_reserve_quote: Option<Balance<Quote>>,
 }
 
 public(package) fun new<Base, Quote>(
@@ -81,10 +109,23 @@ public(package) fun new<Base, Quote>(
     } else {
         0
     };
+    // A bid-side order escrows Quote (`escrow_quote.is_some()`); an ask-side
+    // order escrows Base. Every real call site (`place_limit_order_bid`/
+    // `_ask`) populates exactly one of the two, mirroring the convention
+    // `fee_reserve_base`/`fee_reserve_quote` follow below.
+    let is_bid_side = escrow_quote.is_some();
+    let (fee_reserve_base, fee_reserve_quote) = if (is_bid_side) {
+        (option::some(balance::zero<Base>()), option::none())
+    } else {
+        (option::none(), option::some(balance::zero<Quote>()))
+    };
     Order {
         order_id, owner, remaining_size, escrow_base, escrow_quote, maker_fee_bps,
         original_size: remaining_size,
         total_reserved,
+        fee_basis_accumulated: 0,
+        fee_reserve_base,
+        fee_reserve_quote,
     }
 }
 
@@ -104,14 +145,22 @@ public(package) fun set_owner<Base, Quote>(o: &mut Order<Base, Quote>, new_owner
     o.owner = new_owner;
 }
 
+/// Returns `(escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote)`.
+/// The fee-reserve pair must be inspected/settled by the caller (via
+/// `tiny_clob::conclude_order_fee` and its side-specific unwrap helpers) —
+/// unlike the escrow pair, which may be safely destroyed once known to be
+/// zero/empty, an order's `fee_reserve_base`/`fee_reserve_quote` may still
+/// hold real, uncollected fee value even at conclusion and must never be
+/// silently dropped.
 public(package) fun destroy<Base, Quote>(
     o: Order<Base, Quote>,
-): (Option<Balance<Base>>, Option<Balance<Quote>>) {
+): (Option<Balance<Base>>, Option<Balance<Quote>>, Option<Balance<Base>>, Option<Balance<Quote>>) {
     let Order {
         order_id: _, owner: _, remaining_size: _, escrow_base, escrow_quote, maker_fee_bps: _,
-        original_size: _, total_reserved: _,
+        original_size: _, total_reserved: _, fee_basis_accumulated: _,
+        fee_reserve_base, fee_reserve_quote,
     } = o;
-    (escrow_base, escrow_quote)
+    (escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote)
 }
 
 public(package) fun id<Base, Quote>(o: &Order<Base, Quote>): u64 { o.order_id }
@@ -127,4 +176,27 @@ public(package) fun total_reserved<Base, Quote>(o: &Order<Base, Quote>): u64 { o
 /// already been charged so far: `total_reserved(o) - escrow_quote_value(o)`.
 public(package) fun escrow_quote_value<Base, Quote>(o: &Order<Base, Quote>): u64 {
     if (o.escrow_quote.is_some()) balance::value(o.escrow_quote.borrow()) else 0
+}
+
+/// See the `fee_basis_accumulated` field doc comment.
+public(package) fun fee_basis_accumulated<Base, Quote>(o: &Order<Base, Quote>): u64 {
+    o.fee_basis_accumulated
+}
+
+public(package) fun increase_fee_basis_accumulated<Base, Quote>(o: &mut Order<Base, Quote>, amount: u64) {
+    o.fee_basis_accumulated = o.fee_basis_accumulated + amount;
+}
+
+/// Joins `b` into this (bid-side) order's `fee_reserve_base`. Aborts if this
+/// order is ask-side (`fee_reserve_base` is `None`) — every call site is
+/// expected to already know this order's side.
+public(package) fun join_fee_reserve_base<Base, Quote>(o: &mut Order<Base, Quote>, b: Balance<Base>) {
+    o.fee_reserve_base.borrow_mut().join(b);
+}
+
+/// Joins `b` into this (ask-side) order's `fee_reserve_quote`. Aborts if
+/// this order is bid-side (`fee_reserve_quote` is `None`) — every call site
+/// is expected to already know this order's side.
+public(package) fun join_fee_reserve_quote<Base, Quote>(o: &mut Order<Base, Quote>, b: Balance<Quote>) {
+    o.fee_reserve_quote.borrow_mut().join(b);
 }
