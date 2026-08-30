@@ -46,7 +46,7 @@ fun setup_levels(): (ts::Scenario, PriceTree<PriceLevel<BTC, USDC>>) {
 }
 
 fun teardown_levels(scenario: ts::Scenario, tree: PriceTree<PriceLevel<BTC, USDC>>) {
-    price_tree::destroy_empty(tree);
+    tree.destroy_empty();
     scenario.end();
 }
 
@@ -54,9 +54,9 @@ fun teardown_levels(scenario: ts::Scenario, tree: PriceTree<PriceLevel<BTC, USDC
 /// every order (destroying its empty escrow legs) then destroys the empty
 /// level itself.
 fun destroy_level(mut level: PriceLevel<BTC, USDC>) {
-    while (!price_tree::level_is_empty(&level)) {
-        let (_id, order) = price_tree::level_pop_front_order(&mut level);
-        let (escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote) = order::destroy(order);
+    while (!level.level_is_empty()) {
+        let (_id, order) = level.level_pop_front_order();
+        let (escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote) = order.destroy();
         escrow_base.destroy_none();
         escrow_quote.destroy_none();
         // `mock_order` constructs orders with both escrow legs `none()`, so
@@ -64,9 +64,9 @@ fun destroy_level(mut level: PriceLevel<BTC, USDC>) {
         // its doc comment); `fee_reserve_base` is therefore always `none()`
         // and `fee_reserve_quote` is always a zero-valued `Some`.
         fee_reserve_base.destroy_none();
-        balance::destroy_zero(fee_reserve_quote.destroy_some());
+        fee_reserve_quote.destroy_some().destroy_zero();
     };
-    price_tree::destroy_empty_price_level(level);
+    level.destroy_empty_price_level();
 }
 
 /// Removes and fully destroys every leaf in `keys` — the `PriceLevel`
@@ -74,8 +74,8 @@ fun destroy_level(mut level: PriceLevel<BTC, USDC>) {
 fun cleanup_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC>>, keys: vector<u64>) {
     let mut i = 0;
     while (i < keys.length()) {
-        let ptr = price_tree::find(tree, keys[i]).destroy_some();
-        let level = price_tree::remove(tree, ptr);
+        let ptr = tree.find(keys[i]).destroy_some();
+        let level = tree.remove(ptr);
         destroy_level(level);
         i = i + 1;
     };
@@ -92,7 +92,7 @@ fun insert_via_find_or_append(
     let mut i = 0;
     while (i < keys.length()) {
         let order = mock_order(i);
-        price_tree::insert_or_append_order(tree, keys[i], i, order, ctx);
+        tree.insert_or_append_order(keys[i], i, order, ctx);
         i = i + 1;
     };
 }
@@ -108,8 +108,8 @@ fun insert_plain_level(
     ctx: &mut TxContext,
 ) {
     let mut level = price_tree::new_price_level<BTC, USDC>(ctx);
-    price_tree::level_insert_order(&mut level, order_id, mock_order(order_id));
-    price_tree::insert(tree, key, level);
+    level.level_insert_order(order_id, mock_order(order_id));
+    tree.insert(key, level);
 }
 
 /// Drains the whole `PriceLevel` tree via repeated `min_leaf` + `remove`,
@@ -118,11 +118,11 @@ fun insert_plain_level(
 fun drain_ascending_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC>>): vector<u64> {
     let mut out: vector<u64> = vector[];
     loop {
-        let m = price_tree::min_leaf(tree);
+        let m = tree.min_leaf();
         if (m.is_none()) { m.destroy_none(); break };
         let ptr = m.destroy_some();
-        out.push_back(price_tree::key(tree, ptr));
-        let level = price_tree::remove(tree, ptr);
+        out.push_back(tree.key(ptr));
+        let level = tree.remove(ptr);
         destroy_level(level);
     };
     out
@@ -134,16 +134,16 @@ fun drain_ascending_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC>>): vector<
 fun insert_single_key_becomes_root_min_max() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 42_000_000, mock(1));
+    tree.insert(42_000_000, mock(1));
 
-    let min_ptr = price_tree::min_leaf(&tree).destroy_some();
-    let max_ptr = price_tree::max_leaf(&tree).destroy_some();
-    let found_ptr = price_tree::find(&tree, 42_000_000).destroy_some();
+    let min_ptr = tree.min_leaf().destroy_some();
+    let max_ptr = tree.max_leaf().destroy_some();
+    let found_ptr = tree.find(42_000_000).destroy_some();
     assert!(min_ptr == max_ptr, 0);
     assert!(min_ptr == found_ptr, 1);
-    assert!(price_tree::size(&tree) == 1, 2);
+    assert!(tree.size() == 1, 2);
 
-    let _v = price_tree::remove(&mut tree, found_ptr);
+    let _v = tree.remove(found_ptr);
     teardown(scenario, tree);
 }
 
@@ -164,19 +164,19 @@ fun insert_ascending_keys_updates_max_leaf_incrementally() {
     let mut last_max_ptr = option::none<u64>();
     while (i < prices.length()) {
         let price = prices[i];
-        price_tree::insert(&mut tree, price, mock(i));
-        let max_ptr = price_tree::max_leaf(&tree).destroy_some();
+        tree.insert(price, mock(i));
+        let max_ptr = tree.max_leaf().destroy_some();
         // Each insert's new key is a fresh max: max_leaf must move to it,
         // read directly as a tracked field (not re-derived by descent).
-        assert!(price_tree::find(&tree, price).destroy_some() == max_ptr, i);
+        assert!(tree.find(price).destroy_some() == max_ptr, i);
         last_max_ptr = option::some(max_ptr);
         i = i + 1;
     };
-    assert!(last_max_ptr.destroy_some() == price_tree::max_leaf(&tree).destroy_some(), 100);
+    assert!(last_max_ptr.destroy_some() == tree.max_leaf().destroy_some(), 100);
 
     // Min never moved off the first-inserted (lowest) key.
-    let expected_min = price_tree::find(&tree, 1_000_000).destroy_some();
-    assert!(price_tree::min_leaf(&tree).destroy_some() == expected_min, 101);
+    let expected_min = tree.find(1_000_000).destroy_some();
+    assert!(tree.min_leaf().destroy_some() == expected_min, 101);
 
     cleanup(&mut tree, prices);
     teardown(scenario, tree);
@@ -194,14 +194,14 @@ fun insert_descending_keys_updates_min_leaf_incrementally() {
     let mut i = 0;
     while (i < prices.length()) {
         let price = prices[i];
-        price_tree::insert(&mut tree, price, mock(i));
-        let min_ptr = price_tree::min_leaf(&tree).destroy_some();
-        assert!(price_tree::find(&tree, price).destroy_some() == min_ptr, i);
+        tree.insert(price, mock(i));
+        let min_ptr = tree.min_leaf().destroy_some();
+        assert!(tree.find(price).destroy_some() == min_ptr, i);
         i = i + 1;
     };
 
-    let expected_max = price_tree::find(&tree, 9_000_000).destroy_some();
-    assert!(price_tree::max_leaf(&tree).destroy_some() == expected_max, 100);
+    let expected_max = tree.find(9_000_000).destroy_some();
+    assert!(tree.max_leaf().destroy_some() == expected_max, 100);
 
     cleanup(&mut tree, prices);
     teardown(scenario, tree);
@@ -218,17 +218,17 @@ fun insert_descending_keys_updates_min_leaf_incrementally() {
 fun insert_middle_key_leaves_min_max_unchanged() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1)); // low -> min
-    price_tree::insert(&mut tree, 8_800_000, mock(2)); // high -> max
+    tree.insert(5_000_000, mock(1)); // low -> min
+    tree.insert(8_800_000, mock(2)); // high -> max
 
-    let min_before = price_tree::min_leaf(&tree).destroy_some();
-    let max_before = price_tree::max_leaf(&tree).destroy_some();
+    let min_before = tree.min_leaf().destroy_some();
+    let max_before = tree.max_leaf().destroy_some();
 
-    price_tree::insert(&mut tree, 6_250_000, mock(3)); // middle -> neither
+    tree.insert(6_250_000, mock(3)); // middle -> neither
 
-    assert!(price_tree::min_leaf(&tree).destroy_some() == min_before, 0);
-    assert!(price_tree::max_leaf(&tree).destroy_some() == max_before, 1);
-    assert!(price_tree::size(&tree) == 3, 2);
+    assert!(tree.min_leaf().destroy_some() == min_before, 0);
+    assert!(tree.max_leaf().destroy_some() == max_before, 1);
+    assert!(tree.size() == 3, 2);
 
     cleanup(&mut tree, vector[5_000_000, 6_250_000, 8_800_000]);
     teardown(scenario, tree);
@@ -240,20 +240,20 @@ fun insert_middle_key_leaves_min_max_unchanged() {
 fun remove_non_extreme_leaf_leaves_min_max_unchanged() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1)); // min
-    price_tree::insert(&mut tree, 6_250_000, mock(2)); // middle
-    price_tree::insert(&mut tree, 8_800_000, mock(3)); // max
+    tree.insert(5_000_000, mock(1)); // min
+    tree.insert(6_250_000, mock(2)); // middle
+    tree.insert(8_800_000, mock(3)); // max
 
-    let min_before = price_tree::min_leaf(&tree).destroy_some();
-    let max_before = price_tree::max_leaf(&tree).destroy_some();
+    let min_before = tree.min_leaf().destroy_some();
+    let max_before = tree.max_leaf().destroy_some();
 
-    let middle_ptr = price_tree::find(&tree, 6_250_000).destroy_some();
-    let _v = price_tree::remove(&mut tree, middle_ptr);
+    let middle_ptr = tree.find(6_250_000).destroy_some();
+    let _v = tree.remove(middle_ptr);
 
-    assert!(price_tree::min_leaf(&tree).destroy_some() == min_before, 0);
-    assert!(price_tree::max_leaf(&tree).destroy_some() == max_before, 1);
-    assert!(price_tree::size(&tree) == 2, 2);
-    assert!(price_tree::find(&tree, 6_250_000).is_none(), 3);
+    assert!(tree.min_leaf().destroy_some() == min_before, 0);
+    assert!(tree.max_leaf().destroy_some() == max_before, 1);
+    assert!(tree.size() == 2, 2);
+    assert!(tree.find(6_250_000).is_none(), 3);
 
     cleanup(&mut tree, vector[5_000_000, 8_800_000]);
     teardown(scenario, tree);
@@ -265,15 +265,15 @@ fun remove_non_extreme_leaf_leaves_min_max_unchanged() {
 fun remove_min_leaf_recomputes_new_min() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1)); // min
-    price_tree::insert(&mut tree, 6_250_000, mock(2)); // new min after removal
-    price_tree::insert(&mut tree, 8_800_000, mock(3)); // max
+    tree.insert(5_000_000, mock(1)); // min
+    tree.insert(6_250_000, mock(2)); // new min after removal
+    tree.insert(8_800_000, mock(3)); // max
 
-    let old_min_ptr = price_tree::find(&tree, 5_000_000).destroy_some();
-    let _v = price_tree::remove(&mut tree, old_min_ptr);
+    let old_min_ptr = tree.find(5_000_000).destroy_some();
+    let _v = tree.remove(old_min_ptr);
 
-    let expected_new_min = price_tree::find(&tree, 6_250_000).destroy_some();
-    assert!(price_tree::min_leaf(&tree).destroy_some() == expected_new_min, 0);
+    let expected_new_min = tree.find(6_250_000).destroy_some();
+    assert!(tree.min_leaf().destroy_some() == expected_new_min, 0);
 
     cleanup(&mut tree, vector[6_250_000, 8_800_000]);
     teardown(scenario, tree);
@@ -285,15 +285,15 @@ fun remove_min_leaf_recomputes_new_min() {
 fun remove_max_leaf_recomputes_new_max() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1)); // min
-    price_tree::insert(&mut tree, 6_250_000, mock(2)); // new max after removal
-    price_tree::insert(&mut tree, 8_800_000, mock(3)); // max
+    tree.insert(5_000_000, mock(1)); // min
+    tree.insert(6_250_000, mock(2)); // new max after removal
+    tree.insert(8_800_000, mock(3)); // max
 
-    let old_max_ptr = price_tree::find(&tree, 8_800_000).destroy_some();
-    let _v = price_tree::remove(&mut tree, old_max_ptr);
+    let old_max_ptr = tree.find(8_800_000).destroy_some();
+    let _v = tree.remove(old_max_ptr);
 
-    let expected_new_max = price_tree::find(&tree, 6_250_000).destroy_some();
-    assert!(price_tree::max_leaf(&tree).destroy_some() == expected_new_max, 0);
+    let expected_new_max = tree.find(6_250_000).destroy_some();
+    assert!(tree.max_leaf().destroy_some() == expected_new_max, 0);
 
     cleanup(&mut tree, vector[5_000_000, 6_250_000]);
     teardown(scenario, tree);
@@ -305,14 +305,14 @@ fun remove_max_leaf_recomputes_new_max() {
 fun remove_last_leaf_empties_tree() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 12_500_000, mock(1));
-    let ptr = price_tree::find(&tree, 12_500_000).destroy_some();
-    let _v = price_tree::remove(&mut tree, ptr);
+    tree.insert(12_500_000, mock(1));
+    let ptr = tree.find(12_500_000).destroy_some();
+    let _v = tree.remove(ptr);
 
-    assert!(price_tree::min_leaf(&tree).is_none(), 0);
-    assert!(price_tree::max_leaf(&tree).is_none(), 1);
-    assert!(price_tree::size(&tree) == 0, 2);
-    assert!(price_tree::find(&tree, 12_500_000).is_none(), 3);
+    assert!(tree.min_leaf().is_none(), 0);
+    assert!(tree.max_leaf().is_none(), 1);
+    assert!(tree.size() == 0, 2);
+    assert!(tree.find(12_500_000).is_none(), 3);
 
     teardown(scenario, tree);
 }
@@ -323,8 +323,8 @@ fun remove_last_leaf_empties_tree() {
 fun find_missing_key_returns_none() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 3_300_000, mock(1));
-    assert!(price_tree::find(&tree, 9_900_000).is_none(), 0);
+    tree.insert(3_300_000, mock(1));
+    assert!(tree.find(9_900_000).is_none(), 0);
 
     cleanup(&mut tree, vector[3_300_000]);
     teardown(scenario, tree);
@@ -334,8 +334,8 @@ fun find_missing_key_returns_none() {
 fun find_present_key_returns_some_pointer() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 3_300_000, mock(1));
-    assert!(price_tree::find(&tree, 3_300_000).is_some(), 0);
+    tree.insert(3_300_000, mock(1));
+    assert!(tree.find(3_300_000).is_some(), 0);
 
     cleanup(&mut tree, vector[3_300_000]);
     teardown(scenario, tree);
@@ -351,14 +351,14 @@ fun insert_many_distinct_prices_grows_tree_depth() {
     let base = 4_000_000u64;
     let mut i = 0;
     while (i < 12) {
-        price_tree::insert(&mut tree, base + i, mock(i));
+        tree.insert(base + i, mock(i));
         i = i + 1;
     };
-    assert!(price_tree::size(&tree) == 12, 0);
+    assert!(tree.size() == 12, 0);
 
     i = 0;
     while (i < 12) {
-        assert!(price_tree::find(&tree, base + i).is_some(), 1);
+        assert!(tree.find(base + i).is_some(), 1);
         i = i + 1;
     };
 
@@ -366,15 +366,15 @@ fun insert_many_distinct_prices_grows_tree_depth() {
     i = 0;
     while (i < 12) {
         if (i % 2 == 0) {
-            let ptr = price_tree::find(&tree, base + i).destroy_some();
-            let _v = price_tree::remove(&mut tree, ptr);
+            let ptr = tree.find(base + i).destroy_some();
+            let _v = tree.remove(ptr);
         };
         i = i + 1;
     };
-    assert!(price_tree::size(&tree) == 6, 2);
+    assert!(tree.size() == 6, 2);
     i = 0;
     while (i < 12) {
-        let present = price_tree::find(&tree, base + i).is_some();
+        let present = tree.find(base + i).is_some();
         assert!(present == (i % 2 == 1), 3);
         i = i + 1;
     };
@@ -382,11 +382,11 @@ fun insert_many_distinct_prices_grows_tree_depth() {
     // Remove the remaining odd-indexed leaves to empty the tree.
     i = 1;
     while (i < 12) {
-        let ptr = price_tree::find(&tree, base + i).destroy_some();
-        let _v = price_tree::remove(&mut tree, ptr);
+        let ptr = tree.find(base + i).destroy_some();
+        let _v = tree.remove(ptr);
         i = i + 2;
     };
-    assert!(price_tree::size(&tree) == 0, 4);
+    assert!(tree.size() == 0, 4);
 
     teardown(scenario, tree);
 }
@@ -398,22 +398,22 @@ fun insert_same_price_repeatedly_leaves_tree_depth_unchanged() {
     let (mut scenario, mut tree) = setup();
 
     // First order at this price creates the leaf.
-    price_tree::insert(&mut tree, 7_500_000, mock(1));
-    assert!(price_tree::size(&tree) == 1, 0);
+    tree.insert(7_500_000, mock(1));
+    assert!(tree.size() == 1, 0);
 
     // Additional orders at the same already-present price never call
     // `insert` again — they mutate the existing leaf's FIFO queue in place
     // via `borrow_mut`.
-    let ptr = price_tree::find(&tree, 7_500_000).destroy_some();
+    let ptr = tree.find(7_500_000).destroy_some();
     let mut n = 2;
     while (n <= 5) {
-        price_tree::borrow_mut(&mut tree, ptr).orders.push_back(n);
+        tree.borrow_mut(ptr).orders.push_back(n);
         n = n + 1;
     };
 
     // No new InternalNode/Leaf was created beyond the first.
-    assert!(price_tree::size(&tree) == 1, 1);
-    assert!(price_tree::borrow(&tree, ptr).orders.length() == 5, 2);
+    assert!(tree.size() == 1, 1);
+    assert!(tree.borrow(ptr).orders.length() == 5, 2);
 
     cleanup(&mut tree, vector[7_500_000]);
     teardown(scenario, tree);
@@ -428,10 +428,10 @@ fun no_tick_divisibility_check() {
     // 7 and 13 share no common divisor beyond 1 — no tick-size/divisibility
     // check exists anywhere in price_tree, so both inserts succeed with no
     // abort.
-    price_tree::insert(&mut tree, 7, mock(1));
-    price_tree::insert(&mut tree, 13, mock(2));
-    assert!(price_tree::find(&tree, 7).is_some(), 0);
-    assert!(price_tree::find(&tree, 13).is_some(), 1);
+    tree.insert(7, mock(1));
+    tree.insert(13, mock(2));
+    assert!(tree.find(7).is_some(), 0);
+    assert!(tree.find(13).is_some(), 1);
 
     cleanup(&mut tree, vector[7, 13]);
     teardown(scenario, tree);
@@ -444,8 +444,8 @@ fun no_tick_divisibility_check() {
 fun insert_duplicate_key_aborts() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 2_000_000, mock(1));
-    price_tree::insert(&mut tree, 2_000_000, mock(2));
+    tree.insert(2_000_000, mock(1));
+    tree.insert(2_000_000, mock(2));
 
     cleanup(&mut tree, vector[2_000_000]);
     teardown(scenario, tree);
@@ -462,14 +462,14 @@ fun insert_duplicate_key_aborts() {
 fun borrow_with_internal_node_index_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    price_tree::insert(&mut tree, 8_800_000, mock(2));
+    tree.insert(5_000_000, mock(1));
+    tree.insert(8_800_000, mock(2));
 
     // The tree now has exactly one internal node, allocated at index 0
     // (internal-node indices are allocated bottom-up from 0). Index 0 is
     // `< PARTITION_INDEX`, so it is not a leaf pointer.
     let bad_ptr: u64 = 0;
-    let _v = price_tree::borrow(&tree, bad_ptr);
+    let _v = tree.borrow(bad_ptr);
 
     cleanup(&mut tree, vector[5_000_000, 8_800_000]);
     teardown(scenario, tree);
@@ -480,11 +480,11 @@ fun borrow_with_internal_node_index_aborts_invalid_leaf_ptr() {
 fun remove_with_internal_node_index_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    price_tree::insert(&mut tree, 8_800_000, mock(2));
+    tree.insert(5_000_000, mock(1));
+    tree.insert(8_800_000, mock(2));
 
     let bad_ptr: u64 = 0;
-    let _v = price_tree::remove(&mut tree, bad_ptr);
+    let _v = tree.remove(bad_ptr);
 
     cleanup(&mut tree, vector[5_000_000, 8_800_000]);
     teardown(scenario, tree);
@@ -495,11 +495,11 @@ fun remove_with_internal_node_index_aborts_invalid_leaf_ptr() {
 fun key_with_internal_node_index_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    price_tree::insert(&mut tree, 8_800_000, mock(2));
+    tree.insert(5_000_000, mock(1));
+    tree.insert(8_800_000, mock(2));
 
     let bad_ptr: u64 = 0;
-    let _k = price_tree::key(&tree, bad_ptr);
+    let _k = tree.key(bad_ptr);
 
     cleanup(&mut tree, vector[5_000_000, 8_800_000]);
     teardown(scenario, tree);
@@ -510,11 +510,11 @@ fun key_with_internal_node_index_aborts_invalid_leaf_ptr() {
 fun borrow_mut_with_internal_node_index_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
 
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    price_tree::insert(&mut tree, 8_800_000, mock(2));
+    tree.insert(5_000_000, mock(1));
+    tree.insert(8_800_000, mock(2));
 
     let bad_ptr: u64 = 0;
-    let _v = price_tree::borrow_mut(&mut tree, bad_ptr);
+    let _v = tree.borrow_mut(bad_ptr);
 
     cleanup(&mut tree, vector[5_000_000, 8_800_000]);
     teardown(scenario, tree);
@@ -552,24 +552,24 @@ fun insert_order_independence_same_key_set() {
         let mut i = 0;
         while (i < order.length()) {
             let idx = order[i];
-            price_tree::insert(&mut tree, keys[idx], mock(idx));
+            tree.insert(keys[idx], mock(idx));
             i = i + 1;
         };
 
-        assert!(price_tree::size(&tree) == keys.length(), o);
+        assert!(tree.size() == keys.length(), o);
 
         // Every key is findable regardless of insertion order.
         i = 0;
         while (i < keys.length()) {
-            assert!(price_tree::find(&tree, keys[i]).is_some(), o);
+            assert!(tree.find(keys[i]).is_some(), o);
             i = i + 1;
         };
 
         // min/max are the same actual keys regardless of insertion order.
-        let min_ptr = price_tree::min_leaf(&tree).destroy_some();
-        let max_ptr = price_tree::max_leaf(&tree).destroy_some();
-        assert!(price_tree::key(&tree, min_ptr) == 1_000_000, o);
-        assert!(price_tree::key(&tree, max_ptr) == 9_900_000, o);
+        let min_ptr = tree.min_leaf().destroy_some();
+        let max_ptr = tree.max_leaf().destroy_some();
+        assert!(tree.key(min_ptr) == 1_000_000, o);
+        assert!(tree.key(max_ptr) == 9_900_000, o);
 
         cleanup(&mut tree, keys);
         teardown(scenario, tree);
@@ -594,23 +594,23 @@ fun insert_or_append_order_not_found_lands_correctly() {
     insert_via_find_or_append(&mut tree, &existing, ctx);
 
     let new_key = 3_300_000u64;
-    price_tree::insert_or_append_order(&mut tree, new_key, 100, mock_order(100), ctx);
+    tree.insert_or_append_order(new_key, 100, mock_order(100), ctx);
 
-    assert!(price_tree::size(&tree) == existing.length() + 1, 0);
-    let new_ptr = price_tree::find(&tree, new_key).destroy_some();
-    assert!(price_tree::level_contains_order(price_tree::borrow(&tree, new_ptr), 100), 1);
+    assert!(tree.size() == existing.length() + 1, 0);
+    let new_ptr = tree.find(new_key).destroy_some();
+    assert!(tree.borrow(new_ptr).level_contains_order(100), 1);
 
     // Existing keys remain findable, and min/max are unaffected (new_key is
     // strictly between the existing min and max).
     let mut i = 0;
     while (i < existing.length()) {
-        assert!(price_tree::find(&tree, existing[i]).is_some(), 2);
+        assert!(tree.find(existing[i]).is_some(), 2);
         i = i + 1;
     };
-    let min_ptr = price_tree::min_leaf(&tree).destroy_some();
-    let max_ptr = price_tree::max_leaf(&tree).destroy_some();
-    assert!(price_tree::key(&tree, min_ptr) == 2_000_000, 3);
-    assert!(price_tree::key(&tree, max_ptr) == 9_000_000, 4);
+    let min_ptr = tree.min_leaf().destroy_some();
+    let max_ptr = tree.max_leaf().destroy_some();
+    assert!(tree.key(min_ptr) == 2_000_000, 3);
+    assert!(tree.key(max_ptr) == 9_000_000, 4);
 
     let mut all_keys = existing;
     all_keys.push_back(new_key);
@@ -630,21 +630,21 @@ fun insert_or_append_order_found_appends_without_new_leaf() {
 
     let existing = vector[2_000_000u64, 5_000_000, 9_000_000];
     insert_via_find_or_append(&mut tree, &existing, ctx);
-    assert!(price_tree::size(&tree) == 3, 0);
+    assert!(tree.size() == 3, 0);
 
-    price_tree::insert_or_append_order(&mut tree, 5_000_000, 200, mock_order(200), ctx);
-    price_tree::insert_or_append_order(&mut tree, 5_000_000, 201, mock_order(201), ctx);
+    tree.insert_or_append_order(5_000_000, 200, mock_order(200), ctx);
+    tree.insert_or_append_order(5_000_000, 201, mock_order(201), ctx);
 
     // No new leaf was created for the repeated price.
-    assert!(price_tree::size(&tree) == 3, 1);
+    assert!(tree.size() == 3, 1);
 
-    let ptr = price_tree::find(&tree, 5_000_000).destroy_some();
-    let level = price_tree::borrow(&tree, ptr);
-    assert!(price_tree::level_contains_order(level, 1), 2); // original order (order_id=1)
-    assert!(price_tree::level_contains_order(level, 200), 3);
-    assert!(price_tree::level_contains_order(level, 201), 4);
+    let ptr = tree.find(5_000_000).destroy_some();
+    let level = tree.borrow(ptr);
+    assert!(level.level_contains_order(1), 2); // original order (order_id=1)
+    assert!(level.level_contains_order(200), 3);
+    assert!(level.level_contains_order(201), 4);
     // FIFO order preserved: original order stays at the front.
-    assert!(price_tree::level_front_order_id(level).destroy_some() == 1, 5);
+    assert!(level.level_front_order_id().destroy_some() == 1, 5);
 
     cleanup_levels(&mut tree, existing);
     teardown_levels(scenario, tree);
@@ -702,7 +702,7 @@ fun insert_or_append_order_regression_no_duplication_or_corruption() {
     while (j < op_prices.length()) {
         let price = op_prices[j];
         let is_new = op_is_new[j];
-        price_tree::insert_or_append_order(&mut tree, price, next_order_id, mock_order(next_order_id), ctx);
+        tree.insert_or_append_order(price, next_order_id, mock_order(next_order_id), ctx);
         if (is_new) {
             all_prices.push_back(price);
             expected.push_back(vector[next_order_id]);
@@ -716,19 +716,19 @@ fun insert_or_append_order_regression_no_duplication_or_corruption() {
         j = j + 1;
     };
 
-    assert!(price_tree::size(&tree) == all_prices.length(), 1);
+    assert!(tree.size() == all_prices.length(), 1);
     assert!(all_prices.length() == expected.length(), 5);
 
     // Every price level contains exactly the expected order ids, in FIFO
     // order, and nothing else.
     let mut k = 0;
     while (k < all_prices.length()) {
-        let ptr = price_tree::find(&tree, all_prices[k]).destroy_some();
-        let level = price_tree::borrow(&tree, ptr);
+        let ptr = tree.find(all_prices[k]).destroy_some();
+        let level = tree.borrow(ptr);
         let want = expected.borrow(k);
         let mut m = 0;
         while (m < want.length()) {
-            assert!(price_tree::level_contains_order(level, want[m]), 2);
+            assert!(level.level_contains_order(want[m]), 2);
             m = m + 1;
         };
         k = k + 1;
@@ -811,11 +811,11 @@ fun reorder_keys(keys: &vector<u64>, kind: u64): vector<u64> {
 /// corruption from insertion tends to surface here.
 fun assert_full_ascending_drain(tree: &mut PriceTree<MockLevel>, keys: &vector<u64>) {
     let n = keys.length();
-    assert!(price_tree::size(tree) == n, 0);
+    assert!(tree.size() == n, 0);
 
     let mut i = 0;
     while (i < n) {
-        assert!(price_tree::find(tree, keys[i]).is_some(), 1);
+        assert!(tree.find(keys[i]).is_some(), 1);
         i = i + 1;
     };
 
@@ -830,30 +830,30 @@ fun assert_full_ascending_drain(tree: &mut PriceTree<MockLevel>, keys: &vector<u
     let mut first = true;
     let mut remaining = n;
     while (remaining > 0) {
-        let mp = price_tree::min_leaf(tree).destroy_some();
-        let k = price_tree::key(tree, mp);
+        let mp = tree.min_leaf().destroy_some();
+        let k = tree.key(mp);
         if (!first) { assert!(k > prev, 2); };
         assert!(keys.contains(&k), 3);
-        assert!(price_tree::key(tree, price_tree::max_leaf(tree).destroy_some()) == hi, 4);
-        let _v = price_tree::remove(tree, mp);
+        assert!(tree.key(tree.max_leaf().destroy_some()) == hi, 4);
+        let _v = tree.remove(mp);
         prev = k;
         first = false;
         remaining = remaining - 1;
-        assert!(price_tree::size(tree) == remaining, 5);
+        assert!(tree.size() == remaining, 5);
     };
-    assert!(price_tree::min_leaf(tree).is_none(), 6);
-    assert!(price_tree::max_leaf(tree).is_none(), 7);
+    assert!(tree.min_leaf().is_none(), 6);
+    assert!(tree.max_leaf().is_none(), 7);
 }
 
 /// `assert_full_ascending_drain`'s counterpart for the `PriceLevel`-typed
 /// tree used by `insert_or_append_order` tests below.
 fun assert_full_ascending_drain_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC>>, keys: &vector<u64>) {
     let n = keys.length();
-    assert!(price_tree::size(tree) == n, 0);
+    assert!(tree.size() == n, 0);
 
     let mut i = 0;
     while (i < n) {
-        assert!(price_tree::find(tree, keys[i]).is_some(), 1);
+        assert!(tree.find(keys[i]).is_some(), 1);
         i = i + 1;
     };
 
@@ -868,20 +868,20 @@ fun assert_full_ascending_drain_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC
     let mut first = true;
     let mut remaining = n;
     while (remaining > 0) {
-        let mp = price_tree::min_leaf(tree).destroy_some();
-        let k = price_tree::key(tree, mp);
+        let mp = tree.min_leaf().destroy_some();
+        let k = tree.key(mp);
         if (!first) { assert!(k > prev, 2); };
         assert!(keys.contains(&k), 3);
-        assert!(price_tree::key(tree, price_tree::max_leaf(tree).destroy_some()) == hi, 4);
-        let level = price_tree::remove(tree, mp);
+        assert!(tree.key(tree.max_leaf().destroy_some()) == hi, 4);
+        let level = tree.remove(mp);
         destroy_level(level);
         prev = k;
         first = false;
         remaining = remaining - 1;
-        assert!(price_tree::size(tree) == remaining, 5);
+        assert!(tree.size() == remaining, 5);
     };
-    assert!(price_tree::min_leaf(tree).is_none(), 6);
-    assert!(price_tree::max_leaf(tree).is_none(), 7);
+    assert!(tree.min_leaf().is_none(), 6);
+    assert!(tree.max_leaf().is_none(), 7);
 }
 
 /// Strengthens `insert_order_independence_same_key_set` above: inserts a
@@ -912,7 +912,7 @@ fun order_independence_full_drain_across_orderings_and_entry_points() {
         let (scenario, mut tree) = setup();
         let mut i = 0;
         while (i < order.length()) {
-            price_tree::insert(&mut tree, order[i], mock(i));
+            tree.insert(order[i], mock(i));
             i = i + 1;
         };
         assert_full_ascending_drain(&mut tree, &base);
@@ -953,23 +953,23 @@ fun insert_bulk_random_matches_sorted_reference() {
         let keys = prng_keys(120, seed * 7919);
         let mut i = 0;
         while (i < keys.length()) {
-            price_tree::insert(&mut tree, keys[i], mock(keys[i]));
+            tree.insert(keys[i], mock(keys[i]));
             i = i + 1;
         };
-        assert!(price_tree::size(&tree) == keys.length(), 0);
+        assert!(tree.size() == keys.length(), 0);
 
         // Every inserted key must be findable at a leaf carrying that key.
         let mut j = 0;
         while (j < keys.length()) {
-            let ptr = price_tree::find(&tree, keys[j]).destroy_some();
-            assert!(price_tree::key(&tree, ptr) == keys[j], 1);
+            let ptr = tree.find(keys[j]).destroy_some();
+            assert!(tree.key(ptr) == keys[j], 1);
             j = j + 1;
         };
 
         let want = sorted(&keys);
-        assert!(price_tree::key(&tree, price_tree::min_leaf(&tree).destroy_some()) == want[0], 2);
+        assert!(tree.key(tree.min_leaf().destroy_some()) == want[0], 2);
         assert!(
-            price_tree::key(&tree, price_tree::max_leaf(&tree).destroy_some())
+            tree.key(tree.max_leaf().destroy_some())
                 == want[want.length() - 1],
             3,
         );
@@ -999,7 +999,7 @@ fun insert_or_append_order_matches_plain_insert_differential() {
         let (scenario1, mut ref_tree) = setup();
         let mut i = 0;
         while (i < keys.length()) {
-            price_tree::insert(&mut ref_tree, keys[i], mock(keys[i]));
+            ref_tree.insert(keys[i], mock(keys[i]));
             i = i + 1;
         };
         let ref_drain = drain_ascending(&mut ref_tree);
@@ -1011,10 +1011,10 @@ fun insert_or_append_order_matches_plain_insert_differential() {
         let mut j = 0;
         while (j < keys.length()) {
             let k = keys[j];
-            price_tree::insert_or_append_order(&mut tree, k, j, mock_order(j), ctx);
+            tree.insert_or_append_order(k, j, mock_order(j), ctx);
             j = j + 1;
         };
-        assert!(price_tree::size(&tree) == keys.length(), 1);
+        assert!(tree.size() == keys.length(), 1);
         let got = drain_ascending_levels(&mut tree);
         assert!(got == ref_drain, 2);
         teardown_levels(scenario2, tree);
@@ -1044,21 +1044,21 @@ fun mixed_insert_paths_with_removals_stay_consistent() {
         if (i % 2 == 0) {
             insert_plain_level(&mut tree, k, i, ctx);
         } else {
-            price_tree::insert_or_append_order(&mut tree, k, i, mock_order(i), ctx);
+            tree.insert_or_append_order(k, i, mock_order(i), ctx);
         };
         live.push_back(k);
 
         // Every third step, remove the current minimum.
         if (i % 3 == 2) {
-            let ptr = price_tree::min_leaf(&tree).destroy_some();
-            let mk = price_tree::key(&tree, ptr);
-            let level = price_tree::remove(&mut tree, ptr);
+            let ptr = tree.min_leaf().destroy_some();
+            let mk = tree.key(ptr);
+            let level = tree.remove(ptr);
             destroy_level(level);
             let (found, idx) = live.index_of(&mk);
             assert!(found, 0);
             live.remove(idx);
         };
-        assert!(price_tree::size(&tree) == live.length(), 1);
+        assert!(tree.size() == live.length(), 1);
         i = i + 1;
     };
 
@@ -1090,8 +1090,8 @@ const NO_PARENT_FOR_TESTING: u64 = 0x8000000000000000;
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun remove_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    let _v = price_tree::remove(&mut tree, NO_PARENT_FOR_TESTING);
+    tree.insert(5_000_000, mock(1));
+    let _v = tree.remove(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
     teardown(scenario, tree);
 }
@@ -1100,8 +1100,8 @@ fun remove_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    let _v = price_tree::borrow(&tree, NO_PARENT_FOR_TESTING);
+    tree.insert(5_000_000, mock(1));
+    let _v = tree.borrow(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
     teardown(scenario, tree);
 }
@@ -1110,8 +1110,8 @@ fun borrow_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_mut_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    let _v = price_tree::borrow_mut(&mut tree, NO_PARENT_FOR_TESTING);
+    tree.insert(5_000_000, mock(1));
+    let _v = tree.borrow_mut(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
     teardown(scenario, tree);
 }
@@ -1120,8 +1120,8 @@ fun borrow_mut_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun key_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
     let (mut scenario, mut tree) = setup();
-    price_tree::insert(&mut tree, 5_000_000, mock(1));
-    let _k = price_tree::key(&tree, NO_PARENT_FOR_TESTING);
+    tree.insert(5_000_000, mock(1));
+    let _k = tree.key(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
     teardown(scenario, tree);
 }
@@ -1135,15 +1135,15 @@ fun setup(): (ts::Scenario, PriceTree<MockLevel>) {
 }
 
 fun teardown(scenario: ts::Scenario, tree: PriceTree<MockLevel>) {
-    price_tree::destroy_empty(tree);
+    tree.destroy_empty();
     scenario.end();
 }
 
 fun cleanup(tree: &mut PriceTree<MockLevel>, keys: vector<u64>) {
     let mut i = 0;
     while (i < keys.length()) {
-        let ptr = price_tree::find(tree, keys[i]).destroy_some();
-        let _v = price_tree::remove(tree, ptr);
+        let ptr = tree.find(keys[i]).destroy_some();
+        let _v = tree.remove(ptr);
         i = i + 1;
     };
 }
@@ -1186,11 +1186,11 @@ fun prng_keys(n: u64, seed: u64): vector<u64> {
 fun drain_ascending(tree: &mut PriceTree<MockLevel>): vector<u64> {
     let mut out: vector<u64> = vector[];
     loop {
-        let m = price_tree::min_leaf(tree);
+        let m = tree.min_leaf();
         if (m.is_none()) { m.destroy_none(); break };
         let ptr = m.destroy_some();
-        out.push_back(price_tree::key(tree, ptr));
-        let MockLevel { orders: _ } = price_tree::remove(tree, ptr);
+        out.push_back(tree.key(ptr));
+        let MockLevel { orders: _ } = tree.remove(ptr);
     };
     out
 }

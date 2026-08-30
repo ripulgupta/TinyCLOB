@@ -105,7 +105,7 @@ public(package) fun new<Base, Quote>(
     maker_fee_bps: u64,
 ): Order<Base, Quote> {
     let total_reserved = if (escrow_quote.is_some()) {
-        balance::value(escrow_quote.borrow())
+        escrow_quote.borrow().value()
     } else {
         0
     };
@@ -134,11 +134,11 @@ public(package) fun decrease_remaining_size<Base, Quote>(o: &mut Order<Base, Quo
 }
 
 public(package) fun split_escrow_base<Base, Quote>(o: &mut Order<Base, Quote>, amount: u64): Balance<Base> {
-    balance::split(o.escrow_base.borrow_mut(), amount)
+    o.escrow_base.borrow_mut().split(amount)
 }
 
 public(package) fun split_escrow_quote<Base, Quote>(o: &mut Order<Base, Quote>, amount: u64): Balance<Quote> {
-    balance::split(o.escrow_quote.borrow_mut(), amount)
+    o.escrow_quote.borrow_mut().split(amount)
 }
 
 public(package) fun set_owner<Base, Quote>(o: &mut Order<Base, Quote>, new_owner: address) {
@@ -175,7 +175,7 @@ public(package) fun total_reserved<Base, Quote>(o: &Order<Base, Quote>): u64 { o
 /// bid-side order this is the ground truth used to derive how much has
 /// already been charged so far: `total_reserved(o) - escrow_quote_value(o)`.
 public(package) fun escrow_quote_value<Base, Quote>(o: &Order<Base, Quote>): u64 {
-    if (o.escrow_quote.is_some()) balance::value(o.escrow_quote.borrow()) else 0
+    if (o.escrow_quote.is_some()) o.escrow_quote.borrow().value() else 0
 }
 
 /// See the `fee_basis_accumulated` field doc comment.

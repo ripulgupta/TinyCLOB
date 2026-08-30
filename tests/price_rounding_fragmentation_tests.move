@@ -64,10 +64,10 @@ fun rest_n_fragmented_asks(book: &mut OrderBook<BTC, USDC>, n: u64, ctx: &mut Tx
     while (i < n) {
         let payment = coin::mint_for_testing<BTC>(1, ctx);
         let (ticket_opt, leftover_base, matched_quote, _stopped) =
-            tiny_clob::place_limit_order_ask(book, PRICE, 1, payment, MAX_FILLS, ctx);
-        coin::burn_for_testing(leftover_base);
-        coin::burn_for_testing(matched_quote);
-        tickets.push_back(option::destroy_some(ticket_opt));
+            book.place_limit_order_ask(PRICE, 1, payment, MAX_FILLS, ctx);
+        leftover_base.burn_for_testing();
+        matched_quote.burn_for_testing();
+        tickets.push_back(ticket_opt.destroy_some());
         i = i + 1;
     };
     tickets
@@ -98,24 +98,24 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
     scenario.next_tx(maker_a());
     let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
     let (ask_ticket_opt, ask_leftover_base, ask_matched_quote, _) =
-        tiny_clob::place_limit_order_ask(&mut book_a, PRICE, 100, ask_payment, MAX_FILLS, scenario.ctx());
-    coin::burn_for_testing(ask_leftover_base);
-    coin::burn_for_testing(ask_matched_quote);
-    let ask_ticket = option::destroy_some(ask_ticket_opt);
+        book_a.place_limit_order_ask(PRICE, 100, ask_payment, MAX_FILLS, scenario.ctx());
+    ask_leftover_base.burn_for_testing();
+    ask_matched_quote.burn_for_testing();
+    let ask_ticket = ask_ticket_opt.destroy_some();
 
     scenario.next_tx(taker());
     let bid_payment_a = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_a, leftover_quote_a, stopped_a) = tiny_clob::place_market_order_bid(
-        &mut book_a, 100, BUDGET, bid_payment_a, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
+    let (matched_base_a, leftover_quote_a, stopped_a) = book_a.place_market_order_bid(
+        100, BUDGET, bid_payment_a, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped_a, 0);
-    let base_received_a = coin::burn_for_testing(matched_base_a);
-    let leftover_a = coin::burn_for_testing(leftover_quote_a);
+    let base_received_a = matched_base_a.burn_for_testing();
+    let leftover_a = leftover_quote_a.burn_for_testing();
     let quote_spent_a = BUDGET - leftover_a;
     assert!(base_received_a == 100, 1);
     assert!(quote_spent_a == 49_700, 2);
 
-    tiny_clob::destroy_ticket_unconditionally(ask_ticket);
+    ask_ticket.destroy_ticket_unconditionally();
     destroy_book_and_cap(book_a, cap_a);
 
     // Case B: 100 separate 1-unit asks at the identical price, fresh book.
@@ -125,12 +125,12 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
 
     scenario.next_tx(taker());
     let bid_payment_b = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_b, leftover_quote_b, stopped_b) = tiny_clob::place_market_order_bid(
-        &mut book_b, 100, BUDGET, bid_payment_b, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
+    let (matched_base_b, leftover_quote_b, stopped_b) = book_b.place_market_order_bid(
+        100, BUDGET, bid_payment_b, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped_b, 3);
-    let base_received_b = coin::burn_for_testing(matched_base_b);
-    let leftover_b = coin::burn_for_testing(leftover_quote_b);
+    let base_received_b = matched_base_b.burn_for_testing();
+    let leftover_b = leftover_quote_b.burn_for_testing();
     let quote_spent_b = BUDGET - leftover_b;
     assert!(base_received_b == 100, 4); // identical Base delivered to case A
     assert!(quote_spent_b == 49_700, 5);
@@ -140,7 +140,7 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
     assert!(quote_spent_b == quote_spent_a, 6);
 
     while (!ask_tickets_b.is_empty()) {
-        tiny_clob::destroy_ticket_unconditionally(ask_tickets_b.pop_back());
+        ask_tickets_b.pop_back().destroy_ticket_unconditionally();
     };
     ask_tickets_b.destroy_empty();
     destroy_book_and_cap(book_b, cap_b);
@@ -174,29 +174,29 @@ fun limit_bid_no_longer_underfills_against_fragmented_book_with_exact_escrow() {
     let mut ask_tickets = rest_n_fragmented_asks(&mut book, 100, scenario.ctx());
 
     scenario.next_tx(taker());
-    let escrow = tiny_clob::bid_escrow_amount(&book, PRICE, 100);
+    let escrow = book.bid_escrow_amount(PRICE, 100);
     assert!(escrow == 49_701, 0);
 
     let payment = coin::mint_for_testing<USDC>(escrow, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        tiny_clob::place_limit_order_bid(&mut book, PRICE, 100, payment, MAX_FILLS, scenario.ctx());
+        book.place_limit_order_bid(PRICE, 100, payment, MAX_FILLS, scenario.ctx());
     assert!(!stopped, 1);
 
-    let base_received = coin::burn_for_testing(matched_base);
+    let base_received = matched_base.burn_for_testing();
     assert!(base_received == 100, 2); // now fills completely, unlike before the fix
 
-    let leftover = coin::burn_for_testing(leftover_quote);
+    let leftover = leftover_quote.burn_for_testing();
     assert!(leftover == 1, 3); // 49_701 - (497 * 100) = 1 atom of dust, nothing stranded
 
     // Fully filled, so no resting remainder -- the order never rests.
     if (ticket_opt.is_some()) {
-        tiny_clob::destroy_ticket_unconditionally(option::destroy_some(ticket_opt));
+        ticket_opt.destroy_some().destroy_ticket_unconditionally();
     } else {
-        option::destroy_none(ticket_opt);
+        ticket_opt.destroy_none();
     };
 
     while (!ask_tickets.is_empty()) {
-        tiny_clob::destroy_ticket_unconditionally(ask_tickets.pop_back());
+        ask_tickets.pop_back().destroy_ticket_unconditionally();
     };
     ask_tickets.destroy_empty();
 

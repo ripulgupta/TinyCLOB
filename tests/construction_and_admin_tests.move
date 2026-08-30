@@ -49,13 +49,13 @@ fun generate_one_fee_bearing_fill(
 
     // This bid crosses the resting ask above at the same price/size, so it
     // fully fills and never rests: the returned ticket option is `none`.
-    let quote_cost = tiny_clob::bid_escrow_amount(book, FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE);
+    let quote_cost = book.bid_escrow_amount(FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE);
     let payment = coin::mint_for_testing<USDC>(quote_cost, scenario.ctx());
     let (bid_ticket_opt, matched_base, leftover_quote, _) =
-        tiny_clob::place_limit_order_bid(book, FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE, payment, 1_000_000_000, scenario.ctx());
-    option::destroy_none(bid_ticket_opt);
-    coin::burn_for_testing(matched_base);
-    coin::burn_for_testing(leftover_quote);
+        book.place_limit_order_bid(FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE, payment, 1_000_000_000, scenario.ctx());
+    bid_ticket_opt.destroy_none();
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
 
     let taker_fee_base = (FINALIZE_FEES_SIZE * taker_fee_bps) / 10_000;
     let maker_fee_quote = (quote_cost * maker_fee_bps) / 10_000;
@@ -67,10 +67,10 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
 
-    assert!(tiny_clob::min_size(&book) == min_size(), 1);
-    assert!(!tiny_clob::is_paused(&book), 2);
-    assert!(tiny_clob::clob_admin_cap_id_for_testing(&book) == tiny_clob::cap_id_for_testing(&cap), 3);
-    let (taker_bps, maker_bps) = tiny_clob::fee_config(&book);
+    assert!(book.min_size() == min_size(), 1);
+    assert!(!book.is_paused(), 2);
+    assert!(book.clob_admin_cap_id_for_testing() == cap.cap_id_for_testing(), 3);
+    let (taker_bps, maker_bps) = book.fee_config();
     assert!(taker_bps == 0, 4);
     assert!(maker_bps == 0, 5);
 
@@ -100,7 +100,7 @@ fun new_min_size_too_large_aborts() {
 fun new_size_at_max_boundary_succeeds() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size(), 0, 0, 0, 19, 1, scenario.ctx());
-    assert!(tiny_clob::min_size(&book) == max_min_size(), 0);
+    assert!(book.min_size() == max_min_size(), 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -111,12 +111,12 @@ fun two_books_identical_types_fully_independent_construction() {
     let (mut book1, cap1) = new_book(&mut scenario);
     let (mut book2, cap2) = new_book(&mut scenario);
 
-    assert!(tiny_clob::id_for_testing(&book1) != tiny_clob::id_for_testing(&book2), 0);
-    assert!(tiny_clob::cap_id_for_testing(&cap1) != tiny_clob::cap_id_for_testing(&cap2), 1);
+    assert!(book1.id_for_testing() != book2.id_for_testing(), 0);
+    assert!(cap1.cap_id_for_testing() != cap2.cap_id_for_testing(), 1);
 
-    tiny_clob::clob_admin_set_taker_fee(&cap1, &mut book1, 5);
-    let (taker1, _) = tiny_clob::fee_config(&book1);
-    let (taker2, _) = tiny_clob::fee_config(&book2);
+    cap1.clob_admin_set_taker_fee(&mut book1, 5);
+    let (taker1, _) = book1.fee_config();
+    let (taker2, _) = book2.fee_config();
     assert!(taker1 == 5, 2);
     assert!(taker2 == 0, 3);
 
@@ -129,7 +129,7 @@ fun two_books_identical_types_fully_independent_construction() {
 fun clob_admin_cap_store_and_discard() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = tiny_clob::id_for_testing(&book);
+    let book_id = book.id_for_testing();
 
     // Demonstrates `store`-ability directly: holds the cap as a plain
     // field of a test-only wrapper struct.
@@ -137,23 +137,21 @@ fun clob_admin_cap_store_and_discard() {
     let CapHolder { id, cap } = holder;
     id.delete();
 
-    let cap_id = tiny_clob::cap_id_for_testing(&cap);
+    let cap_id = cap.cap_id_for_testing();
 
     // The cap can now only be destroyed by consuming it inside
     // `clob_admin_finalize` — there is no standalone discard function
     // anymore. Run a full retire -> drain -> clob_admin_finalize sequence and
     // confirm `ClobAdminCapDiscarded` fires from inside `clob_admin_finalize`
     // with the correct `cap_id`/`for_book`.
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+    let deleted_id = cap.clob_admin_finalize(book);
     assert!(deleted_id == book_id, 3);
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
     assert!(discarded_events.length() == 1, 0);
-    let (event_cap_id, event_for_book) = tiny_clob::clob_admin_cap_discarded_fields_for_testing(
-        &discarded_events[0],
-    );
+    let (event_cap_id, event_for_book) = discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
     assert!(event_cap_id == cap_id, 1);
     assert!(event_for_book == book_id, 2);
 
@@ -164,14 +162,14 @@ fun clob_admin_cap_store_and_discard() {
 fun version_guard_view_functions_do_not_abort_on_stale_version() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_book_version_for_testing(&mut book, 999);
+    book.set_book_version_for_testing(999);
 
     // The five pure-read view functions never assert the version guard.
-    let (_taker, _maker) = tiny_clob::fee_config(&book);
-    let (_base, _quote) = tiny_clob::fee_accumulator_balances(&book);
-    let _ = tiny_clob::is_book_paused(&book);
-    let _ = tiny_clob::best_bid(&book);
-    let _ = tiny_clob::best_ask(&book);
+    let (_taker, _maker) = book.fee_config();
+    let (_base, _quote) = book.fee_accumulator_balances();
+    let _ = book.is_book_paused();
+    let _ = book.best_bid();
+    let _ = book.best_ask();
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -185,8 +183,8 @@ fun version_guard_pause_aborts_on_future_version() {
     // `assert_book_version` still refuses to silently paper over.
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_book_version_for_testing(&mut book, 999);
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    book.set_book_version_for_testing(999);
+    cap.clob_admin_pause_book(&mut book);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -195,18 +193,18 @@ fun version_guard_pause_aborts_on_future_version() {
 fun version_auto_upgrades_when_stale_lower_than_current() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = tiny_clob::id_for_testing(&book);
-    tiny_clob::set_book_version_for_testing(&mut book, 0);
+    let book_id = book.id_for_testing();
+    book.set_book_version_for_testing(0);
     // No explicit migration call needed — any ordinary version-guarded
     // function transparently upgrades the book's stored version in place,
     // and emits a BookVersionUpgraded observability event at the moment of
     // the bump.
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
-    assert!(tiny_clob::book_version(&book) == 1, 0);
+    cap.clob_admin_pause_book(&mut book);
+    assert!(book.book_version() == 1, 0);
 
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 1, 1);
-    let (ev_book_id, ev_from, ev_to) = tiny_clob::book_version_upgraded_fields_for_testing(&upgraded_events[0]);
+    let (ev_book_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
     assert!(ev_book_id == book_id, 2);
     assert!(ev_from == 0, 3);
     assert!(ev_to == 1, 4);
@@ -221,7 +219,7 @@ fun version_auto_upgrades_when_stale_lower_than_current() {
 fun version_already_current_emits_no_upgrade_event() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    cap.clob_admin_pause_book(&mut book);
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 0, 0);
     destroy_book_and_cap(book, cap);
@@ -232,11 +230,11 @@ fun version_already_current_emits_no_upgrade_event() {
 fun fee_setters_bounds_and_events() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = tiny_clob::id_for_testing(&book);
+    let book_id = book.id_for_testing();
 
-    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, 10);
-    tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, 5);
-    let (taker, maker) = tiny_clob::fee_config(&book);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+    let (taker, maker) = book.fee_config();
     assert!(taker == 10, 0);
     assert!(maker == 5, 1);
 
@@ -244,7 +242,7 @@ fun fee_setters_bounds_and_events() {
     let maker_events = event::events_by_type<tiny_clob::MakerFeeSet>();
     assert!(taker_events.length() == 1, 2);
     assert!(maker_events.length() == 1, 3);
-    let (ev_book, ev_rate) = tiny_clob::taker_fee_set_fields_for_testing(&taker_events[0]);
+    let (ev_book, ev_rate) = taker_events[0].taker_fee_set_fields_for_testing();
     assert!(ev_book == book_id, 4);
     assert!(ev_rate == 10, 5);
 
@@ -257,7 +255,7 @@ fun fee_setters_bounds_and_events() {
 fun drain_step_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -267,7 +265,7 @@ fun drain_step_before_retire_aborts() {
 fun finalize_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    let deleted_id = cap.clob_admin_finalize(book);
     sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
@@ -281,11 +279,11 @@ fun finalize_rejects_wrong_cap() {
     let mut scenario = ts::begin(admin());
     let (book1, _cap1) = new_book(&mut scenario);
     let (mut book2, cap2) = new_book(&mut scenario);
-    tiny_clob::clob_admin_retire(&cap2, &mut book2);
-    tiny_clob::clob_admin_drain_step(&cap2, &mut book2, 10, scenario.ctx());
+    cap2.clob_admin_retire(&mut book2);
+    cap2.clob_admin_drain_step(&mut book2, 10, scenario.ctx());
 
     // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap.
-    let deleted_id = tiny_clob::clob_admin_finalize(cap2, book1);
+    let deleted_id = cap2.clob_admin_finalize(book1);
     sui::test_utils::destroy(deleted_id);
     sui::test_utils::destroy(book2);
     sui::test_utils::destroy(_cap1);
@@ -300,13 +298,13 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let order_id = tiny_clob::next_order_id(&mut book);
+    let order_id = book.next_order_id();
     let escrow = balance::create_for_testing<USDC>(price * size);
     let order = order::new<BTC, USDC>(order_id, other(), size, option::none(), option::some(escrow), 0);
-    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
+    book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    cap.clob_admin_retire(&mut book);
+    let deleted_id = cap.clob_admin_finalize(book);
     sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
@@ -318,26 +316,26 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let order_id = tiny_clob::next_order_id(&mut book);
+    let order_id = book.next_order_id();
     let escrow = balance::create_for_testing<USDC>(price * size);
     let order = order::new<BTC, USDC>(order_id, other(), size, option::none(), option::some(escrow), 0);
-    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
+    book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
+    cap.clob_admin_retire(&mut book);
     let retired_events = event::events_by_type<tiny_clob::OrderBookRetired>();
     assert!(retired_events.length() == 1, 0);
 
     // Repeatable, bounded max_items — one call with max_items = 0 is a no-op.
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 0, scenario.ctx());
-    assert!(tiny_clob::bids_size_for_testing(&book) == 1, 1);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
-    assert!(tiny_clob::bids_size_for_testing(&book) == 0, 2);
+    cap.clob_admin_drain_step(&mut book, 0, scenario.ctx());
+    assert!(book.bids_size_for_testing() == 1, 1);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+    assert!(book.bids_size_for_testing() == 0, 2);
 
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 3);
     let (deleted_order_book_id, deleted_base, deleted_quote) =
-        tiny_clob::order_book_deleted_fields_for_testing(&deleted_events[0]);
+        deleted_events[0].order_book_deleted_fields_for_testing();
     assert!(deleted_order_book_id == deleted_id, 4);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 40);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 41);
@@ -357,28 +355,28 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
 fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let override_id = object::uid_to_inner(&wrapper_uid);
+    let override_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
         min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
     );
 
-    let true_book_id = tiny_clob::id_for_testing(&book);
+    let true_book_id = book.id_for_testing();
     assert!(true_book_id != override_id, 0);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
 
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    let deleted_id = cap.clob_admin_finalize(book);
     assert!(deleted_id == true_book_id, 1);
 
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 2);
     let (deleted_order_book_id, _, _) =
-        tiny_clob::order_book_deleted_fields_for_testing(&deleted_events[0]);
+        deleted_events[0].order_book_deleted_fields_for_testing();
     assert!(deleted_order_book_id == override_id, 3);
     assert!(deleted_order_book_id != deleted_id, 4);
 
-    object::delete(wrapper_uid);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -391,34 +389,34 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
 fun book_version_upgraded_and_cap_discarded_stamp_event_id_override_not_true_id() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let override_id = object::uid_to_inner(&wrapper_uid);
+    let override_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
         min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
     );
-    let true_book_id = tiny_clob::id_for_testing(&book);
+    let true_book_id = book.id_for_testing();
     assert!(true_book_id != override_id, 0);
 
-    tiny_clob::set_book_version_for_testing(&mut book, 0);
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
+    book.set_book_version_for_testing(0);
+    cap.clob_admin_pause_book(&mut book);
 
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 1, 1);
-    let (ev_book_id, _, _) = tiny_clob::book_version_upgraded_fields_for_testing(&upgraded_events[0]);
+    let (ev_book_id, _, _) = upgraded_events[0].book_version_upgraded_fields_for_testing();
     assert!(ev_book_id == override_id, 2);
     assert!(ev_book_id != true_book_id, 3);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+    let deleted_id = cap.clob_admin_finalize(book);
     assert!(deleted_id == true_book_id, 4);
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
     assert!(discarded_events.length() == 1, 5);
-    let (_, ev_for_book) = tiny_clob::clob_admin_cap_discarded_fields_for_testing(&discarded_events[0]);
+    let (_, ev_for_book) = discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
     assert!(ev_for_book == override_id, 6);
     assert!(ev_for_book != true_book_id, 7);
 
-    object::delete(wrapper_uid);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -426,18 +424,18 @@ fun book_version_upgraded_and_cap_discarded_stamp_event_id_override_not_true_id(
 fun finalize_aborts_when_fee_accumulator_nonzero() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, 10);
-    tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, 5);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
 
     let (fee_base, _fee_quote) = generate_one_fee_bearing_fill(&mut scenario, &mut book, 10, 5);
     assert!(fee_base > 0, 0);
-    let (fee_base_bal, _) = tiny_clob::fee_accumulator_balances(&book);
+    let (fee_base_bal, _) = book.fee_accumulator_balances();
     assert!(fee_base_bal == fee_base, 1);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
     // Fee accumulator is still nonzero (never claimed) — this aborts.
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    let deleted_id = cap.clob_admin_finalize(book);
 
     sui::test_utils::destroy(deleted_id);
     scenario.end();
@@ -447,27 +445,27 @@ fun finalize_aborts_when_fee_accumulator_nonzero() {
 fun finalize_succeeds_after_fees_claimed() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, 10);
-    tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, 5);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
 
     let (fee_base, fee_quote) = generate_one_fee_bearing_fill(&mut scenario, &mut book, 10, 5);
     assert!(fee_base > 0, 0);
 
     // Claim first: drains the accumulator to (0, 0) before clob_admin_finalize.
-    let (base_coin, quote_coin) = tiny_clob::clob_admin_claim_fees(&cap, &mut book, scenario.ctx());
-    assert!(coin::burn_for_testing(base_coin) == fee_base, 1);
-    assert!(coin::burn_for_testing(quote_coin) == fee_quote, 2);
-    let (fee_base_after, fee_quote_after) = tiny_clob::fee_accumulator_balances(&book);
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == fee_base, 1);
+    assert!(quote_coin.burn_for_testing() == fee_quote, 2);
+    let (fee_base_after, fee_quote_after) = book.fee_accumulator_balances();
     assert!(fee_base_after == 0, 3);
     assert!(fee_quote_after == 0, 4);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
+    let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 5);
     let (deleted_order_book_id, deleted_base, deleted_quote) =
-        tiny_clob::order_book_deleted_fields_for_testing(&deleted_events[0]);
+        deleted_events[0].order_book_deleted_fields_for_testing();
     assert!(deleted_order_book_id == deleted_id, 6);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 60);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 61);
@@ -489,10 +487,10 @@ fun unpause_after_retire_aborts_with_ebookretiring() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
+    cap.clob_admin_retire(&mut book);
     // Retiring is sticky and irreversible: unpausing a retiring book must
     // abort instead of un-retiring it.
-    tiny_clob::clob_admin_unpause_book(&cap, &mut book);
+    cap.clob_admin_unpause_book(&mut book);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -503,14 +501,14 @@ fun drain_step_remains_callable_after_failed_unpause_attempt() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    tiny_clob::clob_admin_retire(&cap, &mut book);
+    cap.clob_admin_retire(&mut book);
     // An unpause attempt against a retiring book aborts before mutating
     // anything (see unpause_after_retire_aborts_with_ebookretiring above),
     // so `retiring` stays sticky regardless of any such attempt —
     // clob_admin_drain_step remains callable exactly as if no unpause had
     // ever been attempted.
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
-    assert!(tiny_clob::is_book_retiring(&book), 0);
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
+    assert!(book.is_book_retiring(), 0);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -528,16 +526,16 @@ fun drain_step_aborts_when_only_paused_not_retiring() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let order_id = tiny_clob::next_order_id(&mut book);
+    let order_id = book.next_order_id();
     let escrow = balance::create_for_testing<USDC>(price * size);
     let order = order::new<BTC, USDC>(order_id, other(), size, option::none(), option::some(escrow), 0);
-    tiny_clob::insert_resting_order_for_testing(&mut book, true, price, order, scenario.ctx());
+    book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
 
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
-    assert!(tiny_clob::is_paused(&book), 0);
-    assert!(!tiny_clob::is_book_retiring(&book), 1);
+    cap.clob_admin_pause_book(&mut book);
+    assert!(book.is_paused(), 0);
+    assert!(!book.is_book_retiring(), 1);
     // Plain pause alone must not unlock draining.
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 10, scenario.ctx());
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -548,7 +546,7 @@ fun drain_step_aborts_when_only_paused_not_retiring() {
 fun taker_fee_above_bound_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, 11);
+    cap.clob_admin_set_taker_fee(&mut book, 11);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -558,7 +556,7 @@ fun taker_fee_above_bound_aborts() {
 fun maker_fee_above_bound_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, 6);
+    cap.clob_admin_set_maker_fee(&mut book, 6);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -570,21 +568,20 @@ fun claim_fees_drains_full_accumulator() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    tiny_clob::credit_fee_accumulator_for_testing(
-        &mut book,
+    book.credit_fee_accumulator_for_testing(
         balance::create_for_testing<BTC>(base_amount),
         balance::create_for_testing<USDC>(quote_amount),
     );
 
-    let (before_base, before_quote) = tiny_clob::fee_accumulator_balances(&book);
+    let (before_base, before_quote) = book.fee_accumulator_balances();
     assert!(before_base == base_amount, 0);
     assert!(before_quote == quote_amount, 1);
 
-    let (base_coin, quote_coin) = tiny_clob::clob_admin_claim_fees(&cap, &mut book, scenario.ctx());
-    assert!(coin::burn_for_testing(base_coin) == base_amount, 2);
-    assert!(coin::burn_for_testing(quote_coin) == quote_amount, 3);
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == base_amount, 2);
+    assert!(quote_coin.burn_for_testing() == quote_amount, 3);
 
-    let (after_base, after_quote) = tiny_clob::fee_accumulator_balances(&book);
+    let (after_base, after_quote) = book.fee_accumulator_balances();
     assert!(after_base == 0, 4);
     assert!(after_quote == 0, 5);
 
@@ -599,9 +596,9 @@ fun claim_fees_drains_full_accumulator() {
 fun claim_fees_zero_balance_emits_no_event() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let (base_coin, quote_coin) = tiny_clob::clob_admin_claim_fees(&cap, &mut book, scenario.ctx());
-    assert!(coin::burn_for_testing(base_coin) == 0, 0);
-    assert!(coin::burn_for_testing(quote_coin) == 0, 1);
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == 0, 0);
+    assert!(quote_coin.burn_for_testing() == 0, 1);
     let claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
     assert!(claimed_events.length() == 0, 2);
     destroy_book_and_cap(book, cap);
@@ -614,9 +611,9 @@ fun claim_fees_rejects_wrong_cap() {
     let mut scenario = ts::begin(admin());
     let (mut book1, _cap1) = new_book(&mut scenario);
     let (book2, cap2) = new_book(&mut scenario);
-    let (base_coin, quote_coin) = tiny_clob::clob_admin_claim_fees(&cap2, &mut book1, scenario.ctx());
-    coin::burn_for_testing(base_coin);
-    coin::burn_for_testing(quote_coin);
+    let (base_coin, quote_coin) = cap2.clob_admin_claim_fees(&mut book1, scenario.ctx());
+    base_coin.burn_for_testing();
+    quote_coin.burn_for_testing();
     sui::test_utils::destroy(book1);
     sui::test_utils::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);

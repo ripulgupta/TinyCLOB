@@ -20,8 +20,8 @@ use tiny_clob::test_utils::{
 fun price_band_factor_just_inside_band_succeeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     // band: [1000/2, 1000*2] = [500, 2000]
     let low_ticket = rest_bid(&mut book, 500, min_size(), 10, scenario.ctx());
     let high_ticket = rest_bid(&mut book, 2000, min_size(), 10, scenario.ctx());
@@ -36,8 +36,8 @@ fun price_band_factor_just_inside_band_succeeds() {
 fun price_band_factor_just_outside_band_below_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     let ticket = rest_bid(&mut book, 499, min_size(), 10, scenario.ctx()); // just below the [500, 2000] band
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -49,8 +49,8 @@ fun price_band_factor_just_outside_band_below_aborts() {
 fun price_band_factor_just_outside_band_above_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     let ticket = rest_bid(&mut book, 2001, min_size(), 10, scenario.ctx()); // just above the [500, 2000] band
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
@@ -61,8 +61,8 @@ fun price_band_factor_just_outside_band_above_aborts() {
 fun set_last_price_empty_book_is_unconstrained() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 12_345, 0);
+    book.set_last_price(12_345, scenario.ctx());
+    assert!(book.last_price() == 12_345, 0);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -73,7 +73,7 @@ fun set_last_price_below_best_bid_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
+    book.set_last_price(999, scenario.ctx());
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -89,11 +89,11 @@ fun set_last_price_at_or_above_best_bid_succeeds_with_only_bid_present() {
     // being consistent with a silent no-op (the audit's L-02 finding: a
     // target value equal to the already-current `last_price` wouldn't
     // distinguish "the call worked" from "the call did nothing").
-    assert!(tiny_clob::last_price(&book) == 1, 0); // book's initial_last_price, untouched so far
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // exactly the best bid; differs from the initial 1
-    assert!(tiny_clob::last_price(&book) == 1000, 1);
-    tiny_clob::set_last_price(&mut book, 5_000_000, scenario.ctx()); // far above; no best ask to bound it
-    assert!(tiny_clob::last_price(&book) == 5_000_000, 2);
+    assert!(book.last_price() == 1, 0); // book's initial_last_price, untouched so far
+    book.set_last_price(1000, scenario.ctx()); // exactly the best bid; differs from the initial 1
+    assert!(book.last_price() == 1000, 1);
+    book.set_last_price(5_000_000, scenario.ctx()); // far above; no best ask to bound it
+    assert!(book.last_price() == 5_000_000, 2);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -105,7 +105,7 @@ fun set_last_price_above_best_ask_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2001, scenario.ctx());
+    book.set_last_price(2001, scenario.ctx());
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -116,10 +116,10 @@ fun set_last_price_at_or_below_best_ask_succeeds_with_only_ask_present() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2000, scenario.ctx()); // exactly the best ask
-    assert!(tiny_clob::last_price(&book) == 2000, 0);
-    tiny_clob::set_last_price(&mut book, 1, scenario.ctx()); // far below; no best bid to bound it
-    assert!(tiny_clob::last_price(&book) == 1, 1);
+    book.set_last_price(2000, scenario.ctx()); // exactly the best ask
+    assert!(book.last_price() == 2000, 0);
+    book.set_last_price(1, scenario.ctx()); // far below; no best bid to bound it
+    assert!(book.last_price() == 1, 1);
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -131,8 +131,8 @@ fun set_last_price_within_spread_both_sides_present_succeeds() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1500, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 1500, 0);
+    book.set_last_price(1500, scenario.ctx());
+    assert!(book.last_price() == 1500, 0);
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -146,7 +146,7 @@ fun set_last_price_below_bid_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
+    book.set_last_price(999, scenario.ctx());
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -160,7 +160,7 @@ fun set_last_price_above_ask_both_sides_present_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
     let ask_ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 2001, scenario.ctx());
+    book.set_last_price(2001, scenario.ctx());
     unit_test::destroy(bid_ticket);
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -178,18 +178,18 @@ fun last_price_updates_on_real_fill_not_on_zero_qty_iteration() {
     let (mut book, cap) = new_book(&mut scenario);
     let ask1 = rest_ask(&mut book, 100, min_size(), 10, scenario.ctx());
     let ask2 = rest_ask(&mut book, 200, min_size(), 10, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 1, 0); // untouched: nothing filled yet
+    assert!(book.last_price() == 1, 0); // untouched: nothing filled yet
 
     scenario.next_tx(taker());
-    let budget = tiny_clob::bid_escrow_amount(&book, 100, min_size()); // exactly covers ask1, nothing left for ask2
+    let budget = book.bid_escrow_amount(100, min_size()); // exactly covers ask1, nothing left for ask2
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
-        &mut book, min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(
+        min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 1);
-    assert!(coin::burn_for_testing(matched_base) == min_size(), 2); // only ask1 filled
-    assert!(coin::burn_for_testing(leftover) == 0, 3);
-    assert!(tiny_clob::last_price(&book) == 100, 4); // ask1's price, not ask2's
+    assert!(matched_base.burn_for_testing() == min_size(), 2); // only ask1 filled
+    assert!(leftover.burn_for_testing() == 0, 3);
+    assert!(book.last_price() == 100, 4); // ask1's price, not ask2's
 
     unit_test::destroy(ask1);
     unit_test::destroy(ask2);
@@ -205,16 +205,16 @@ fun market_order_ask_updates_last_price_after_real_fill() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 300, min_size(), 10, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 1, 0); // untouched: nothing filled yet
+    assert!(book.last_price() == 1, 0); // untouched: nothing filled yet
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(min_size(), scenario.ctx());
     let (leftover_base, matched_quote, stopped) =
-        tiny_clob::place_market_order_ask(&mut book, min_size(), payment, 10, option::none(), option::none(), scenario.ctx());
+        book.place_market_order_ask(min_size(), payment, 10, option::none(), option::none(), scenario.ctx());
     assert!(!stopped, 1);
-    assert!(coin::burn_for_testing(leftover_base) == 0, 2);
-    assert!(coin::burn_for_testing(matched_quote) == 300 * min_size(), 3);
-    assert!(tiny_clob::last_price(&book) == 300, 4);
+    assert!(leftover_base.burn_for_testing() == 0, 2);
+    assert!(matched_quote.burn_for_testing() == 300 * min_size(), 3);
+    assert!(book.last_price() == 300, 4);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
@@ -237,16 +237,16 @@ fun last_price_reflects_last_of_two_fully_filled_ask_levels() {
 
     scenario.next_tx(taker());
     // Exactly covers both levels: 100*min_size() + 200*min_size().
-    let budget = tiny_clob::bid_escrow_amount(&book, 100, min_size())
-        + tiny_clob::bid_escrow_amount(&book, 200, min_size());
+    let budget = book.bid_escrow_amount(100, min_size())
+        + book.bid_escrow_amount(200, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
-        &mut book, min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(
+        min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
-    assert!(coin::burn_for_testing(matched_base) == min_size() * 2, 1); // both levels fully filled
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
-    assert!(tiny_clob::last_price(&book) == 200, 3); // the LAST level touched, not the first
+    assert!(matched_base.burn_for_testing() == min_size() * 2, 1); // both levels fully filled
+    assert!(leftover.burn_for_testing() == 0, 2);
+    assert!(book.last_price() == 200, 3); // the LAST level touched, not the first
 
     unit_test::destroy(ask1);
     unit_test::destroy(ask2);
@@ -266,13 +266,13 @@ fun last_price_reflects_last_of_two_fully_filled_bid_levels() {
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(min_size() * 2, scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = tiny_clob::place_market_order_ask(
-        &mut book, min_size() * 2, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(
+        min_size() * 2, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
-    assert!(coin::burn_for_testing(leftover_base) == 0, 1); // both levels fully filled
-    assert!(coin::burn_for_testing(matched_quote) == 300 * min_size() + 200 * min_size(), 2);
-    assert!(tiny_clob::last_price(&book) == 200, 3); // the LAST level touched, not the first
+    assert!(leftover_base.burn_for_testing() == 0, 1); // both levels fully filled
+    assert!(matched_quote.burn_for_testing() == 300 * min_size() + 200 * min_size(), 2);
+    assert!(book.last_price() == 200, 3); // the LAST level touched, not the first
 
     unit_test::destroy(bid1);
     unit_test::destroy(bid2);
@@ -297,19 +297,19 @@ fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
     // Rest the ask BEFORE any band exists, at a price far outside the band
     // that will be set below.
     let ask_ticket = rest_ask(&mut book, 5000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // <= best_ask (5000), so this succeeds
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx()); // <= best_ask (5000), so this succeeds
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     // band is now [500, 2000] -- 5000 is well outside it.
 
     scenario.next_tx(taker());
-    let budget = tiny_clob::bid_escrow_amount(&book, 5000, min_size());
+    let budget = book.bid_escrow_amount(5000, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = tiny_clob::place_market_order_bid(
-        &mut book, min_size(), budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(
+        min_size(), budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
-    assert!(coin::burn_for_testing(matched_base) == min_size(), 1); // filled despite being outside the band
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(matched_base.burn_for_testing() == min_size(), 1); // filled despite being outside the band
+    assert!(leftover.burn_for_testing() == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -323,19 +323,19 @@ fun swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let ask_ticket = rest_ask(&mut book, 5000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     // band is now [500, 2000] -- 5000 is well outside it.
 
     scenario.next_tx(taker());
-    let budget = tiny_clob::bid_escrow_amount(&book, 5000, min_size());
+    let budget = book.bid_escrow_amount(5000, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = tiny_clob::swap_bid(
-        &mut book, min_size(), budget, payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.swap_bid(
+        min_size(), budget, payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
-    assert!(coin::burn_for_testing(matched_base) == min_size(), 1); // filled despite being outside the band
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(matched_base.burn_for_testing() == min_size(), 1); // filled despite being outside the band
+    assert!(leftover.burn_for_testing() == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -349,7 +349,7 @@ fun swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band() {
 fun clob_admin_set_price_band_factor_zero_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(0));
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(0));
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -359,7 +359,7 @@ fun clob_admin_set_price_band_factor_zero_aborts() {
 fun set_last_price_zero_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::set_last_price(&mut book, 0, scenario.ctx());
+    book.set_last_price(0, scenario.ctx());
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -381,24 +381,24 @@ fun swap_bid_with_off_band_limit_price_fills_against_resting_ask_outside_band() 
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let ask_ticket = rest_ask(&mut book, 5000, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx());
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     // band is now [500, 2000] -- 5000 is well outside it, and the taker's
     // own limit_price below is ALSO 5000 (outside the band).
 
     scenario.next_tx(taker());
-    let budget = tiny_clob::bid_escrow_amount(&book, 5000, min_size());
+    let budget = book.bid_escrow_amount(5000, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = tiny_clob::swap_bid(
-        &mut book, min_size(), budget, payment, 10, option::some(5000), option::none(), option::none(),
+    let (matched_base, leftover, stopped) = book.swap_bid(
+        min_size(), budget, payment, 10, option::some(5000), option::none(), option::none(),
         scenario.ctx(),
     );
     assert!(!stopped, 0);
     // Fills despite both the resting price AND the taker's own limit_price
     // being outside the band -- proving the band no longer gates the
     // taker's protective cap at all, not just the no-limit-price path.
-    assert!(coin::burn_for_testing(matched_base) == min_size(), 1);
-    assert!(coin::burn_for_testing(leftover) == 0, 2);
+    assert!(matched_base.burn_for_testing() == min_size(), 1);
+    assert!(leftover.burn_for_testing() == 0, 2);
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -413,19 +413,19 @@ fun swap_ask_with_off_band_limit_price_fills_against_resting_bid_outside_band() 
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let bid_ticket = rest_bid(&mut book, 100, min_size(), 10, scenario.ctx());
-    tiny_clob::set_last_price(&mut book, 1000, scenario.ctx()); // >= best_bid (100), so this succeeds
-    tiny_clob::clob_admin_set_price_band_factor(&cap, &mut book, option::some(2));
+    book.set_last_price(1000, scenario.ctx()); // >= best_bid (100), so this succeeds
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
     // band is now [500, 2000] -- 100 is well outside it (below), and the
     // taker's own limit_price below is ALSO 100 (outside the band).
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(min_size(), scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = tiny_clob::swap_ask(
-        &mut book, min_size(), payment, 10, option::some(100), option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.swap_ask(
+        min_size(), payment, 10, option::some(100), option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
-    assert!(coin::burn_for_testing(leftover_base) == 0, 1);
-    assert!(coin::burn_for_testing(matched_quote) == 100 * min_size(), 2);
+    assert!(leftover_base.burn_for_testing() == 0, 1);
+    assert!(matched_quote.burn_for_testing() == 100 * min_size(), 2);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
@@ -443,16 +443,16 @@ fun swap_ask_with_off_band_limit_price_fills_against_resting_bid_outside_band() 
 fun last_price_set_event_records_setter_and_value() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = tiny_clob::id_for_testing(&book);
+    let book_id = book.id_for_testing();
 
     scenario.next_tx(maker_a());
-    assert!(tiny_clob::last_price(&book) == 1, 0); // initial_last_price, not yet touched
-    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 12_345, 1);
+    assert!(book.last_price() == 1, 0); // initial_last_price, not yet touched
+    book.set_last_price(12_345, scenario.ctx());
+    assert!(book.last_price() == 12_345, 1);
 
     let events = event::events_by_type<tiny_clob::LastPriceSet>();
     assert!(events.length() == 1, 2);
-    let (ev_book_id, ev_last_price, ev_setter) = tiny_clob::last_price_set_fields_for_testing(&events[0]);
+    let (ev_book_id, ev_last_price, ev_setter) = events[0].last_price_set_fields_for_testing();
     assert!(ev_book_id == book_id, 3);
     assert!(ev_last_price == 12_345, 4);
     assert!(ev_setter == maker_a(), 5); // the actual caller, not admin()
@@ -470,12 +470,12 @@ fun last_price_set_noop_emits_no_additional_event() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx()); // real change: 1 -> 12_345
+    book.set_last_price(12_345, scenario.ctx()); // real change: 1 -> 12_345
     let events_after_real_change = event::events_by_type<tiny_clob::LastPriceSet>();
     assert!(events_after_real_change.length() == 1, 0);
 
-    tiny_clob::set_last_price(&mut book, 12_345, scenario.ctx()); // no-op: already 12_345
-    assert!(tiny_clob::last_price(&book) == 12_345, 1);
+    book.set_last_price(12_345, scenario.ctx()); // no-op: already 12_345
+    assert!(book.last_price() == 12_345, 1);
     let events_after_noop = event::events_by_type<tiny_clob::LastPriceSet>();
     assert!(events_after_noop.length() == 1, 2); // unchanged -- no new event from the no-op call
 
@@ -491,18 +491,18 @@ fun last_price_set_noop_emits_no_additional_event() {
 fun set_last_price_succeeds_on_paused_book() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    tiny_clob::clob_admin_pause_book(&cap, &mut book);
-    assert!(tiny_clob::is_book_paused(&book), 0);
+    cap.clob_admin_pause_book(&mut book);
+    assert!(book.is_book_paused(), 0);
 
     // Not pause-gated: succeeds despite the book being paused.
-    tiny_clob::set_last_price(&mut book, 999, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 999, 1);
+    book.set_last_price(999, scenario.ctx());
+    assert!(book.last_price() == 999, 1);
 
     // Pausing/unpausing still works normally afterward -- `set_last_price`
     // didn't interfere with the pause lifecycle.
-    tiny_clob::clob_admin_unpause_book(&cap, &mut book);
-    assert!(!tiny_clob::is_book_paused(&book), 2);
-    assert!(tiny_clob::last_price(&book) == 999, 3); // stuck through the unpause
+    cap.clob_admin_unpause_book(&mut book);
+    assert!(!book.is_book_paused(), 2);
+    assert!(book.last_price() == 999, 3); // stuck through the unpause
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -512,17 +512,17 @@ fun set_last_price_succeeds_on_paused_book() {
 fun set_last_price_succeeds_on_retiring_book_and_finalize_still_works() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = tiny_clob::id_for_testing(&book);
-    tiny_clob::clob_admin_retire(&cap, &mut book);
+    let book_id = book.id_for_testing();
+    cap.clob_admin_retire(&mut book);
 
     // Not gated on `retiring` either: succeeds on a retiring book.
-    tiny_clob::set_last_price(&mut book, 4_242, scenario.ctx());
-    assert!(tiny_clob::last_price(&book) == 4_242, 0);
+    book.set_last_price(4_242, scenario.ctx());
+    assert!(book.last_price() == 4_242, 0);
 
     // The deletion lifecycle proceeds normally afterward: an empty book
     // drains trivially and finalizes.
-    tiny_clob::clob_admin_drain_step(&cap, &mut book, 100, scenario.ctx());
-    let deleted_id = tiny_clob::clob_admin_finalize(cap, book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+    let deleted_id = cap.clob_admin_finalize(book);
     assert!(deleted_id == book_id, 1);
 
     scenario.end();
@@ -537,8 +537,8 @@ fun set_last_price_succeeds_from_non_admin_sender_without_admin_cap() {
     let (mut book, cap) = new_book(&mut scenario);
 
     scenario.next_tx(other()); // switch to a sender that never held the ClobAdminCap
-    tiny_clob::set_last_price(&mut book, 777, scenario.ctx()); // no cap argument exists on this function at all
-    assert!(tiny_clob::last_price(&book) == 777, 0);
+    book.set_last_price(777, scenario.ctx()); // no cap argument exists on this function at all
+    assert!(book.last_price() == 777, 0);
 
     destroy_book_and_cap(book, cap);
     scenario.end();

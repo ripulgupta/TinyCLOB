@@ -51,27 +51,27 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     // `initial_last_price` with a comfortably-clear-of-the-minimum value
     // rather than `1`.
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 8, 6, 0, 19, 1_000_000_000, scenario.ctx());
-    let scale = tiny_clob::price_scale(&book);
+    let scale = book.price_scale();
 
     let price = scale * 79_000; // true price = $7,900,000 per BTC (see doc comment above)
     let size = 100_000; // base atoms (8 decimals)
-    let expected_escrow = tiny_clob::bid_escrow_amount(&book, price, size);
+    let expected_escrow = book.bid_escrow_amount(price, size);
     // price is an exact multiple of scale, so the ceiling division is exact.
     assert!(expected_escrow == 79_000 * size, 0);
 
     let payment = coin::mint_for_testing<USDC>(expected_escrow, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        tiny_clob::place_limit_order_bid(&mut book, price, size, payment, 10, scenario.ctx());
+        book.place_limit_order_bid(price, size, payment, 10, scenario.ctx());
     assert!(!stopped, 1);
-    assert!(coin::burn_for_testing(matched_base) == 0, 2);
-    assert!(coin::burn_for_testing(leftover_quote) == 0, 3);
+    assert!(matched_base.burn_for_testing() == 0, 2);
+    assert!(leftover_quote.burn_for_testing() == 0, 3);
     assert!(ticket_opt.is_some(), 4);
     let ticket = ticket_opt.destroy_some();
-    assert!(tiny_clob::depth_at_price(&book, tiny_clob::bid_for_testing(), price) == size, 5);
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == size, 5);
 
-    let (b, q) = tiny_clob::cancel_order(&mut book, ticket, scenario.ctx());
-    assert!(coin::burn_for_testing(b) == 0, 6);
-    assert!(coin::burn_for_testing(q) == expected_escrow, 7);
+    let (b, q) = book.cancel_order(ticket, scenario.ctx());
+    assert!(b.burn_for_testing() == 0, 6);
+    assert!(q.burn_for_testing() == expected_escrow, 7);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -237,21 +237,21 @@ fun wal_sui_same_decimals_pair_price_extremes_and_adjacent_ticks() {
 fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 9, 9, 1_000_000_000, scenario.ctx());
-    assert!(tiny_clob::price_scale(&book) == 18_446_744_073, 0);
+    assert!(book.price_scale() == 18_446_744_073, 0);
     // Cheapest representable raw price is 19 (P ~= 1.03e-9 >= 10^-9).
     let ask_ticket = rest_ask(&mut book, 19, 1_000, 10, scenario.ctx());
 
     scenario.next_tx(taker());
     let budget: u64 = 20_000_000_000; // 2e10 quote atoms
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, stopped) = tiny_clob::place_market_order_bid(
-        &mut book, 1_000, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(
+        1_000, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
     );
     // The resting ask only has 1_000 base atoms available, so the fill is
     // capped by natural_fill_qty (1_000), not by an abort.
-    assert!(coin::burn_for_testing(matched_base) == 1_000, 1);
+    assert!(matched_base.burn_for_testing() == 1_000, 1);
     assert!(!stopped, 2);
-    coin::burn_for_testing(leftover_payment);
+    leftover_payment.burn_for_testing();
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
@@ -295,26 +295,26 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     // cancels, verifies exact base refund.
     let min_payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
     let (min_ticket_opt, min_leftover, min_matched, min_stopped) =
-        tiny_clob::place_limit_order_ask(&mut book, p_min, size, min_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(p_min, size, min_payment, 10, scenario.ctx());
     assert!(!min_stopped, 0);
-    assert!(coin::burn_for_testing(min_leftover) == 0, 1);
-    assert!(coin::burn_for_testing(min_matched) == 0, 2);
-    assert!(tiny_clob::depth_at_price(&book, tiny_clob::ask_for_testing(), p_min) == size, 3);
-    let (min_b, min_q) = tiny_clob::cancel_order(&mut book, min_ticket_opt.destroy_some(), scenario.ctx());
-    assert!(coin::burn_for_testing(min_b) == size, 4);
-    assert!(coin::burn_for_testing(min_q) == 0, 5);
+    assert!(min_leftover.burn_for_testing() == 0, 1);
+    assert!(min_matched.burn_for_testing() == 0, 2);
+    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), p_min) == size, 3);
+    let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(min_b.burn_for_testing() == size, 4);
+    assert!(min_q.burn_for_testing() == 0, 5);
 
     // (b) Extreme maximum representable raw price: same checks.
     let max_payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
     let (max_ticket_opt, max_leftover, max_matched, max_stopped) =
-        tiny_clob::place_limit_order_ask(&mut book, p_max, size, max_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(p_max, size, max_payment, 10, scenario.ctx());
     assert!(!max_stopped, 6);
-    assert!(coin::burn_for_testing(max_leftover) == 0, 7);
-    assert!(coin::burn_for_testing(max_matched) == 0, 8);
-    assert!(tiny_clob::depth_at_price(&book, tiny_clob::ask_for_testing(), p_max) == size, 9);
-    let (max_b, max_q) = tiny_clob::cancel_order(&mut book, max_ticket_opt.destroy_some(), scenario.ctx());
-    assert!(coin::burn_for_testing(max_b) == size, 10);
-    assert!(coin::burn_for_testing(max_q) == 0, 11);
+    assert!(max_leftover.burn_for_testing() == 0, 7);
+    assert!(max_matched.burn_for_testing() == 0, 8);
+    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), p_max) == size, 9);
+    let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(max_b.burn_for_testing() == size, 10);
+    assert!(max_q.burn_for_testing() == 0, 11);
 
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);

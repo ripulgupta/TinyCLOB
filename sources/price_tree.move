@@ -117,7 +117,7 @@ public(package) fun destroy_empty_price_level<Base, Quote>(level: PriceLevel<Bas
     let PriceLevel { orders, total_size, total_quote_escrow } = level;
     assert!(total_size == 0, EPriceLevelNotEmpty);
     assert!(total_quote_escrow == 0, EPriceLevelNotEmpty);
-    linked_table::destroy_empty(orders);
+    orders.destroy_empty();
 }
 
 /// The maintained running total — O(1), replaces a linear-scan sum.
@@ -157,8 +157,8 @@ public(package) fun level_insert_order<Base, Quote>(
     order_id: u64,
     order: Order<Base, Quote>,
 ) {
-    level.total_size = level.total_size + order::remaining_size(&order);
-    level.total_quote_escrow = level.total_quote_escrow + order::escrow_quote_value(&order);
+    level.total_size = level.total_size + order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow + order.escrow_quote_value();
     level.orders.push_back(order_id, order);
 }
 
@@ -172,8 +172,8 @@ public(package) fun level_insert_order_front<Base, Quote>(
     order_id: u64,
     order: Order<Base, Quote>,
 ) {
-    level.total_size = level.total_size + order::remaining_size(&order);
-    level.total_quote_escrow = level.total_quote_escrow + order::escrow_quote_value(&order);
+    level.total_size = level.total_size + order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow + order.escrow_quote_value();
     level.orders.push_front(order_id, order);
 }
 
@@ -187,8 +187,8 @@ public(package) fun level_remove_order<Base, Quote>(
     order_id: u64,
 ): Order<Base, Quote> {
     let order = level.orders.remove(order_id);
-    level.total_size = level.total_size - order::remaining_size(&order);
-    level.total_quote_escrow = level.total_quote_escrow - order::escrow_quote_value(&order);
+    level.total_size = level.total_size - order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow - order.escrow_quote_value();
     order
 }
 
@@ -200,8 +200,8 @@ public(package) fun level_pop_front_order<Base, Quote>(
     level: &mut PriceLevel<Base, Quote>,
 ): (u64, Order<Base, Quote>) {
     let (order_id, order) = level.orders.pop_front();
-    level.total_size = level.total_size - order::remaining_size(&order);
-    level.total_quote_escrow = level.total_quote_escrow - order::escrow_quote_value(&order);
+    level.total_size = level.total_size - order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow - order.escrow_quote_value();
     (order_id, order)
 }
 
@@ -212,7 +212,7 @@ public(package) fun level_set_order_owner<Base, Quote>(
     order_id: u64,
     new_owner: address,
 ) {
-    order::set_owner(level.orders.borrow_mut(order_id), new_owner);
+    level.orders.borrow_mut(order_id).set_owner(new_owner);
 }
 
 // === Construction ===
@@ -242,8 +242,8 @@ public fun destroy_empty<V: store>(tree: PriceTree<V>) {
         next_internal_index: _,
         next_leaf_index: _,
     } = tree;
-    table::destroy_empty(internal_nodes);
-    table::destroy_empty(leaves);
+    internal_nodes.destroy_empty();
+    leaves.destroy_empty();
 }
 
 // === Pointer encoding helpers ===
@@ -277,16 +277,16 @@ fun highest_set_bit_mask(x: u64): u64 {
 
 fun set_parent<V: store>(tree: &mut PriceTree<V>, ptr: u64, new_parent: u64) {
     if (is_leaf_ptr(ptr)) {
-        table::borrow_mut(&mut tree.leaves, leaf_index_of(ptr)).parent = new_parent;
+        tree.leaves.borrow_mut(leaf_index_of(ptr)).parent = new_parent;
     } else {
-        table::borrow_mut(&mut tree.internal_nodes, ptr).parent = new_parent;
+        tree.internal_nodes.borrow_mut(ptr).parent = new_parent;
     }
 }
 
 fun descend_to_leaf<V: store>(tree: &PriceTree<V>, key: u64): u64 {
     let mut ptr = tree.root;
     while (!is_leaf_ptr(ptr)) {
-        let node = table::borrow(&tree.internal_nodes, ptr);
+        let node = tree.internal_nodes.borrow(ptr);
         ptr = if (key & node.mask == 0) node.left else node.right;
     };
     ptr
@@ -300,7 +300,7 @@ fun descend_to_leaf<V: store>(tree: &PriceTree<V>, key: u64): u64 {
 fun descend_extreme<V: store>(tree: &PriceTree<V>, start_ptr: u64, want_min: bool): u64 {
     let mut ptr = start_ptr;
     while (!is_leaf_ptr(ptr)) {
-        let node = table::borrow(&tree.internal_nodes, ptr);
+        let node = tree.internal_nodes.borrow(ptr);
         ptr = if (want_min) node.left else node.right;
     };
     ptr
@@ -323,7 +323,7 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
         let leaf_idx = tree.next_leaf_index;
         tree.next_leaf_index = leaf_idx + 1;
         let leaf_ptr = encode_leaf_ptr(leaf_idx);
-        table::add(&mut tree.leaves, leaf_idx, Leaf { key, value, parent: NO_PARENT });
+        tree.leaves.add(leaf_idx, Leaf { key, value, parent: NO_PARENT });
         tree.root = leaf_ptr;
         tree.min_leaf = leaf_ptr;
         tree.max_leaf = leaf_ptr;
@@ -343,14 +343,14 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     let mut path_masks: vector<u64> = vector[];
     let mut ptr = tree.root;
     while (!is_leaf_ptr(ptr)) {
-        let node = table::borrow(&tree.internal_nodes, ptr);
+        let node = tree.internal_nodes.borrow(ptr);
         path_ptrs.push_back(ptr);
         path_masks.push_back(node.mask);
         ptr = if (key & node.mask == 0) node.left else node.right;
     };
     let closest_ptr = ptr;
     let closest_leaf_idx = leaf_index_of(closest_ptr);
-    let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
+    let closest_key = tree.leaves.borrow(closest_leaf_idx).key;
     assert!(closest_key != key, EKeyAlreadyExists);
 
     let xor = closest_key ^ key;
@@ -390,19 +390,18 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     } else {
         (current_ptr, leaf_ptr)
     };
-    table::add(
-        &mut tree.internal_nodes,
+    tree.internal_nodes.add(
         internal_idx,
         InternalNode { mask: new_mask, left, right, parent: parent_ptr },
     );
-    table::add(&mut tree.leaves, leaf_idx, Leaf { key, value, parent: internal_idx });
+    tree.leaves.add(leaf_idx, Leaf { key, value, parent: internal_idx });
 
     set_parent(tree, current_ptr, internal_idx);
 
     if (parent_ptr == NO_PARENT) {
         tree.root = internal_idx;
     } else {
-        let gp = table::borrow_mut(&mut tree.internal_nodes, parent_ptr);
+        let gp = tree.internal_nodes.borrow_mut(parent_ptr);
         if (gp.left == current_ptr) {
             gp.left = internal_idx;
         } else {
@@ -410,11 +409,11 @@ public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
         };
     };
 
-    let min_key = table::borrow(&tree.leaves, leaf_index_of(tree.min_leaf)).key;
+    let min_key = tree.leaves.borrow(leaf_index_of(tree.min_leaf)).key;
     if (key < min_key) {
         tree.min_leaf = leaf_ptr;
     };
-    let max_key = table::borrow(&tree.leaves, leaf_index_of(tree.max_leaf)).key;
+    let max_key = tree.leaves.borrow(leaf_index_of(tree.max_leaf)).key;
     if (key > max_key) {
         tree.max_leaf = leaf_ptr;
     };
@@ -468,18 +467,18 @@ public(package) fun insert_or_append_order<Base, Quote>(
     let mut path_masks: vector<u64> = vector[];
     let mut ptr = tree.root;
     while (!is_leaf_ptr(ptr)) {
-        let node = table::borrow(&tree.internal_nodes, ptr);
+        let node = tree.internal_nodes.borrow(ptr);
         path_ptrs.push_back(ptr);
         path_masks.push_back(node.mask);
         ptr = if (price & node.mask == 0) node.left else node.right;
     };
     let closest_ptr = ptr;
     let closest_leaf_idx = leaf_index_of(closest_ptr);
-    let closest_key = table::borrow(&tree.leaves, closest_leaf_idx).key;
+    let closest_key = tree.leaves.borrow(closest_leaf_idx).key;
 
     if (closest_key == price) {
         // Found — insert into the existing level, no further tree traversal.
-        let leaf = table::borrow_mut(&mut tree.leaves, closest_leaf_idx);
+        let leaf = tree.leaves.borrow_mut(closest_leaf_idx);
         level_insert_order(&mut leaf.value, order_id, order);
         return
     };
@@ -520,19 +519,18 @@ public(package) fun insert_or_append_order<Base, Quote>(
     } else {
         (current_ptr, leaf_ptr)
     };
-    table::add(
-        &mut tree.internal_nodes,
+    tree.internal_nodes.add(
         internal_idx,
         InternalNode { mask: new_mask, left, right, parent: parent_ptr },
     );
-    table::add(&mut tree.leaves, leaf_idx, Leaf { key: price, value: level, parent: internal_idx });
+    tree.leaves.add(leaf_idx, Leaf { key: price, value: level, parent: internal_idx });
 
     set_parent(tree, current_ptr, internal_idx);
 
     if (parent_ptr == NO_PARENT) {
         tree.root = internal_idx;
     } else {
-        let gp = table::borrow_mut(&mut tree.internal_nodes, parent_ptr);
+        let gp = tree.internal_nodes.borrow_mut(parent_ptr);
         if (gp.left == current_ptr) {
             gp.left = internal_idx;
         } else {
@@ -540,11 +538,11 @@ public(package) fun insert_or_append_order<Base, Quote>(
         };
     };
 
-    let min_key = table::borrow(&tree.leaves, leaf_index_of(tree.min_leaf)).key;
+    let min_key = tree.leaves.borrow(leaf_index_of(tree.min_leaf)).key;
     if (price < min_key) {
         tree.min_leaf = leaf_ptr;
     };
-    let max_key = table::borrow(&tree.leaves, leaf_index_of(tree.max_leaf)).key;
+    let max_key = tree.leaves.borrow(leaf_index_of(tree.max_leaf)).key;
     if (price > max_key) {
         tree.max_leaf = leaf_ptr;
     };
@@ -565,24 +563,24 @@ public(package) fun find_and_remove_order<Base, Quote>(
     price: u64,
     order_id: u64,
 ): Option<Order<Base, Quote>> {
-    let leaf_opt = find(tree, price);
+    let leaf_opt = tree.find(price);
     if (leaf_opt.is_none()) {
         return option::none()
     };
     let leaf_ptr = leaf_opt.destroy_some();
 
     let (found, order_opt, level_now_empty) = {
-        let level = borrow_mut(tree, leaf_ptr);
-        if (level_contains_order(level, order_id)) {
-            let order = level_remove_order(level, order_id);
-            (true, option::some(order), level_is_empty(level))
+        let level = tree.borrow_mut(leaf_ptr);
+        if (level.level_contains_order(order_id)) {
+            let order = level.level_remove_order(order_id);
+            (true, option::some(order), level.level_is_empty())
         } else {
-            (false, option::none(), level_is_empty(level))
+            (false, option::none(), level.level_is_empty())
         }
     };
     if (found && level_now_empty) {
-        let removed = remove(tree, leaf_ptr);
-        destroy_empty_price_level(removed);
+        let removed = tree.remove(leaf_ptr);
+        removed.destroy_empty_price_level();
     };
     order_opt
 }
@@ -594,7 +592,7 @@ public(package) fun find_and_remove_order<Base, Quote>(
 public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     let leaf_idx = leaf_index_of(leaf_ptr);
-    let Leaf { key: _, value, parent } = table::remove(&mut tree.leaves, leaf_idx);
+    let Leaf { key: _, value, parent } = tree.leaves.remove(leaf_idx);
 
     if (parent == NO_PARENT) {
         // The removed leaf was the tree's only leaf.
@@ -605,7 +603,7 @@ public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
     };
 
     let InternalNode { mask: _, left, right, parent: grandparent } =
-        table::remove(&mut tree.internal_nodes, parent);
+        tree.internal_nodes.remove(parent);
     let sibling_ptr = if (left == leaf_ptr) right else left;
 
     set_parent(tree, sibling_ptr, grandparent);
@@ -613,7 +611,7 @@ public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
     if (grandparent == NO_PARENT) {
         tree.root = sibling_ptr;
     } else {
-        let gp = table::borrow_mut(&mut tree.internal_nodes, grandparent);
+        let gp = tree.internal_nodes.borrow_mut(grandparent);
         if (gp.left == parent) {
             gp.left = sibling_ptr;
         } else {
@@ -641,25 +639,25 @@ public fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
         return option::none()
     };
     let ptr = descend_to_leaf(tree, key);
-    let leaf = table::borrow(&tree.leaves, leaf_index_of(ptr));
+    let leaf = tree.leaves.borrow(leaf_index_of(ptr));
     if (leaf.key == key) option::some(ptr) else option::none()
 }
 
 public fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
-    &table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).value
+    &tree.leaves.borrow(leaf_index_of(leaf_ptr)).value
 }
 
 /// Returns the price `key` a leaf pointer (as returned by `find`/
 /// `min_leaf`/`max_leaf`) was inserted under.
 public fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
-    table::borrow(&tree.leaves, leaf_index_of(leaf_ptr)).key
+    tree.leaves.borrow(leaf_index_of(leaf_ptr)).key
 }
 
 public fun borrow_mut<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): &mut V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
-    &mut table::borrow_mut(&mut tree.leaves, leaf_index_of(leaf_ptr)).value
+    &mut tree.leaves.borrow_mut(leaf_index_of(leaf_ptr)).value
 }
 
 /// O(1): the tracked pointer, not a derived-by-traversal value.
@@ -674,5 +672,5 @@ public fun max_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
 
 /// Number of distinct keys (leaves) currently in the tree.
 public fun size<V: store>(tree: &PriceTree<V>): u64 {
-    table::length(&tree.leaves)
+    tree.leaves.length()
 }
