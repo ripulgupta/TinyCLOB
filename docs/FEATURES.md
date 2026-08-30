@@ -755,7 +755,7 @@ sites the same way this module's own functions do (every function in this
 module that mutates the book calls this first). A book whose stored version
 lags behind the currently-published package's version is transparently
 upgraded in place with no separate migration call required — this emits
-`BookVersionUpgraded { book_id, from, to }`. A book whose stored version is
+`BookVersionUpgraded { order_book_id, from, to }`. A book whose stored version is
 *ahead* of the currently-published package still aborts with
 `ENewVersionMismatch` (5), since that direction cannot be auto-resolved.
 
@@ -794,7 +794,7 @@ ordering within a transaction's effects is deterministic).
 
 | Event | Fields |
 |---|---|
-| `BookVersionUpgraded` | `book_id: ID`, `from: u64`, `to: u64` |
+| `BookVersionUpgraded` | `order_book_id: ID`, `from: u64`, `to: u64` |
 | `Paused` | `order_book_id: ID` |
 | `Unpaused` | `order_book_id: ID` |
 | `TakerFeeSet` | `order_book_id: ID`, `rate_bps: u64` |

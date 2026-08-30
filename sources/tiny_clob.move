@@ -82,6 +82,8 @@ const EDecimalsTooLarge: u64 = 28;
 /// `fee_amount` for an explicit clamp before shipping the change.
 const MAX_TAKER_FEE_BPS: u64 = 10;
 const MAX_MAKER_FEE_BPS: u64 = 5;
+/// Basis-point denominator used by `fee_amount` (1 bps = 1 / 10_000).
+const BPS_DENOM: u64 = 10_000;
 const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
 const U64_MAX: u128 = 0xFFFFFFFFFFFFFFFF;
 
@@ -592,7 +594,7 @@ fun claim_maker_balance<Base, Quote>(
 }
 
 public struct BookVersionUpgraded has copy, drop {
-    book_id: ID,
+    order_book_id: ID,
     from: u64,
     to: u64,
 }
@@ -625,7 +627,7 @@ public fun assert_book_version<Base, Quote>(book: &mut OrderBook<Base, Quote>) {
         let from = book.version;
         book.version = CURRENT_VERSION;
         event::emit(BookVersionUpgraded {
-            book_id: book.event_id,
+            order_book_id: book.event_id,
             from,
             to: CURRENT_VERSION,
         });
@@ -1322,7 +1324,7 @@ fun scaled_ceil_mul_div(price: u64, size: u64, price_scale: u64): u64 {
 /// nonzero `rate_bps` now pays at least 1 unit of fee, closing a dust-sized
 /// exploit where floor division let many small fills each collect zero fee.
 fun fee_amount(receive_amount: u64, rate_bps: u64): u64 {
-    (((receive_amount as u128) * (rate_bps as u128) + 9_999) / 10_000) as u64
+    (((receive_amount as u128) * (rate_bps as u128) + (BPS_DENOM as u128) - 1) / (BPS_DENOM as u128)) as u64
 }
 
 /// `min_size` bounds order-placement size only — it is enforced here, once,
@@ -2845,7 +2847,7 @@ public fun event_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID 
 
 #[test_only]
 public fun book_version_upgraded_fields_for_testing(e: &BookVersionUpgraded): (ID, u64, u64) {
-    (e.book_id, e.from, e.to)
+    (e.order_book_id, e.from, e.to)
 }
 
 #[test_only]
