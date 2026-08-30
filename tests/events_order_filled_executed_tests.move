@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 // Fee-rate/price/size fixture shared with the `match_bid`/`match_ask`
@@ -214,8 +214,7 @@ fun order_executed_fires_from_place_market_order_bid_fully_filled() {
 
     let budget = book.bid_escrow_amount(OE_PRICE, OE_SIZE);
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(
-        OE_SIZE, budget, payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(payment, 1_000_000_000, 0, OE_SIZE, u64_max(), scenario.ctx(),
     );
     matched_base.burn_for_testing();
     leftover_payment.burn_for_testing();
@@ -246,8 +245,7 @@ fun order_executed_fires_from_place_market_order_ask_fully_filled() {
     seed_resting_bid(&mut book, OE_PRICE, 200, scenario.ctx());
 
     let payment = coin::mint_for_testing<BTC>(OE_SIZE, scenario.ctx());
-    let (leftover_payment, matched_quote, stopped) = book.place_market_order_ask(
-        OE_SIZE, payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, stopped) = book.place_market_order_ask(payment, 1_000_000_000, 0, OE_SIZE, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();

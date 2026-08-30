@@ -152,32 +152,33 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // Taker fully filled by the larger resting bid, so fill_qty ==
     // FEE_TEST_TAKER_SIZE, and since the resting bid (size 500) still has
     // size left afterward (500 > 337), this fill is TAKER-limited in
-    // `fill_level_ask` -- the clamped-floor branch of the rounding fix (see
-    // the project's audit notes, findings L-A/L-B), not the old
-    // proportional-ceiling formula:
-    //   quote_cost = min(max(floor(price * fill_qty / price_scale), 1),
-    //                     escrow_quote_value)
-    //              = min(max(floor(1_000 * 337 / 184), 1), 2_718)
-    //              = min(max(1_831, 1), 2_718) = 1_831
-    //   (escrow_quote_value = total_reserved = bid_escrow_amount(book,
-    //   1_000, 500) = ceil(500_000 / 184) = 2_718, unspent so far since this
-    //   is the order's first fill)
+    // `fill_level_ask`. Under the telescoping cumulative-proportional-ceiling
+    // escrow-charging scheme (see `order::Order.original_size`'s doc comment
+    // and `fill_level_ask`'s own comment in `tiny_clob.move`), this is the
+    // order's FIRST fill (`cumulative_before = 0`), so the general formula
+    // collapses to a plain single-fill ceiling:
+    //   total_reserved = bid_escrow_amount(book, 1_000, 500)
+    //                   = ceil(500_000 / 184) = 2_718
+    //   target_charge  = ceil(total_reserved * fill_qty / original_size)
+    //                   = ceil(2_718 * 337 / 500) = ceil(1_831.932) = 1_832
+    //   quote_cost     = target_charge - already_charged (0) = 1_832
     //   taker_fee_quote = ceil(quote_cost * taker_bps / 10_000)
-    //                   = ceil(1_831 * 7 / 10_000) = ceil(1.2817) = 2
-    //   matched_quote   = quote_cost - taker_fee_quote = 1_831 - 2 = 1_829
+    //                   = ceil(1_832 * 7 / 10_000) = ceil(1.2824) = 2
+    //   matched_quote   = quote_cost - taker_fee_quote = 1_832 - 2 = 1_830
     //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
     //                  = ceil(337 * 3 / 10_000) = ceil(0.1011) = 1
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
     // As in `match_bid_produces_expected_fill_and_fee_amounts` above, the
-    // taker fee is charged once in aggregate (equal to the old per-fill
-    // amount for this single-fill case); the maker fee is only set aside in
-    // the resting bid's `fee_reserve_base` -- it never concludes here
-    // (500 > 337), so it's never actually collected.
+    // taker fee is charged once in aggregate; the maker fee is only set
+    // aside in the resting bid's `fee_reserve_base` -- it never concludes
+    // here (500 > 337), so it's never actually collected.
     //
-    // `expected_quote_cost` is NOT `tiny_clob::bid_escrow_amount(...)`
-    // (which always ceils, and would give the stale, no-longer-charged
-    // 1_832) -- it's the hand-derived clamped-floor value above.
-    let expected_quote_cost = 1_831;
+    // `expected_quote_cost` (1_832) now EQUALS `bid_escrow_amount`'s own
+    // ceiling formula for this single, first fill -- unlike the OLD
+    // production scheme's clamped-floor value (1_831, a verified
+    // under-collection relative to the fair isolated-ceil value the review
+    // confirmed this new scheme now delivers instead).
+    let expected_quote_cost = 1_832;
     let expected_taker_fee_quote = 2;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
 
@@ -758,7 +759,12 @@ fun many_price_levels_depth_and_best_bid_correct_after_each_insertion() {
         let mut j = 0;
         while (j <= i) {
             let q = prices[j] + 1;
-            assert!(book.depth_at_price(true, q) == size, 0);
+            // `depth_at_price` for a bid is Quote-denominated: each order
+            // here was constructed with an escrow of exactly `q * size`
+            // (see `escrow` above), which is also this book's `price_scale
+            // == 1` fixture's exact `bid_escrow_amount(q, size)` -- not the
+            // Base `size` itself.
+            assert!(book.depth_at_price(true, q) == q * size, 0);
             j = j + 1;
         };
         assert!(book.best_bid().destroy_some() == best_bid_expected, 1);

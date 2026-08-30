@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -183,8 +183,7 @@ fun last_price_updates_on_real_fill_not_on_zero_qty_iteration() {
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(100, min_size()); // exactly covers ask1, nothing left for ask2
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.place_market_order_bid(
-        min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(payment, 10, 0, min_size() * 2, u64_max(), scenario.ctx(),
     );
     assert!(!stopped, 1);
     assert!(matched_base.burn_for_testing() == min_size(), 2); // only ask1 filled
@@ -210,7 +209,7 @@ fun market_order_ask_updates_last_price_after_real_fill() {
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(min_size(), scenario.ctx());
     let (leftover_base, matched_quote, stopped) =
-        book.place_market_order_ask(min_size(), payment, 10, option::none(), option::none(), scenario.ctx());
+        book.place_market_order_ask(payment, 10, 0, min_size(), scenario.ctx());
     assert!(!stopped, 1);
     assert!(leftover_base.burn_for_testing() == 0, 2);
     assert!(matched_quote.burn_for_testing() == 300 * min_size(), 3);
@@ -240,8 +239,7 @@ fun last_price_reflects_last_of_two_fully_filled_ask_levels() {
     let budget = book.bid_escrow_amount(100, min_size())
         + book.bid_escrow_amount(200, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.place_market_order_bid(
-        min_size() * 2, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(payment, 10, 0, min_size() * 2, u64_max(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == min_size() * 2, 1); // both levels fully filled
@@ -266,8 +264,7 @@ fun last_price_reflects_last_of_two_fully_filled_bid_levels() {
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(min_size() * 2, scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(
-        min_size() * 2, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(payment, 10, 0, min_size() * 2, scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1); // both levels fully filled
@@ -304,8 +301,7 @@ fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(5000, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.place_market_order_bid(
-        min_size(), budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(payment, 10, 0, min_size(), u64_max(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == min_size(), 1); // filled despite being outside the band

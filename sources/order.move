@@ -27,27 +27,45 @@ use sui::balance::{Self, Balance};
 public struct Order<phantom Base, phantom Quote> has store {
     order_id: u64,
     owner: address,
+    /// For an ASK-side order: remaining Base quantity still open — decreased
+    /// by exactly `fill_qty` on every fill, always exactly in sync with
+    /// `escrow_base`'s live value.
+    ///
+    /// For a BID-side order (Quote-denominated — see `new`'s doc comment):
+    /// remaining QUOTE buying-power still open, decreased by exactly
+    /// `quote_cost` (never `fill_qty`) on every fill, always exactly in sync
+    /// with `escrow_quote`'s live value — i.e. `remaining_size ==
+    /// escrow_quote_value` is a maintained invariant for a bid-side order at
+    /// all times, mirroring how `remaining_size == escrow_base value` already
+    /// holds for an ask-side order. The remaining Base quantity a bid-side
+    /// order can still accept is NOT this field — it must be derived as
+    /// `original_size - fee_basis_accumulated` (see `tiny_clob::fill_level_ask`).
     remaining_size: u64,
     escrow_base: Option<Balance<Base>>,
     escrow_quote: Option<Balance<Quote>>,
     maker_fee_bps: u64,
-    /// Set once, at construction, to whatever `remaining_size` is at that
-    /// moment (i.e. the quantity that actually starts resting — for a limit
-    /// order that partially fills during its own placement sweep before
-    /// resting, this is the post-sweep remainder, not the taker's original
-    /// full requested size). Never mutated afterward. Together with
-    /// `escrow_quote_value` (the live escrow balance), this lets
-    /// `fill_level_ask` charge a resting bid's escrow via a
-    /// delta-of-cumulative-proportional-ceiling scheme
-    /// (`ceil(total_reserved * cumulative_filled / original_size)`, clamped
-    /// at `total_reserved`, at each fill, minus what was already charged —
-    /// the latter derived as `total_reserved - escrow_quote_value`)
-    /// that telescopes to exactly the order's actual `total_reserved`
-    /// escrow with zero dust, no matter how many separate fills/transactions
-    /// the order is drained across. Only
-    /// bid-side resting orders need this field; it exists (unused) on
-    /// ask-side orders too, matching how `escrow_base`/`escrow_quote`
-    /// already sit unused on one side or the other.
+    /// Set once, at construction, to the Base-denominated `base_size` (i.e.
+    /// the quantity that actually starts resting — for a limit order that
+    /// partially fills during its own placement sweep before resting, this
+    /// is the post-sweep remainder, not the taker's original full requested
+    /// size). Never mutated afterward. For a BID-side order, together with
+    /// `fee_basis_accumulated` (which, for a bid-side order, doubles as the
+    /// running cumulative-Base-filled counter — see that field's doc
+    /// comment) and `escrow_quote_value`, this lets `fill_level_ask` charge
+    /// a resting bid's escrow via a delta-of-cumulative-proportional-ceiling
+    /// scheme: `ceil(total_reserved * cumulative_filled / original_size)`
+    /// at each fill, minus what was already charged (the latter derived as
+    /// `total_reserved - escrow_quote_value`). This telescopes to exactly
+    /// the order's actual `total_reserved` escrow with zero dust, no matter
+    /// how many separate fills/transactions the order is drained across,
+    /// AND — unlike independently ceiling-rounding each fill in isolation —
+    /// is not superadditive, so it never causes the order's own Base
+    /// delivery to fall short of `original_size` (see `tiny_clob::
+    /// fill_level_ask`'s doc comment for the full rationale and the
+    /// regression this avoids). This field also exists (unused for the
+    /// scheme above, but still set) on ask-side orders, matching how
+    /// `escrow_base`/`escrow_quote` already sit unused on one side or the
+    /// other.
     original_size: u64,
     /// Set once, at construction, to the actual `Quote` balance value
     /// handed to this order's escrow at that moment (0 if none). For a
@@ -56,10 +74,10 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// `bid_escrow_amount` recomputation, it already reflects any rounding
     /// shortfall clamped in at placement (see `place_limit_order_bid`'s
     /// resting-remainder clamp). `fill_level_ask` charges each fill a
-    /// proportional ceiling of this value, clamped at `total_reserved`
-    /// itself, so the running total can never exceed what was actually
-    /// reserved. The running total already charged so far is not stored
-    /// separately — it is always exactly `total_reserved -
+    /// proportional ceiling of this value (see `original_size`'s doc
+    /// comment above), so the running total can never exceed what was
+    /// actually reserved. The running total already charged so far is not
+    /// stored separately — it is always exactly `total_reserved -
     /// escrow_quote_value(&order)`, since every fill decrements the live
     /// escrow balance by precisely the amount it charges. Only bid-side
     /// resting orders need this field; it exists (unused) on ask-side
@@ -78,6 +96,17 @@ public struct Order<phantom Base, phantom Quote> has store {
     /// summing each fill's independently ceiling-rounded fee — the latter
     /// can over-collect when an order fills across many small fills (see the
     /// project's audit notes, finding F-6).
+    ///
+    /// For a BID-side order specifically, this field does double duty: since
+    /// its value is always exactly the cumulative `fill_qty` (Base) summed
+    /// across every fill so far, `fill_level_ask` also reads it (BEFORE this
+    /// fill's own increment) as the running "cumulative Base filled" counter
+    /// for the escrow-charging scheme described on `original_size`'s doc
+    /// comment. `original_size - fee_basis_accumulated` (read before this
+    /// fill's increment) is likewise how `fill_level_ask` derives how much
+    /// more Base a resting bid can still accept — this order's `remaining_size`
+    /// no longer holds that Base quantity directly, since it is
+    /// Quote-denominated for a bid-side order (see its own doc comment).
     fee_basis_accumulated: u64,
     /// Per-fill maker-fee set-aside for a BID-side order (populated only
     /// then; `None` for an ask-side order) — mirrors `escrow_base`/
@@ -96,10 +125,19 @@ public struct Order<phantom Base, phantom Quote> has store {
     fee_reserve_quote: Option<Balance<Quote>>,
 }
 
+/// `base_size` is always the Base-denominated order size (for a bid, the
+/// quantity of Base this order wants to buy; for an ask, the quantity of
+/// Base it wants to sell) — regardless of side. `original_size` is always
+/// set to exactly this value. For an ASK-side order, `remaining_size` also
+/// starts at this same value (Base-denominated, matching `escrow_base`'s
+/// value). For a BID-side order, `remaining_size` instead starts at
+/// `total_reserved` (the live `Quote` escrow value) — see the
+/// `remaining_size` field doc comment above for why bid- and ask-side
+/// orders deliberately diverge here.
 public(package) fun new<Base, Quote>(
     order_id: u64,
     owner: address,
-    remaining_size: u64,
+    base_size: u64,
     escrow_base: Option<Balance<Base>>,
     escrow_quote: Option<Balance<Quote>>,
     maker_fee_bps: u64,
@@ -114,6 +152,7 @@ public(package) fun new<Base, Quote>(
     // `_ask`) populates exactly one of the two, mirroring the convention
     // `fee_reserve_base`/`fee_reserve_quote` follow below.
     let is_bid_side = escrow_quote.is_some();
+    let remaining_size = if (is_bid_side) { total_reserved } else { base_size };
     let (fee_reserve_base, fee_reserve_quote) = if (is_bid_side) {
         (option::some(balance::zero<Base>()), option::none())
     } else {
@@ -121,7 +160,7 @@ public(package) fun new<Base, Quote>(
     };
     Order {
         order_id, owner, remaining_size, escrow_base, escrow_quote, maker_fee_bps,
-        original_size: remaining_size,
+        original_size: base_size,
         total_reserved,
         fee_basis_accumulated: 0,
         fee_reserve_base,

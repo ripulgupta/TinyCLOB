@@ -24,6 +24,10 @@ const MAKER_C: address = @0xA003;
 
 const MIN_SIZE: u64 = 100;
 const MAX_MIN_SIZE: u64 = 1_000_000_000_000_000;
+/// `u64::MAX` -- the "unbounded" sentinel for `place_market_order_bid`'s
+/// `max_base_out`/`max_quote_in` and `place_market_order_ask`'s
+/// `max_base_in` (see their doc comments in `sources/tiny_clob.move`).
+const U64_MAX: u64 = 18_446_744_073_709_551_615;
 
 /// Was `CH2_PRICE`/`CH2_SIZE` in the original monolith — renamed since "CH2"
 /// was meaningless outside its original context.
@@ -38,6 +42,7 @@ public(package) fun maker_b(): address { MAKER_B }
 public(package) fun maker_c(): address { MAKER_C }
 public(package) fun min_size(): u64 { MIN_SIZE }
 public(package) fun max_min_size(): u64 { MAX_MIN_SIZE }
+public(package) fun u64_max(): u64 { U64_MAX }
 public(package) fun default_price(): u64 { DEFAULT_PRICE }
 public(package) fun default_size(): u64 { DEFAULT_SIZE }
 
@@ -160,7 +165,9 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(!min_stopped, 1);
     assert!(min_matched.burn_for_testing() == 0, 2);
     assert!(min_leftover.burn_for_testing() == 0, 3);
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_min) == size, 4);
+    // Quote-denominated for a bid (see `depth_at_price`'s doc comment) --
+    // equal to the escrow reserved, not the Base `size`.
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_min) == min_escrow, 4);
     let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
     assert!(min_b.burn_for_testing() == 0, 5);
     assert!(min_q.burn_for_testing() == min_escrow, 6);
@@ -173,7 +180,7 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(!max_stopped, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
     assert!(max_leftover.burn_for_testing() == 0, 9);
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_max) == size, 10);
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_max) == max_escrow, 10);
     let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
     assert!(max_b.burn_for_testing() == 0, 11);
     assert!(max_q.burn_for_testing() == max_escrow, 12);
@@ -198,8 +205,8 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(mid_next_matched.burn_for_testing() == 0, 17);
     assert!(mid_next_leftover.burn_for_testing() == 0, 18);
 
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid) == mid_size, 19);
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid_next) == mid_size, 20);
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid) == mid_escrow, 19);
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid_next) == mid_next_escrow, 20);
     assert!(p_mid != p_mid_next, 21);
 
     unit_test::destroy(mid_ticket_opt.destroy_some());

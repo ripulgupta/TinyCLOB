@@ -71,6 +71,20 @@ const EResetPriceAboveBestAsk: u64 = 27;
 /// A decimals/precision/exponent argument to `new`/`new_with_event_id_override`
 /// exceeded `MAX_DECIMALS`.
 const EDecimalsTooLarge: u64 = 28;
+/// A `price` derived from `payment.value()`/`expected_base_output` (in
+/// `place_limit_order_bid_expected_output`) or from `expected_quote_output`/
+/// `size` (in `place_limit_order_ask_expected_output`) overflowed `u64`
+/// before it could be narrowed down to the `price: u64` these functions
+/// delegate to -- a named, explicit failure instead of a bare
+/// arithmetic-error abort on the narrowing cast.
+const EPriceOverflow: u64 = 29;
+/// `place_market_order_bid` was called with `min_base_out > max_base_out` --
+/// both are Base-denominated, so this is an unsatisfiable request
+/// regardless of the specific values (the slippage floor can never be met
+/// without also exceeding the call's own declared cap), and is rejected
+/// unconditionally up front rather than left to abort later, confusingly,
+/// as a spurious `ESlippageExceeded`.
+const EMinExceedsMaxBaseOut: u64 = 30;
 
 /// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
 /// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
@@ -689,6 +703,15 @@ public fun best_ask<Base, Quote>(book: &OrderBook<Base, Quote>): Option<u64> {
     }
 }
 
+/// For an ASK price level (`side == false`), the returned depth is
+/// Base-denominated (the sum of every resting ask's remaining Base
+/// quantity at `price`).
+///
+/// For a BID price level (`side == true`), the returned depth is
+/// QUOTE-denominated instead (the sum of every resting bid's remaining
+/// Quote buying-power at `price` -- see `order::Order.remaining_size`'s doc
+/// comment). This is identical to `bid_quote_escrow_at_price(book, price)`
+/// for the same `price` -- both are the same maintained aggregate.
 public fun depth_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, side: bool, price: u64): u64 {
     let tree = if (side) &book.bids else &book.asks;
     let found = tree.find(price);
@@ -755,10 +778,26 @@ public fun book_version<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
 /// ask (`side == false`) -- the currency that side actually escrows. This is
 /// the order's remaining escrowed PRINCIPAL only: `cancel_order` may
 /// additionally pay out pooled proceeds in the OPPOSITE currency, which this
-/// value does not include. `Some({escrow: 0, remaining_size: r})` with `r >
-/// 0` is a real, reachable state (the order's escrow is fully charged but it
-/// is still resting with real remaining size) -- distinct from `None` (not
-/// resting at all).
+/// value does not include. `remaining_size` is ALSO denominated in Quote for
+/// a bid, Base for an ask (see `order::Order.remaining_size`'s doc comment)
+/// -- for a bid, `escrow` and `remaining_size` are therefore always equal
+/// (both are just `escrow_quote_value`), mirroring how they were already
+/// equal for an ask.
+///
+/// For an ASK-side order, `escrow`/`remaining_size` can never reach `0`
+/// while it's still resting: `fill_level_bid` never charges more Base than
+/// an ask has left, and draining it to exactly `0` is the same fill that
+/// stops it from resting. For a BID-side order, this is no longer true
+/// under the telescoping proportional-ceiling escrow-charging scheme (see
+/// `order::Order.original_size`'s doc comment and `fill_level_ask`): whenever
+/// the order's resting price is below `book.price_scale` (the normal case),
+/// the cumulative-ceiling formula reaches the order's full `total_reserved`
+/// Quote escrow strictly before its Base side (`original_size -
+/// fee_basis_accumulated`) is exhausted -- so `Some(RestingOrderEscrow {
+/// escrow: 0, remaining_size: 0 })` (both fields are the same
+/// `escrow_quote_value`, per above) for a live, still-resting, still-fillable
+/// bid is a real, reachable state, not an error condition. `None` (not
+/// resting at all) remains the only other state for either side.
 ///
 /// Returns a small `RestingOrderEscrow` struct rather than a `(u64, u64)`
 /// tuple: Move does not support a bare tuple as a type argument (e.g.
@@ -1707,7 +1746,13 @@ fun fill_level_ask<Base, Quote>(
     max_fills: u64,
 ): (bool, bool) {
     let event_book_id = book.event_id;
-    let price_scale = book.price_scale;
+    // Note: unlike `fill_level_bid`, this function no longer reads
+    // `book.price_scale` at all -- a resting bid's own `total_reserved`/
+    // `original_size` ratio already fixes its price (every fill against a
+    // single resting order happens at that order's own resting price, by
+    // construction of price-level matching), so the cumulative-proportional
+    // charging scheme in the loop below needs no separate `price`/
+    // `price_scale` input.
     let mut stop = false;
     let mut hit_max_fills = false;
     let is_empty_now;
@@ -1723,46 +1768,74 @@ fun fill_level_ask<Base, Quote>(
             if (level.level_is_empty()) break;
             let head_key = level.level_front_order_id().destroy_some();
             *fills_consumed = *fills_consumed + 1;
-            let maker_remaining = level.level_borrow_order(head_key).remaining_size();
+            // `maker_remaining` here is the resting bid's remaining BASE
+            // capacity -- derived, NOT read directly off `remaining_size`
+            // (which is Quote-denominated for a bid-side order; see
+            // `order::Order.remaining_size`'s doc comment). `fee_basis_accumulated`
+            // doubles as the running cumulative-Base-filled counter for a
+            // bid-side order (see its own doc comment) -- reading it here,
+            // BEFORE this fill's own increment below, is exactly the
+            // "already filled" quantity needed to derive what's left.
+            let original_size = level.level_borrow_order(head_key).original_size();
+            let cumulative_before = level.level_borrow_order(head_key).fee_basis_accumulated();
+            let maker_remaining = original_size - cumulative_before;
             let fill_qty = std::u64::min(*remaining_size, maker_remaining);
 
             let mut maker_order = level.level_remove_order(head_key);
-            maker_order.decrease_remaining_size(fill_qty);
-            // Maker-side (bid-resting-order) charge, split by which side this
-            // fill is limited by (see the project's audit notes, findings
-            // L-A/L-B, and the matching comment in `fill_level_bid`):
+            // Maker-side (bid-resting-order) charge: a delta-of-cumulative-
+            // proportional-ceiling scheme, not an independent per-fill
+            // ceiling/floor. See `original_size`'s doc comment in
+            // `order.move` for the full derivation. In short:
             //
-            // - Maker-limited (`fill_qty == maker_remaining`, this fill fully
-            //   drains the resting bid): simply drain whatever's left in the
-            //   order's own reservation. Verified equal to the old
-            //   proportional-ceiling formula's value at full drain (both
-            //   telescope to exactly `total_reserved` minus whatever was
-            //   already charged), so this is a pure simplification for this
-            //   branch, not a behavior change.
-            // - Taker-limited (maker order still has size left after this
-            //   fill): `max(floor(price * fill_qty / price_scale), 1)`,
-            //   clamped to never exceed what's actually left in the maker's
-            //   reservation. The `escrow_quote_value` clamp is mandatory: a
-            //   bid's fixed, placement-time Quote reservation can already be
-            //   nearly exhausted by prior fills against the same order (its
-            //   `total_reserved` was computed once, ceiling-rounded, at
-            //   placement time), so an unclamped floor/ceiling here could
-            //   demand more Quote than the order has left and abort
-            //   `split_escrow_quote` -- a real, maker-triggerable DoS. Once
-            //   `escrow_quote_value` is fully exhausted this correctly falls
-            //   back to charging 0 on a taker-limited fill rather than
-            //   aborting; no assertion or invariant in this module depends
-            //   on `quote_cost > 0` for a fill with `fill_qty > 0` (see
-            //   `tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel`
-            //   in `tests/escrow_shortfall_and_edge_case_tests.move`).
-            let quote_cost = if (fill_qty == maker_remaining) {
-                maker_order.escrow_quote_value()
-            } else {
-                let floor_u128 = ((best_price as u128) * (fill_qty as u128)) / (price_scale as u128);
-                let floor_u128 = if (floor_u128 < 1) { 1 } else { floor_u128 };
-                let escrow_u128 = maker_order.escrow_quote_value() as u128;
-                (if (floor_u128 < escrow_u128) { floor_u128 } else { escrow_u128 }) as u64
-            };
+            //   target_charge  = ceil(total_reserved * cumulative_after / original_size)
+            //   quote_cost     = target_charge - already_charged
+            //
+            // where `cumulative_after = cumulative_before + fill_qty` and
+            // `already_charged = total_reserved - escrow_quote_value` (every
+            // fill decrements the live escrow by exactly what it charges, so
+            // this is always exactly right, with no separately-tracked
+            // running total needed).
+            //
+            // This ONE formula covers both the taker-limited and the
+            // maker-limited (fully-draining) case uniformly, with no special
+            // branch: when `cumulative_after == original_size` (this fill
+            // fully drains the order), `ceil(total_reserved * original_size /
+            // original_size) == total_reserved` exactly, so `quote_cost`
+            // collapses to `total_reserved - already_charged`, i.e. exactly
+            // whatever remains in escrow -- a full drain to zero is
+            // mathematically forced regardless of formula (money
+            // conservation leaves no other choice), so this is not a special
+            // case at all, just what the general formula already produces.
+            //
+            // Why this formula, and not the simpler "independently
+            // ceiling-round every fill's own `price * fill_qty /
+            // price_scale`" (which might look like the more obvious
+            // "fairness fix" for the maker-limited case): that simpler
+            // approach is exactly what three prior, separate experiments on
+            // this project already tried (applying a ceil/upper-bound
+            // conversion uniformly to every fill) and found broken --
+            // independent per-fill ceiling is superadditive across a
+            // fragmented sequence of fills, so it can exhaust a resting
+            // bid's *actual* Quote escrow before its full Base size is
+            // delivered, under-filling the order (e.g. delivering only 95 of
+            // an intended 100 Base). The cumulative scheme above cannot do
+            // this: Base delivery is governed purely by exact Base
+            // arithmetic (`original_size - fee_basis_accumulated`, no
+            // rounding anywhere in that derivation), and the Quote charged
+            // telescopes to exactly `total_reserved` by construction, so
+            // full Base delivery and exact Quote conservation both hold
+            // simultaneously, always -- while still charging the earlier,
+            // taker-limited fills closer to their own fair (isolated-ceil)
+            // value than the old floor-based formula did, which is what
+            // actually reduces (though, being an apportionment problem, does
+            // not perfectly eliminate) how much rounding slack the final
+            // fill absorbs relative to a hypothetical isolated trade.
+            let total_reserved = maker_order.total_reserved();
+            let cumulative_after = cumulative_before + fill_qty;
+            let target_charge = scaled_ceil_mul_div(total_reserved, cumulative_after, original_size);
+            let already_charged = total_reserved - maker_order.escrow_quote_value();
+            let quote_cost = target_charge - already_charged;
+            maker_order.decrease_remaining_size(quote_cost);
 
             let quote_out = maker_order.split_escrow_quote(quote_cost);
             // Taker fee (Quote) is no longer deducted per-fill -- see the
@@ -1781,7 +1854,16 @@ fun fill_level_ask<Base, Quote>(
 
             let maker_addr = maker_order.owner();
             let maker_order_id = maker_order.id();
-            let maker_remaining_after = maker_order.remaining_size();
+            // `original_size - cumulative_after` -- exact Base arithmetic,
+            // matches `maker_remaining` above (`fee_basis_accumulated` was
+            // just incremented by `fill_qty` above, so this order's own
+            // accessor already reflects `cumulative_after`). NOT
+            // `maker_order.remaining_size()`, which is Quote-denominated for
+            // a bid-side order and would answer a different question (how
+            // much Quote capacity is left, not whether Base capacity hit 0 --
+            // though by construction both reach their respective zero at
+            // exactly the same fill; see the formula derivation above).
+            let maker_remaining_after = original_size - maker_order.fee_basis_accumulated();
 
             event::emit(OrderFilled {
                 maker_order_id,
@@ -2238,36 +2320,171 @@ public fun place_limit_order_ask<Base, Quote>(
     (ticket_opt, payment, matched_quote.into_coin(ctx), stopped_on_max_fills_while_crossing)
 }
 
+/// `payment`'s ENTIRE value is derived, up front, into the implied limit
+/// `price` for a resting bid targeting exactly `expected_base_output` Base
+/// (`price = floor(payment.value() * price_scale / expected_base_output)`).
+/// This choice of rounding direction guarantees `bid_escrow_amount(book,
+/// price, expected_base_output) <= payment.value()` always (the identity
+/// `ceil(a/b) <= c <=> a <= c*b` applied to `price * expected_base_output <=
+/// payment.value() * price_scale`, which holds by construction of `price`
+/// via `floor`) -- so the delegated `place_limit_order_bid` call below can
+/// never itself abort for lack of funds on account of this derivation, and
+/// any of `payment` left over after `bid_escrow_amount` is taken (rounding
+/// slack from the `floor`, at most `price_scale - 1` raw price-scale units'
+/// worth of Quote, plus whatever isn't matched/rested) is returned to the
+/// caller exactly like `place_limit_order_bid`'s own leftover-payment
+/// convention.
+///
+/// WORST-CASE RESTING PRICE WARNING: this derived `price` is the MAXIMUM
+/// price `payment`'s whole value implies for `expected_base_output` -- it is
+/// used both to cross the book AND, unchanged, as the price any unfilled
+/// remainder RESTS at. That resting price is the worst case from a "paying
+/// too much" perspective (it is the highest price this payment could imply),
+/// so a caller whose order does not fully fill can end up with a resting bid
+/// parked indefinitely at a price considerably above what a tighter,
+/// hand-computed limit price would have used. This is a deliberate tradeoff,
+/// not a bug: it is exactly what guarantees the fund-safety property above
+/// (the delegated `place_limit_order_bid` call can never abort for lack of
+/// funds) -- callers who care about the resting price, not just guaranteed
+/// non-reverting placement, should compute and pass an explicit `price` to
+/// `place_limit_order_bid` directly instead.
+///
+/// Aborts with `EZeroPrice` if the derived `price` rounds down to `0` (e.g.
+/// `payment` too small relative to `expected_base_output`) -- same as
+/// passing `price = 0` directly to `place_limit_order_bid`. Aborts with
+/// `EPriceOverflow` if the derived price would overflow `u64` before it can
+/// be passed to `place_limit_order_bid`.
+public fun place_limit_order_bid_expected_output<Base, Quote>(
+    book: &mut OrderBook<Base, Quote>,
+    payment: Coin<Quote>,
+    expected_base_output: u64,
+    max_fills: u64,
+    ctx: &mut TxContext,
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool) {
+    validate_size(book, expected_base_output);
+    let price_scale = book.price_scale;
+    let price_u128 = ((payment.value() as u128) * (price_scale as u128)) / (expected_base_output as u128);
+    assert!(price_u128 <= U64_MAX, EPriceOverflow);
+    let price = price_u128 as u64;
+    place_limit_order_bid(book, price, expected_base_output, payment, max_fills, ctx)
+}
+
+/// `payment`'s entire value (`payment.value()`) is the resting ask's `size`
+/// -- the whole coin is escrowed, mirroring `place_limit_order_bid_expected_output`'s
+/// whole-coin convention. The implied limit `price` is derived from
+/// `expected_quote_output` via `price = ceil(expected_quote_output *
+/// price_scale / size)`, i.e. the lowest price at which fully filling this
+/// ask would yield AT LEAST `expected_quote_output` Quote -- matching a "sell
+/// this whole coin for at least this much" intent. Unlike the bid-side
+/// variant, there is no rounding-slack leftover to return here: an ask's
+/// escrow is exactly `size` Base with no price-scale conversion involved.
+///
+/// WORST-CASE RESTING PRICE WARNING (mirrors `place_limit_order_bid_expected_output`,
+/// same direction of concern for an ask maker): this derived `price` is the
+/// LOWEST price satisfying "fully filling `size` yields at least
+/// `expected_quote_output`" -- it is used both to cross the book AND,
+/// unchanged, as the price any unfilled remainder RESTS at. A lower price is
+/// worse for an ask's maker (less Quote received per unit sold), so a
+/// caller whose order does not fully fill can end up with a resting ask
+/// parked indefinitely at a price lower than a tighter, hand-computed limit
+/// price would have used. This is deliberate, not a bug -- it is what
+/// guarantees this function's escrow is never starved of Base for the
+/// implied price/size pair. Callers who care about the resting price should
+/// compute and pass an explicit `price` to `place_limit_order_ask` directly
+/// instead.
+///
+/// Aborts with `EZeroPrice` if `expected_quote_output == 0` (the derived
+/// price would round down to `0`) -- same as passing `price = 0` directly to
+/// `place_limit_order_ask`. Aborts with `EPriceOverflow` if the derived
+/// price would overflow `u64` before it can be passed to
+/// `place_limit_order_ask`.
+public fun place_limit_order_ask_expected_output<Base, Quote>(
+    book: &mut OrderBook<Base, Quote>,
+    payment: Coin<Base>,
+    expected_quote_output: u64,
+    max_fills: u64,
+    ctx: &mut TxContext,
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool) {
+    let size = payment.value();
+    validate_size(book, size);
+    let price_scale = book.price_scale;
+    let price_u128 = ((expected_quote_output as u128) * (price_scale as u128) + (size as u128) - 1) / (size as u128);
+    assert!(price_u128 <= U64_MAX, EPriceOverflow);
+    let price = price_u128 as u64;
+    place_limit_order_ask(book, price, size, payment, max_fills, ctx)
+}
+
+/// `payment`'s value, optionally capped by `max_quote_in`, is the taker's
+/// Quote budget -- there is no separate `budget` parameter (unlike the old
+/// `size`/`budget`/`Option`-wrapped-slippage-guard interface this replaces).
+/// This is a REDESIGNED interface, not a drop-in replacement for the old
+/// `(size, budget, payment, max_fills, max_quote_in: Option<u64>,
+/// min_base_out: Option<u64>)` signature -- do not mechanically migrate a
+/// caller by positionally renaming old arguments onto the new ones; every
+/// parameter's meaning and type changed:
+///
+/// - `max_base_out` (`u64`, `0` = a real zero cap that immediately no-ops
+///   with nothing matched; `u64::MAX` = unbounded) replaces the old,
+///   mandatory `size` parameter -- it caps how much Base this call will ever
+///   try to buy.
+/// - `max_quote_in` (`u64`, same `0`-is-real / `u64::MAX`-is-unbounded
+///   convention) replaces the old `budget` parameter AND the old
+///   `max_quote_in: Option<u64>` slippage guard in one: unlike the old
+///   interface, where `budget` (escrowed up front) and `max_quote_in`
+///   (asserted after the fact) were two independent knobs, this cap is now
+///   enforced up front, by construction -- at most `min(payment.value(),
+///   max_quote_in)` is ever escrowed/spent, so there is nothing left to
+///   assert post-hoc and no way for matching itself to spend past it.
+/// - `min_base_out` (`u64`, `0` = not applicable) is the slippage floor,
+///   replacing the old `Option<u64>` guard of the same name -- unchanged in
+///   spirit, just unwrapped from `Option`.
+///
+/// Any of `payment` not spent (beyond `max_quote_in`, or left over after
+/// matching) is returned to the caller as the second output coin.
+///
+/// Unlike `place_market_order_ask`, there is deliberately no `validate_size`
+/// call against `max_base_out`/`min_size` here: a market bid never rests an
+/// order (any unmatched remainder is simply returned), so it can never
+/// create a sub-`min_size` dust order on the book -- `validate_size`'s
+/// entire purpose (see its own doc comment) is bounding what can rest, which
+/// does not apply to a call that never rests anything.
+///
+/// Aborts with `EMinExceedsMaxBaseOut` if `min_base_out > max_base_out` --
+/// both are Base-denominated, so this combination can never be satisfied
+/// regardless of matching, and is rejected up front.
 public fun place_market_order_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    budget: u64,
     mut payment: Coin<Quote>,
     max_fills: u64,
-    max_quote_in: Option<u64>,
-    min_base_out: Option<u64>,
+    min_base_out: u64,
+    max_base_out: u64,
+    max_quote_in: u64,
     ctx: &mut TxContext,
 ): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
-    validate_size(book, size);
+    // Both are Base-denominated, so this ordering constraint is
+    // unconditional (not just a special case of `max_base_out == 0`):
+    // `min_base_out > max_base_out` can never be satisfied no matter what
+    // matches, and the `u64::MAX` "unbounded" sentinel for `max_base_out`
+    // (see this function's doc comment) trivially satisfies this assert on
+    // its own, so no separate unbounded-case logic is needed here.
+    assert!(min_base_out <= max_base_out, EMinExceedsMaxBaseOut);
 
+    let size_bound = max_base_out;
+    let budget = std::u64::min(payment.value(), max_quote_in);
     let budget_balance = payment.split(budget, ctx).into_balance();
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (mut matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(book, option::none(), size, budget_balance, taker, max_fills);
+        match_bid(book, option::none(), size_bound, budget_balance, taker, max_fills);
     let taker_fee_amount = fee_amount(matched_base.value(), taker_fee_bps);
     let taker_fee_balance = matched_base.split(taker_fee_amount);
     book.fee_accumulator.base.join(taker_fee_balance);
 
-    if (max_quote_in.is_some()) {
-        let quote_spent = budget - remaining_budget.value();
-        assert!(quote_spent <= *max_quote_in.borrow(), ESlippageExceeded);
-    };
-    if (min_base_out.is_some()) {
-        assert!(matched_base.value() >= *min_base_out.borrow(), ESlippageExceeded);
+    if (min_base_out != 0) {
+        assert!(matched_base.value() >= min_base_out, ESlippageExceeded);
     };
 
     payment.join(remaining_budget.into_coin(ctx));
@@ -2278,7 +2495,7 @@ public fun place_market_order_bid<Base, Quote>(
         taker_side: true,
         entry_point: 2,
         limit_price: option::none(),
-        requested_size: size,
+        requested_size: size_bound,
         unmatched_size: remaining_size,
         rested_size: 0,
         rested_order_id: option::none(),
@@ -2289,18 +2506,38 @@ public fun place_market_order_bid<Base, Quote>(
     (matched_base.into_coin(ctx), payment, stopped_on_max_fills_while_crossing)
 }
 
+/// `payment`'s value, optionally capped by `max_base_in` (`u64`, `0` = a
+/// real zero cap that immediately no-ops with nothing matched and `payment`
+/// returned untouched; `u64::MAX` = unbounded -- replacing the old explicit
+/// `size` parameter), is how much Base this call sells; any of `payment`
+/// beyond that cap is returned unspent. `min_quote_out` (`0` = not
+/// applicable) is the slippage floor, replacing the old `Option<u64>`
+/// guard. There is no `budget`-equivalent parameter here (an ask was never
+/// budget-gated) and no replacement for the old `max_base_in` spend-guard
+/// beyond the cap itself, which is now enforced up front by construction
+/// (via the `min(payment.value(), max_base_in)` clamp below) rather than
+/// checked after the fact.
 public fun place_market_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    size: u64,
     mut payment: Coin<Base>,
     max_fills: u64,
-    min_quote_out: Option<u64>,
-    max_base_in: Option<u64>,
+    min_quote_out: u64,
+    max_base_in: u64,
     ctx: &mut TxContext,
 ): (Coin<Base>, Coin<Quote>, bool) {
     assert_book_version(book);
     assert!(!is_paused(book), EBookPaused);
-    validate_size(book, size);
+
+    let size = std::u64::min(payment.value(), max_base_in);
+    // A genuine `size == 0` (either `payment` itself is empty, or
+    // `max_base_in == 0`, a real zero cap -- see this function's doc
+    // comment) must no-op cleanly rather than abort: `validate_size` exists
+    // to gate a real resting/matching order size against the book's
+    // `min_size` floor, not to reject an intentional zero-size no-op, so it
+    // is skipped entirely in that case (matching then trivially produces
+    // zero fills without it, since `match_ask` breaks its loop immediately
+    // on `remaining_size == 0`).
+    if (size != 0) { validate_size(book, size); };
 
     let escrow_base = payment.split(size, ctx).into_balance();
     let event_book_id = book.event_id;
@@ -2312,12 +2549,8 @@ public fun place_market_order_ask<Base, Quote>(
     let taker_fee_balance = matched_quote.split(taker_fee_amount);
     book.fee_accumulator.quote.join(taker_fee_balance);
 
-    if (max_base_in.is_some()) {
-        let base_spent = size - remaining_escrow.value();
-        assert!(base_spent <= *max_base_in.borrow(), ESlippageExceeded);
-    };
-    if (min_quote_out.is_some()) {
-        assert!(matched_quote.value() >= *min_quote_out.borrow(), ESlippageExceeded);
+    if (min_quote_out != 0) {
+        assert!(matched_quote.value() >= min_quote_out, ESlippageExceeded);
     };
 
     payment.join(remaining_escrow.into_coin(ctx));

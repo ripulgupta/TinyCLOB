@@ -57,8 +57,7 @@ fun cancel_order_sweeps_combined_escrow_and_proceeds() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -200,8 +199,7 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
 
     scenario.next_tx(other());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -243,8 +241,7 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -291,8 +288,7 @@ fun update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push() {
     // Cross the reassigned resting bid with a market ask from a third party.
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -337,8 +333,7 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     // owner = admin().
     scenario.next_tx(taker());
     let ask_payment_1 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_1, matched_quote_1, _) = book.place_market_order_ask(
-        fill_size, ask_payment_1, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_1, matched_quote_1, _) = book.place_market_order_ask(ask_payment_1, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_1.burn_for_testing();
     matched_quote_1.burn_for_testing();
@@ -354,8 +349,7 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     // existing ledger entry again.
     scenario.next_tx(taker());
     let ask_payment_2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(
-        fill_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(ask_payment_2, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_2.burn_for_testing();
     matched_quote_2.burn_for_testing();
@@ -410,8 +404,7 @@ fun update_resting_order_not_found_is_a_noop() {
     unit_test::destroy(bid_ticket);
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -443,8 +436,7 @@ fun push_proceeds_rejects_wrong_cap() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book1.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book1.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -599,8 +591,7 @@ fun destroy_orphaned_ticket_with_nonzero_proceeds_aborts() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -657,8 +648,7 @@ fun destroy_orphaned_ticket_after_all_zero_credited_fill_disposes_cleanly() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        1, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, 1, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -693,8 +683,7 @@ fun destroy_ticket_unconditionally_disposes_with_real_escrow_and_proceeds_still_
     // escrow still locked for the unfilled remainder.
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -795,8 +784,7 @@ fun claim_proceeds_auto_destroys_ticket_when_order_fully_filled() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -831,8 +819,7 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -850,8 +837,7 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     // across multiple claims.
     scenario.next_tx(taker());
     let ask_payment2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment2, matched_quote2, _) = book.place_market_order_ask(
-        fill_size, ask_payment2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment2, matched_quote2, _) = book.place_market_order_ask(ask_payment2, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment2.burn_for_testing();
     matched_quote2.burn_for_testing();
@@ -890,8 +876,7 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_push() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -929,8 +914,7 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_drain() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        fill_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -986,8 +970,7 @@ fun update_resting_order_reassign_with_no_pooled_proceeds_yet_then_fill_credits_
     // ordinary credit_maker_table path.
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -1025,8 +1008,7 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
 
     scenario.next_tx(taker());
     let ask_payment_1 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_1, matched_quote_1, _) = book.place_market_order_ask(
-        fill_size, ask_payment_1, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_1, matched_quote_1, _) = book.place_market_order_ask(ask_payment_1, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_1.burn_for_testing();
     matched_quote_1.burn_for_testing(); // pooled under admin() (A)
@@ -1036,8 +1018,7 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
 
     scenario.next_tx(taker());
     let ask_payment_2 = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
-    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(
-        fill_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(ask_payment_2, 1_000_000_000, 0, fill_size, scenario.ctx(),
     );
     leftover_2.burn_for_testing();
     matched_quote_2.burn_for_testing(); // pooled under other() (B)
@@ -1092,8 +1073,7 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(300, scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        300, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, 300, scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -1137,8 +1117,7 @@ fun update_resting_order_failed_reassign_after_full_fill_does_not_sync_owner() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing(); // fully filled -> no longer resting

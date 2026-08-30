@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -90,8 +90,7 @@ fun place_market_order_bid_matches_resting_ask() {
 
     let budget = book.bid_escrow_amount(default_price(), default_size());
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, _) = book.place_market_order_bid(
-        default_size(), budget, bid_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, _) = book.place_market_order_bid(bid_payment, 1_000_000_000, 0, default_size(), u64_max(), scenario.ctx(),
     );
     assert!(matched_base.burn_for_testing() == default_size(), 0);
     assert!(leftover_payment.burn_for_testing() == 0, 1);
@@ -116,8 +115,7 @@ fun place_market_order_bid_merges_leftover_budget_and_payment_when_payment_excee
 
     let budget = book.bid_escrow_amount(default_price(), default_size());
     let bid_payment = coin::mint_for_testing<USDC>(budget + 777, scenario.ctx());
-    let (matched_base, leftover_payment, _) = book.place_market_order_bid(
-        default_size(), budget, bid_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, _) = book.place_market_order_bid(bid_payment, 1_000_000_000, 0, default_size(), u64_max(), scenario.ctx(),
     );
     assert!(matched_base.burn_for_testing() == default_size(), 0);
     // budget is fully spent (0 leftover from matching) + 777 leftover from
@@ -138,8 +136,7 @@ fun place_market_order_ask_matches_resting_bid() {
     unit_test::destroy(bid_ticket);
 
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     assert!(leftover_payment.burn_for_testing() == 0, 0);
     assert!(matched_quote.burn_for_testing() == escrow_amount, 1);

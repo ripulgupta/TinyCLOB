@@ -120,8 +120,7 @@ fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
     // (pooled-proceeds owner sync still works alongside the new event).
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(
-        default_size(), ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
     );
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
@@ -180,8 +179,7 @@ fun clob_admin_drain_step_emits_proceeds_claimed_only_for_the_nonzero_order() {
     scenario.next_tx(taker());
     let total_size = size_zero + size_normal;
     let ask_payment = coin::mint_for_testing<BTC>(total_size, scenario.ctx());
-    let (leftover, matched_quote, _) = book.place_market_order_ask(
-        total_size, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, total_size, scenario.ctx(),
     );
     leftover.burn_for_testing();
     matched_quote.burn_for_testing();

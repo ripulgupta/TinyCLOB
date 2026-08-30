@@ -63,7 +63,10 @@ fun bid_quote_escrow_at_price_matches_single_order_after_partial_fill() {
     let (per_order_escrow, per_order_remaining_size) =
         escrow_opt.borrow().resting_order_escrow_fields();
     assert!(per_order_escrow == expected_remaining, 8);
-    assert!(per_order_remaining_size == size - fill_qty, 9);
+    // `remaining_size` is Quote-denominated for a bid, equal to the live
+    // escrow value (see `order::Order.remaining_size`'s doc comment) -- NOT
+    // the Base `size - fill_qty` this would have been under the old scheme.
+    assert!(per_order_remaining_size == expected_remaining, 9);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
@@ -126,7 +129,8 @@ fun resting_order_escrow_fresh_bid_and_ask() {
     assert!(bid_escrow_opt.is_some(), 0);
     let (bid_escrow, bid_remaining) = bid_escrow_opt.borrow().resting_order_escrow_fields();
     assert!(bid_escrow == reserved, 1);
-    assert!(bid_remaining == bid_size, 2);
+    // Quote-denominated for a bid -- equal to `reserved`, not `bid_size`.
+    assert!(bid_remaining == reserved, 2);
 
     // Same result via the ticket-based wrapper.
     let bid_escrow_opt_via_ticket = book.resting_order_escrow_by_ticket(&bid_ticket);
@@ -134,7 +138,7 @@ fun resting_order_escrow_fresh_bid_and_ask() {
     let (bid_escrow_2, bid_remaining_2) =
         bid_escrow_opt_via_ticket.borrow().resting_order_escrow_fields();
     assert!(bid_escrow_2 == reserved, 4);
-    assert!(bid_remaining_2 == bid_size, 5);
+    assert!(bid_remaining_2 == reserved, 5);
 
     scenario.next_tx(maker_b());
     let ask_price = default_price() + 1; // above best bid, so it just rests.
@@ -172,8 +176,7 @@ fun resting_order_escrow_after_partial_fill_full_fill_and_cancel() {
     scenario.next_tx(taker());
     let fill_qty = min_size();
     let ask_payment = coin::mint_for_testing<BTC>(fill_qty, scenario.ctx());
-    let (leftover, matched_quote, _) = book.place_market_order_ask(
-        fill_qty, ask_payment, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_qty, scenario.ctx(),
     );
     leftover.burn_for_testing();
     let quote_charged = matched_quote.burn_for_testing();
@@ -183,15 +186,16 @@ fun resting_order_escrow_after_partial_fill_full_fill_and_cancel() {
     let (escrow_after_partial, remaining_after_partial) =
         opt_after_partial.borrow().resting_order_escrow_fields();
     assert!(escrow_after_partial == reserved - quote_charged, 1);
-    assert!(remaining_after_partial == size - fill_qty, 2);
+    // Quote-denominated for a bid -- equal to `escrow_after_partial`, not
+    // the Base `size - fill_qty`.
+    assert!(remaining_after_partial == reserved - quote_charged, 2);
 
     // Full fill: the order is completely drained and removed, so the query
     // must return None (distinct from `Some((0, r>0))`).
     scenario.next_tx(taker());
     let remaining_size = size - fill_qty;
     let ask_payment_2 = coin::mint_for_testing<BTC>(remaining_size, scenario.ctx());
-    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(
-        remaining_size, ask_payment_2, 1_000_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_2, matched_quote_2, _) = book.place_market_order_ask(ask_payment_2, 1_000_000_000, 0, remaining_size, scenario.ctx(),
     );
     leftover_2.burn_for_testing();
     matched_quote_2.burn_for_testing();
@@ -264,11 +268,16 @@ fun resting_order_escrow_by_ticket_wrong_book_aborts() {
     scenario.end();
 }
 
-// Reachable `Some((0, r))` state: the order's escrow is fully charged
-// (clamped at its own `total_reserved`, which is strictly less than what a
-// full drain of `original_size` would otherwise imply -- the shortfall
-// scenario), yet it's still resting with real remaining size. Distinct from
-// `None` (not resting at all).
+// Reachable `Some((0, 0))` state (RETARGETED for the telescoping
+// cumulative-proportional-ceiling escrow-charging scheme -- see
+// `order::Order.original_size`'s doc comment and `fill_level_ask` in
+// `tiny_clob.move`): a bid's escrow (Quote) can hit exactly `0` strictly
+// before its Base side (`original_size - fee_basis_accumulated`) is
+// exhausted, so the order is still resting with real remaining Base
+// capacity even though `resting_order_escrow_fields` reports `(escrow: 0,
+// remaining_size: 0)` (both fields are the same live Quote escrow value for
+// a bid -- see the field's own doc comment). Distinct from `None` (not
+// resting at all).
 #[test]
 fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     let mut scenario = ts::begin(admin());
@@ -288,15 +297,17 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     let bid_ticket = ticket_opt.destroy_some();
     let order_id = bid_ticket.ticket_order_id();
 
-    // Two 1-unit fills of the remaining 7 units, each taker-limited (maker
-    // still has size left afterward: 6, then 5). Under the rounding-
-    // direction fix, `fill_level_ask`'s taker-limited quote_cost is
-    // `min(max(floor(price * fill_qty / price_scale), 1),
-    // escrow_quote_value(&maker_order))`: `floor(5*1/18) = 0`, so each fill
-    // is `max(0, 1) = 1`, clamped against the live escrow (2, then 1) --
-    // both fills charge exactly 1, exhausting `total_reserved`(2) to 0
-    // exactly after the second fill, while 5 units of remaining_size are
-    // still genuinely resting.
+    // Four 1-unit fills of the remaining 7 units, each taker-limited (maker
+    // still has size left afterward: 6, 5, 4, then 3). Hand-derived
+    // cumulative-ceiling values (`target(k) = ceil(2*k/7)`, `k` = cumulative
+    // Base filled): `target(1..7) = 1,1,1,2,2,2,2`. Per-fill deltas:
+    //   fill_a (k=1): target=1, delta = 1 - 0 = 1
+    //   fill_b (k=2): target=1, delta = 1 - 1 = 0
+    //   fill_c (k=3): target=1, delta = 1 - 1 = 0
+    //   fill_d (k=4): target=2, delta = 2 - 1 = 1
+    // Sum = 2 == total_reserved: the escrow hits exactly 0 after the 4th
+    // fill, while the maker still has 7 - 4 = 3 units of genuinely resting
+    // Base capacity.
     scenario.next_tx(maker_b());
     let base_a = coin::mint_for_testing<BTC>(1, scenario.ctx());
     let (ta, lba, mqa, _) = book.place_limit_order_ask(shortfall_price(), 1, base_a, 10, scenario.ctx());
@@ -311,20 +322,52 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     assert!(tb.is_none(), 11);
     tb.destroy_none();
     lbb.burn_for_testing();
-    assert!(mqb.burn_for_testing() == 1, 12);
+    assert!(mqb.burn_for_testing() == 0, 12);
+
+    scenario.next_tx(maker_b());
+    let base_c = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (tc, lbc, mqc, _) = book.place_limit_order_ask(shortfall_price(), 1, base_c, 10, scenario.ctx());
+    assert!(tc.is_none(), 13);
+    tc.destroy_none();
+    lbc.burn_for_testing();
+    assert!(mqc.burn_for_testing() == 0, 14);
+
+    scenario.next_tx(maker_b());
+    let base_d = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (td, lbd, mqd, _) = book.place_limit_order_ask(shortfall_price(), 1, base_d, 10, scenario.ctx());
+    assert!(td.is_none(), 15);
+    td.destroy_none();
+    lbd.burn_for_testing();
+    assert!(mqd.burn_for_testing() == 1, 16);
 
     let escrow_opt = book.resting_order_escrow(true, shortfall_price(), order_id);
     assert!(escrow_opt.is_some(), 1);
     let (escrow, remaining) = escrow_opt.borrow().resting_order_escrow_fields();
     assert!(escrow == 0, 2);
-    assert!(remaining == 5, 3);
+    // `remaining_size` is Quote-denominated for a bid (equal to `escrow`),
+    // NOT the Base remaining capacity (which is genuinely 3, still
+    // resting/fillable -- see the header comment above).
+    assert!(remaining == 0, 3);
 
     // Matches the same read via `resting_order_escrow_by_ticket`.
     let escrow_opt_via_ticket = book.resting_order_escrow_by_ticket(&bid_ticket);
     assert!(escrow_opt_via_ticket.is_some(), 4);
     let (escrow_2, remaining_2) = escrow_opt_via_ticket.borrow().resting_order_escrow_fields();
     assert!(escrow_2 == 0, 5);
-    assert!(remaining_2 == 5, 6);
+    assert!(remaining_2 == 0, 6);
+
+    // The order is genuinely still live and fillable: one more 1-unit ask
+    // fill succeeds and is charged 0 (target(5) = ceil(10/7) = 2,
+    // already_charged = 2, delta = 0), proving this is NOT the same as
+    // `None` (not resting at all).
+    scenario.next_tx(maker_b());
+    let base_e = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (te, lbe, mqe, _) = book.place_limit_order_ask(shortfall_price(), 1, base_e, 10, scenario.ctx());
+    assert!(te.is_none(), 17);
+    te.destroy_none();
+    lbe.burn_for_testing();
+    assert!(mqe.burn_for_testing() == 0, 18);
+    assert!(book.resting_order_escrow(true, shortfall_price(), order_id).is_some(), 19);
 
     unit_test::destroy(ask_ticket);
     unit_test::destroy(bid_ticket);

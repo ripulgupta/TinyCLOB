@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -67,7 +67,8 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     assert!(leftover_quote.burn_for_testing() == 0, 3);
     assert!(ticket_opt.is_some(), 4);
     let ticket = ticket_opt.destroy_some();
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == size, 5);
+    // Quote-denominated for a bid -- equal to the escrow reserved, not `size`.
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == expected_escrow, 5);
 
     let (b, q) = book.cancel_order(ticket, scenario.ctx());
     assert!(b.burn_for_testing() == 0, 6);
@@ -244,8 +245,7 @@ fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
     scenario.next_tx(taker());
     let budget: u64 = 20_000_000_000; // 2e10 quote atoms
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(
-        1_000, budget, payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(payment, 10, 0, 1_000, u64_max(), scenario.ctx(),
     );
     // The resting ask only has 1_000 base atoms available, so the fill is
     // capped by natural_fill_qty (1_000), not by an abort.

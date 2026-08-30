@@ -108,14 +108,18 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     scenario.next_tx(taker());
     let cross2_size = 214;
     let cross2_payment = coin::mint_for_testing<BTC>(cross2_size, scenario.ctx());
-    let (cross2_leftover, cross2_matched, cross2_stopped) = book.place_market_order_ask(
-        cross2_size, cross2_payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (cross2_leftover, cross2_matched, cross2_stopped) = book.place_market_order_ask(cross2_payment, 10, 0, cross2_size, scenario.ctx(),
     );
     assert!(!cross2_stopped, 15);
     assert!(cross2_leftover.burn_for_testing() == 0, 16);
     assert!(cross2_matched.burn_for_testing() == 601 * 214, 17); // = 128_614, exact, fee 0
-    // bid1 now has 401 - 214 = 187 remaining, pooling 214 base for maker_b().
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid1_price) == 187, 18);
+    // bid1 now has 401 - 214 = 187 Base remaining, pooling 214 base for
+    // maker_b(). `depth_at_price` for a bid is Quote-denominated -- since
+    // `bid1_price` is an exact multiple of `price_scale`, the escrow charge
+    // divides out exactly with zero rounding slop at any cumulative fill
+    // count, so the remaining Quote escrow is exactly `601 * 187 = 112_387`
+    // (i.e. `bid_escrow_amount(bid1_price, 187)`, exactly), not `187`.
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid1_price) == 601 * 187, 18);
 
     // --- Fees change mid-lifecycle. ---
     scenario.next_tx(admin());
@@ -304,13 +308,16 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     scenario.next_tx(taker());
     let cross2_size = 41;
     let cross2_payment = coin::mint_for_testing<WAL>(cross2_size, scenario.ctx());
-    let (cross2_leftover, cross2_matched, _) = book.place_market_order_ask(
-        cross2_size, cross2_payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (cross2_leftover, cross2_matched, _) = book.place_market_order_ask(cross2_payment, 10, 0, cross2_size, scenario.ctx(),
     );
     assert!(cross2_leftover.burn_for_testing() == 0, 11);
     assert!(cross2_matched.burn_for_testing() == 289 * 41, 12); // = 11_849, exact
     // bid now has 97 - 41 = 56 remaining, pooling 41 base for maker_c().
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid_price) == 56, 13);
+    // bid now has 97 - 41 = 56 Base remaining. `depth_at_price` for a bid is
+    // Quote-denominated; `bid_price` is an exact multiple of `price_scale`,
+    // so the remaining escrow divides out exactly to `289 * 56 = 16_184`
+    // (`bid_escrow_amount(bid_price, 56)`, exactly), not `56`.
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid_price) == 289 * 56, 13);
 
     // Reassign the remaining 56 of the bid to maker_a() -- left resting
     // (untouched) until the retire/drain finale below, to prove force-drain

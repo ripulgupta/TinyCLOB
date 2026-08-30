@@ -41,7 +41,7 @@ use sui::coin;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket};
 use tiny_clob::test_markers::{BTC, USDC};
-use tiny_clob::test_utils::{admin, maker_a, taker, realistic_decimals_book, destroy_book_and_cap};
+use tiny_clob::test_utils::{admin, maker_a, taker, realistic_decimals_book, destroy_book_and_cap, u64_max};
 
 // `realistic_decimals_book<BTC, USDC>(1, &mut scenario)` (base_decimals=8,
 // quote_decimals=6, precision=0, exponent=19) derives `price_scale == 184`
@@ -105,8 +105,7 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
 
     scenario.next_tx(taker());
     let bid_payment_a = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_a, leftover_quote_a, stopped_a) = book_a.place_market_order_bid(
-        100, BUDGET, bid_payment_a, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
+    let (matched_base_a, leftover_quote_a, stopped_a) = book_a.place_market_order_bid(bid_payment_a, MAX_FILLS, 0, 100, u64_max(), scenario.ctx(),
     );
     assert!(!stopped_a, 0);
     let base_received_a = matched_base_a.burn_for_testing();
@@ -125,8 +124,7 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
 
     scenario.next_tx(taker());
     let bid_payment_b = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_b, leftover_quote_b, stopped_b) = book_b.place_market_order_bid(
-        100, BUDGET, bid_payment_b, MAX_FILLS, option::none(), option::none(), scenario.ctx(),
+    let (matched_base_b, leftover_quote_b, stopped_b) = book_b.place_market_order_bid(bid_payment_b, MAX_FILLS, 0, 100, u64_max(), scenario.ctx(),
     );
     assert!(!stopped_b, 3);
     let base_received_b = matched_base_b.burn_for_testing();

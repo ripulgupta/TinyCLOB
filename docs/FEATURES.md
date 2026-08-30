@@ -316,62 +316,153 @@ Unlike the bid side, an ask's unmatched remainder always rests at its full
 size — `Base`-denominated escrow requires no price-scale conversion or
 rounding, so there is no analogous shortfall case.
 
+### `place_limit_order_bid_expected_output`
+
+```
+public fun place_limit_order_bid_expected_output<Base, Quote>(
+    book: &mut OrderBook<Base, Quote>,
+    payment: Coin<Quote>,
+    expected_base_output: u64,
+    max_fills: u64,
+    ctx: &mut TxContext,
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
+```
+
+Convenience wrapper around `place_limit_order_bid` that derives its `price`
+from a whole `payment` coin rather than taking one directly. The implied
+`price` is `floor(payment.value() * price_scale / expected_base_output)` —
+the maximum price `payment`'s entire value can afford for
+`expected_base_output` Base — computed once and used both to cross the book
+and, unchanged, as the price any unfilled remainder rests at. This
+guarantees `bid_escrow_amount(book, price, expected_base_output) <=
+payment.value()`, so the delegated placement can never itself abort for
+lack of funds; any leftover (rounding slack from the `floor`, plus whatever
+isn't matched/rested) is returned merged into the leftover `Coin<Quote>`,
+same as `place_limit_order_bid`. Aborts with `EZeroPrice` (14) if the
+derived price rounds down to `0`, or `EPriceOverflow` (29) if it would
+overflow `u64`. Also aborts if `expected_base_output < min_size`.
+
+**Worst-case resting price**: because the derived price is a maximum, any
+unmatched remainder rests at the *worst* price this payment could imply —
+potentially far above what a hand-computed limit price would use. This is
+deliberate (it is what makes the fund-safety guarantee above hold), not a
+bug, but callers who care about the resting price rather than just
+guaranteed non-reverting placement should compute and pass an explicit
+`price` to `place_limit_order_bid` directly instead.
+
+### `place_limit_order_ask_expected_output`
+
+```
+public fun place_limit_order_ask_expected_output<Base, Quote>(
+    book: &mut OrderBook<Base, Quote>,
+    payment: Coin<Base>,
+    expected_quote_output: u64,
+    max_fills: u64,
+    ctx: &mut TxContext,
+): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
+```
+
+Mirrors `place_limit_order_bid_expected_output` for the ask side. The whole
+`payment` coin's value is the resting ask's `size`; the implied `price` is
+`ceil(expected_quote_output * price_scale / size)` — the lowest price at
+which fully filling `size` yields at least `expected_quote_output` Quote.
+Unlike the bid-side variant there is no rounding-slack leftover to return
+(an ask's escrow is exactly `size` Base, with no price-scale conversion).
+Aborts with `EZeroPrice` (14) if `expected_quote_output == 0`, or
+`EPriceOverflow` (29) if the derived price would overflow `u64`.
+
+**Worst-case resting price**: the derived price is the *lowest* price
+satisfying the constraint above, so any unmatched remainder rests at the
+worst price for the ask's own maker (least Quote received per unit sold).
+Deliberate, for the same fund-safety reason as the bid-side mirror — not a
+bug, but a caller who cares about the resting price should pass an explicit
+`price` to `place_limit_order_ask` directly instead.
+
 ### `place_market_order_bid`
 
 ```
 public fun place_market_order_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    budget: u64,
     payment: Coin<Quote>,
     max_fills: u64,
-    max_quote_in: Option<u64>,
-    min_base_out: Option<u64>,
+    min_base_out: u64,
+    max_base_out: u64,
+    max_quote_in: u64,
     ctx: &mut TxContext,
 ): (Coin<Base>, Coin<Quote>, bool)
 ```
 
 No price parameter; no declared-range check and no price-band check apply
 at all — this fills at whatever prices the book's resting orders currently
-offer. Aborts if the book is paused, or if `size < min_size`. `budget` is
-the amount of `payment` escrowed for this buy; any part of `payment` beyond
-`budget`, together with any unspent portion of `budget` itself left over
-from matching, is merged into and returned as a single `Coin<Quote>`. Never
-rests an order — anything unfilled is simply returned.
+offer. Aborts if the book is paused. Never rests an order — anything
+unfilled is simply returned. There is no `size`/`budget` split like the
+older interface: `payment`'s whole value is the taker's available Quote,
+and `max_base_out`/`max_quote_in` cap how much of it actually gets used.
 
-Optional slippage guards, checked after matching completes: `max_quote_in`
-aborts with `ESlippageExceeded` (17) if the quote actually spent exceeds it;
-`min_base_out` aborts with the same code if the base actually received is
-below it.
+- `max_base_out` caps how much Base this call will ever try to buy. `0` is
+  a real, literal zero cap — the call immediately no-ops with nothing
+  matched and `payment` returned untouched, it does **not** mean
+  "unbounded". `u64::MAX` means unbounded.
+- `max_quote_in` caps how much Quote this call will ever spend, using the
+  same `0`-is-real / `u64::MAX`-is-unbounded convention. At most
+  `min(payment.value(), max_quote_in)` is ever escrowed into the match —
+  the cap is enforced up front, by construction, not asserted after the
+  fact — and anything beyond it is returned untouched as part of the merged
+  leftover `Coin<Quote>`.
+- `min_base_out` is the slippage floor: aborts with `ESlippageExceeded`
+  (17) if the base actually received is below it. `0` means "not
+  applicable" (no floor).
+- Aborts with `EMinExceedsMaxBaseOut` (30) if `min_base_out >
+  max_base_out` — both are Base-denominated, so this combination can never
+  be satisfied by any match outcome, and is rejected up front rather than
+  left to surface later as a confusing `ESlippageExceeded`. `max_base_out ==
+  u64::MAX` always satisfies this check.
 
-`budget` and `max_quote_in` serve different purposes and are not redundant:
-`budget` is escrowed up front and must cover the worst case the caller is
-willing to fund; `max_quote_in` is a post-hoc, atomic assertion on the
-actual amount spent, which can be tighter than `budget` without requiring
-the caller to compute a precisely-sized `budget` coin in advance. A caller
-may pass a generously large `budget` and rely on `max_quote_in` to bound
-real spend — the unspent difference is always returned automatically as
-part of the merged leftover `Coin<Quote>` — rather than needing to
-pre-split `payment` down to an exact amount themselves.
+This interface replaces an older `(size: u64, budget: u64, payment,
+max_fills, max_quote_in: Option<u64>, min_base_out: Option<u64>)` signature.
+It is a redesign, not a positional drop-in: every parameter's meaning
+and/or type changed, so do not mechanically migrate a caller by renaming
+old arguments onto the new positions.
 
 ### `place_market_order_ask`
 
 ```
 public fun place_market_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    size: u64,
     payment: Coin<Base>,
     max_fills: u64,
-    min_quote_out: Option<u64>,
-    max_base_in: Option<u64>,
+    min_quote_out: u64,
+    max_base_in: u64,
     ctx: &mut TxContext,
 ): (Coin<Base>, Coin<Quote>, bool)
 ```
 
 Mirrors `place_market_order_bid` for the ask side: no price parameter, no
-declared-range or price-band checks. `size` determines exactly how much
-`Base` is escrowed from `payment` for this sell. Optional slippage guards
-`min_quote_out`/`max_base_in`, same abort code.
+declared-range or price-band checks.
+
+- `max_base_in` caps how much Base this call sells: `size =
+  min(payment.value(), max_base_in)`. `0` is a real, literal zero cap — the
+  call immediately no-ops with nothing matched and `payment` returned
+  untouched (this size-zero case deliberately skips the `min_size` check
+  below, since it isn't placing any order at all). `u64::MAX` means
+  unbounded (`size` is then simply `payment.value()`). Any of `payment`
+  beyond the resulting `size` is returned unspent.
+- When the resulting `size` is nonzero, it must satisfy `size >= min_size`
+  (aborts with `ESizeBelowMinSize` (12) otherwise) — this check does not
+  apply to the `size == 0` no-op case above.
+- `min_quote_out` is the slippage floor: aborts with `ESlippageExceeded`
+  (17) if the quote actually received is below it. `0` means "not
+  applicable".
+
+Unlike `place_market_order_bid`, there is no `min_quote_out`-vs-`max_base_in`
+ordering constraint to enforce — the two are denominated in different
+currencies (Quote and Base respectively), so no combination of values is
+inherently unsatisfiable the way `min_base_out > max_base_out` is on the bid
+side.
+
+This interface replaces an older `(size: u64, payment, max_fills,
+min_quote_out: Option<u64>, max_base_in: Option<u64>)` signature — likewise
+a redesign, not a positional drop-in.
 
 ### `swap_bid`
 
@@ -434,8 +525,10 @@ second. `place_market_order_ask`/`swap_ask` return
 `(Coin<Base>, Coin<Quote>, bool)` too, but the first position is the
 leftover (unmatched) base returned to the caller and the second is the
 matched quote received — see each function's own signature for which is
-which. On the bid side, `budget`'s own unspent remainder from matching and
-the portion of `payment` never earmarked as `budget` are joined into that
+which. On the bid side, whatever internally-escrowed Quote goes unspent by
+matching, together with the portion of `payment` never escrowed for
+matching in the first place (e.g. capped out by `max_quote_in` on
+`place_market_order_bid`, or `budget` on `swap_bid`), are joined into that
 one leftover `Coin<Quote>` before it is returned, mirroring how
 `place_limit_order_bid`/`place_limit_order_ask` already merge their own
 internal escrow/payment
@@ -772,7 +865,7 @@ upgraded in place with no separate migration call required — this emits
 | `is_book_retiring<Base, Quote>(book): bool` | current retiring state (sticky once `true`) |
 | `best_bid<Base, Quote>(book): Option<u64>` | highest resting bid price, or `None` |
 | `best_ask<Base, Quote>(book): Option<u64>` | lowest resting ask price, or `None` |
-| `depth_at_price<Base, Quote>(book, side: bool, price: u64): u64` | total resting size at that exact raw price on that side; `0` if no such level exists, for any `price` value including `0` — never aborts |
+| `depth_at_price<Base, Quote>(book, side: bool, price: u64): u64` | total resting size at that exact raw price on that side; `0` if no such level exists, for any `price` value including `0` — never aborts. Denomination depends on `side`: Base for an ask level, but QUOTE for a bid level (the sum of every resting bid's remaining Quote buying-power at that price — identical to `bid_quote_escrow_at_price(book, price)` for the same price) |
 | `bid_escrow_amount<Base, Quote>(book, price, size): u64` | escrow required for a bid at `(price, size)` (§3) |
 | `ticket_order_id`/`ticket_order_book_id`/`ticket_side`/`ticket_price` | the corresponding field of an `OrderTicket` |
 | `last_price<Base, Quote>(book): u64` | the book's current `last_price` (§5) |
@@ -782,7 +875,7 @@ upgraded in place with no separate migration call required — this emits
 | `bid_quote_escrow_at_price<Base, Quote>(book, price): u64` | the exact, maintained total of live `Quote` escrow held by every resting bid order at `price`; `0` if no bid level exists there. Bid-only (no `side` parameter) — an ask level's escrow is `Base`, already exactly equal to `depth_at_price(book, ask(), price)`, so there is no analogous "quote value" for it. |
 | `resting_order_escrow<Base, Quote>(book, side, price, order_id): Option<RestingOrderEscrow>` | the live state of one resting order, or `None` if that price level doesn't exist or holds no such order (fully filled, cancelled, or never placed). Never aborts, for any input. |
 | `resting_order_escrow_by_ticket<Base, Quote>(book, ticket): Option<RestingOrderEscrow>` | `resting_order_escrow` for the order `ticket` was minted for. Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. |
-| `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows); `remaining_size` is always the order's Base-denominated remaining size regardless of side. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. `(0, r)` with `r > 0` is a real, reachable state (escrow fully charged, order still resting with real remaining size) — distinct from `None` (not resting at all). |
+| `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows). `remaining_size` is ALSO denominated in Quote for a bid, Base for an ask — NOT always Base regardless of side. For a bid, `escrow` and `remaining_size` are therefore always equal (both are just the live Quote escrow value); for an ask they were already equal. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. For an ask, `escrow`/`remaining_size` can never reach `0` while still resting (draining to `0` is the same fill that stops it from resting). For a bid, under the telescoping proportional-ceiling escrow-charging scheme, `(escrow: 0, remaining_size: 0)` for a live, still-resting, still-fillable order IS a real, reachable state whenever the order's resting price is below `price_scale` — the Quote escrow can hit exactly `0` strictly before the order's Base side is exhausted. `None` (not resting at all) remains the only other state for either side. |
 
 ## 13. Events reference
 
@@ -837,11 +930,13 @@ leaves it still resting, and differs by side:
   `ceil(price * size / price_scale)`.
 - A fill that leaves the order **still resting**: on the maker-ask side,
   `quote_amount = ceil(price * size / price_scale)` exactly, unchanged. On
-  the maker-bid side, `quote_amount` is at least 1 atom whenever that order's
-  remaining Quote escrow still holds at least 1 atom, and never more than
-  what remains in it — `0` only in the pre-existing, separately documented
-  `(escrow == 0, remaining_size > 0)` state (§12,
-  `resting_order_escrow_fields`).
+  the maker-bid side, `quote_amount` is never more than what remains in that
+  order's Quote escrow, but — unlike the ask side — it CAN be exactly `0`
+  even while the order's remaining Quote escrow is still nonzero (i.e. a
+  fill with `fill_qty > 0` that charges no additional Quote this round);
+  this is a legitimate, non-error outcome of the escrow-charging scheme and
+  is not itself evidence of the `(escrow: 0, remaining_size: 0)` state
+  described under `resting_order_escrow_fields` (§12).
 
 This rounding is deliberately asymmetric: a fill that exhausts a resting
 order's own liquidity (not the taker's choice) never costs the taker more
@@ -925,6 +1020,8 @@ maker fee is actually paid in).
 | 26 | `EResetPriceBelowBestBid` |
 | 27 | `EResetPriceAboveBestAsk` |
 | 28 | `EDecimalsTooLarge` |
+| 29 | `EPriceOverflow` |
+| 30 | `EMinExceedsMaxBaseOut` |
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 
@@ -962,10 +1059,16 @@ maker fee is actually paid in).
   level to receive a nonzero fill within a single match, not the first
   level touched and not an aggregate/average across levels touched.
 - `bid_escrow_amount(book, 0, size)` returns `0` and does not abort.
-- `resting_order_escrow` can return `Some((0, r))` with `r > 0` — a resting
-  bid whose escrow is fully charged but which still has real remaining
-  size and stays on the book. This is distinct from `None` (not resting at
-  all) and is a real, reachable state, not an error condition.
+- For an ask, `resting_order_escrow`'s `escrow`/`remaining_size` can never
+  both reach `0` while the order still rests (they are equal, and draining
+  to `0` is the same fill that stops it from resting). For a bid, this is
+  no longer true: `remaining_size` is Quote-denominated for a bid (equal to
+  `escrow`), and under the telescoping proportional-ceiling escrow-charging
+  scheme, `Some((escrow: 0, remaining_size: 0))` for a live, still-resting,
+  still-fillable bid IS a real, reachable state whenever the order's
+  resting price is below `price_scale` — the Quote escrow can hit exactly
+  `0` strictly before the order's Base side is exhausted. This is distinct
+  from `None` (not resting at all) and is not an error condition.
 - `bid_quote_escrow_at_price` is an exact, maintained aggregate, not a
   re-derivation — unlike computing `bid_escrow_amount(book, price,
   depth_at_price(book, bid(), price))`, which can over- or under-count the

@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -111,8 +111,7 @@ fun place_market_order_bid_ask_happy_path() {
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, _) = book.place_market_order_bid(
-        PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, _) = book.place_market_order_bid(bid_payment, 10, 0, PLACEMENT_SIZE, u64_max(), scenario.ctx(),
     );
     assert!(matched_base.burn_for_testing() == PLACEMENT_SIZE, 0);
     assert!(leftover.burn_for_testing() == 0, 1);
@@ -121,7 +120,7 @@ fun place_market_order_bid_ask_happy_path() {
     let bid_ticket2 = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
     let ask_payment2 = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
     let (leftover_base, matched_quote, _) =
-        book.place_market_order_ask(PLACEMENT_SIZE, ask_payment2, 10, option::none(), option::none(), scenario.ctx());
+        book.place_market_order_ask(ask_payment2, 10, 0, PLACEMENT_SIZE, scenario.ctx());
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 3);
     assert!(leftover_base.burn_for_testing() == 0, 4);
 
@@ -132,7 +131,7 @@ fun place_market_order_bid_ask_happy_path() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 17, location = tiny_clob)] // ESlippageExceeded
 fun place_market_order_bid_slippage_bound_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
@@ -141,8 +140,13 @@ fun place_market_order_bid_slippage_bound_aborts() {
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    // `min_base_out == max_base_out == PLACEMENT_SIZE + 1` satisfies the
+    // `min_base_out <= max_base_out` ordering assert on its own, so the only
+    // available liquidity (`PLACEMENT_SIZE`) genuinely falls short of the
+    // slippage floor -- an actual `ESlippageExceeded`, not the unrelated
+    // `EMinExceedsMaxBaseOut` ordering check.
     let (matched_base, leftover, _) = book.place_market_order_bid(
-        PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::some(PLACEMENT_SIZE + 1), scenario.ctx(),
+        bid_payment, 10, PLACEMENT_SIZE + 1, PLACEMENT_SIZE + 1, u64_max(), scenario.ctx(),
     );
     matched_base.burn_for_testing();
     leftover.burn_for_testing();
@@ -201,8 +205,7 @@ fun place_market_order_bid_returns_true_when_truncated_by_max_fills() {
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
     // max_fills = 0 against a crossing resting ask: nothing can be matched,
     // and the truncation signal must now come back as `true`.
-    let (matched_base, leftover, stopped) = book.place_market_order_bid(
-        PLACEMENT_SIZE, budget, bid_payment, 0, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(bid_payment, 0, 0, PLACEMENT_SIZE, u64_max(), scenario.ctx(),
     );
     assert!(matched_base.burn_for_testing() == 0, 0);
     assert!(leftover.burn_for_testing() == budget, 1);
@@ -222,8 +225,7 @@ fun place_market_order_bid_returns_false_when_fully_filled_within_max_fills() {
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.place_market_order_bid(
-        PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover, stopped) = book.place_market_order_bid(bid_payment, 10, 0, PLACEMENT_SIZE, u64_max(), scenario.ctx(),
     );
     assert!(matched_base.burn_for_testing() == PLACEMENT_SIZE, 0);
     assert!(leftover.burn_for_testing() == 0, 1);
@@ -242,8 +244,7 @@ fun place_market_order_ask_returns_true_when_truncated_by_max_fills() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(
-        PLACEMENT_SIZE, ask_payment, 0, option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(ask_payment, 0, 0, PLACEMENT_SIZE, scenario.ctx(),
     );
     assert!(leftover_base.burn_for_testing() == PLACEMENT_SIZE, 0);
     assert!(matched_quote.burn_for_testing() == 0, 1);
@@ -262,8 +263,7 @@ fun place_market_order_ask_returns_false_when_fully_filled_within_max_fills() {
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(
-        PLACEMENT_SIZE, ask_payment, 10, option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(ask_payment, 10, 0, PLACEMENT_SIZE, scenario.ctx(),
     );
     assert!(leftover_base.burn_for_testing() == 0, 0);
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 1);

@@ -15,7 +15,7 @@ use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, ClobAdminCap};
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC};
-use tiny_clob::test_utils::{Self, admin, other, maker_a, new_book, realistic_decimals_book, destroy_book_and_cap};
+use tiny_clob::test_utils::{Self, admin, other, maker_a, new_book, realistic_decimals_book, destroy_book_and_cap, u64_max};
 
 // `new_book` (base_decimals = quote_decimals = precision = 0, exponent =
 // 19) derives `price_scale == 1`, so `quote_cost == price * fill_qty`
@@ -145,8 +145,7 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
     let mut i = 0;
     while (i < 2) {
         let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
-        let (leftover_base, matched_quote, _) = book.place_market_order_ask(
-            100, ask_payment, 1_000_000, option::none(), option::none(), scenario.ctx(),
+        let (leftover_base, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000, 0, 100, scenario.ctx(),
         );
         leftover_base.burn_for_testing();
         matched_quote.burn_for_testing();
@@ -267,8 +266,7 @@ fun maker_fee_reserve_trues_up_on_clob_admin_drain_step_with_nonzero_slack() {
     let mut i = 0;
     while (i < 2) {
         let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
-        let (leftover_base, matched_quote, _) = book.place_market_order_ask(
-            100, ask_payment, 1_000_000, option::none(), option::none(), scenario.ctx(),
+        let (leftover_base, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000, 0, 100, scenario.ctx(),
         );
         leftover_base.burn_for_testing();
         matched_quote.burn_for_testing();
@@ -379,8 +377,7 @@ fun order_executed_taker_fee_amount_matches_aggregate_across_many_small_fills() 
 
     let budget = PRICE * num_fills;
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(
-        num_fills, budget, payment, 1_000_000, option::none(), option::none(), scenario.ctx(),
+    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(payment, 1_000_000, 0, num_fills, u64_max(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     let matched_base_val = matched_base.burn_for_testing();
@@ -440,8 +437,7 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
     };
 
     let payment = coin::mint_for_testing<BTC>(num_fills, scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(
-        num_fills, payment, 1_000_000, option::none(), option::none(), scenario.ctx(),
+    let (leftover_base, matched_quote, stopped) = book.place_market_order_ask(payment, 1_000_000, 0, num_fills, scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1);
