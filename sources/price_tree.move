@@ -217,7 +217,7 @@ public(package) fun level_set_order_owner<Base, Quote>(
 
 // === Construction ===
 
-public fun new<V: store>(ctx: &mut TxContext): PriceTree<V> {
+public(package) fun new<V: store>(ctx: &mut TxContext): PriceTree<V> {
     PriceTree {
         root: EMPTY_TREE,
         internal_nodes: table::new(ctx),
@@ -232,7 +232,7 @@ public fun new<V: store>(ctx: &mut TxContext): PriceTree<V> {
 /// Consumes an empty `PriceTree`. Aborts (via `table::destroy_empty`) if
 /// either table is non-empty. Needed because `Table` has no `drop`, so a
 /// tree can only go out of scope once both of its tables are empty.
-public fun destroy_empty<V: store>(tree: PriceTree<V>) {
+public(package) fun destroy_empty<V: store>(tree: PriceTree<V>) {
     let PriceTree {
         root: _,
         internal_nodes,
@@ -318,7 +318,7 @@ fun descend_extreme<V: store>(tree: &PriceTree<V>, start_ptr: u64, want_min: boo
 /// descent is now replayed from an in-memory record of the first descent's
 /// path instead of touching `Table` again — see the comments below for why
 /// that replay is always exactly a prefix of the first descent's path.
-public fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
+public(package) fun insert<V: store>(tree: &mut PriceTree<V>, key: u64, value: V) {
     if (tree.root == EMPTY_TREE) {
         let leaf_idx = tree.next_leaf_index;
         tree.next_leaf_index = leaf_idx + 1;
@@ -589,7 +589,7 @@ public(package) fun find_and_remove_order<Base, Quote>(
 /// returned by `find`/`min_leaf`/`max_leaf` (not a raw price key).
 ///
 /// Cost: O(log distinct_price_count).
-public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
+public(package) fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     let leaf_idx = leaf_index_of(leaf_ptr);
     let Leaf { key: _, value, parent } = tree.leaves.remove(leaf_idx);
@@ -634,7 +634,7 @@ public fun remove<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): V {
 }
 
 /// Returns the leaf pointer for `key` if present.
-public fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
+public(package) fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
     if (tree.root == EMPTY_TREE) {
         return option::none()
     };
@@ -643,34 +643,34 @@ public fun find<V: store>(tree: &PriceTree<V>, key: u64): Option<u64> {
     if (leaf.key == key) option::some(ptr) else option::none()
 }
 
-public fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
+public(package) fun borrow<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): &V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     &tree.leaves.borrow(leaf_index_of(leaf_ptr)).value
 }
 
 /// Returns the price `key` a leaf pointer (as returned by `find`/
 /// `min_leaf`/`max_leaf`) was inserted under.
-public fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
+public(package) fun key<V: store>(tree: &PriceTree<V>, leaf_ptr: u64): u64 {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     tree.leaves.borrow(leaf_index_of(leaf_ptr)).key
 }
 
-public fun borrow_mut<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): &mut V {
+public(package) fun borrow_mut<V: store>(tree: &mut PriceTree<V>, leaf_ptr: u64): &mut V {
     assert!(is_leaf_ptr(leaf_ptr) && leaf_ptr != NO_PARENT, EInvalidLeafPtr);
     &mut tree.leaves.borrow_mut(leaf_index_of(leaf_ptr)).value
 }
 
 /// O(1): the tracked pointer, not a derived-by-traversal value.
-public fun min_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
+public(package) fun min_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
     if (tree.min_leaf == EMPTY_TREE) option::none() else option::some(tree.min_leaf)
 }
 
 /// O(1): the tracked pointer, not a derived-by-traversal value.
-public fun max_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
+public(package) fun max_leaf<V: store>(tree: &PriceTree<V>): Option<u64> {
     if (tree.max_leaf == EMPTY_TREE) option::none() else option::some(tree.max_leaf)
 }
 
 /// Number of distinct keys (leaves) currently in the tree.
-public fun size<V: store>(tree: &PriceTree<V>): u64 {
+public(package) fun size<V: store>(tree: &PriceTree<V>): u64 {
     tree.leaves.length()
 }

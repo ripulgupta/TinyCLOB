@@ -212,6 +212,7 @@ fun destroy_fee_accumulator<Base, Quote>(
     (base, quote)
 }
 
+#[test_only]
 fun credit_fee_accumulator<Base, Quote>(
     fees: &mut FeeAccumulator<Base, Quote>,
     base: Balance<Base>,
