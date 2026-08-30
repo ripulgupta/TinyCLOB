@@ -41,6 +41,21 @@ public(package) fun max_min_size(): u64 { MAX_MIN_SIZE }
 public(package) fun default_price(): u64 { DEFAULT_PRICE }
 public(package) fun default_size(): u64 { DEFAULT_SIZE }
 
+/// A realistic BTC(8 decimals)/USDC(6 decimals)-shaped book (`price_scale =
+/// 184`; see `full_lifecycle_tests.move`'s header comment for the full
+/// derivation), generalized over `Base`/`Quote` so any pair sharing this
+/// decimals/precision/exponent shape can reuse it, instead of each test
+/// duplicating the inline `tiny_clob::new` call and its derivation comment.
+/// Unlike `new_book` (`price_scale == 1`, no rounding to account for), this
+/// book requires genuine ceiling rounding in `bid_escrow_amount`/
+/// `scaled_ceil_mul_div` for any price that isn't an exact multiple of 184.
+public(package) fun realistic_decimals_book<Base, Quote>(
+    min_size: u64,
+    scenario: &mut ts::Scenario,
+): (OrderBook<Base, Quote>, ClobAdminCap) {
+    tiny_clob::new<Base, Quote>(min_size, 8, 6, 0, 19, 184 * 497, scenario.ctx())
+}
+
 public(package) fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
     tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 19, 1, scenario.ctx())
 }

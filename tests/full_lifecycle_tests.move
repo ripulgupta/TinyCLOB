@@ -32,7 +32,7 @@ use sui::event;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap};
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
-use tiny_clob::test_utils::{Self, admin, other, taker, maker_a, maker_b, maker_c};
+use tiny_clob::test_utils::{Self, admin, other, taker, maker_a, maker_b, maker_c, realistic_decimals_book};
 
 #[test]
 fun full_lifecycle_realistic_btc_usdc_decimals() {
@@ -42,7 +42,8 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     // scale_hi = floor(u64::MAX * 10^8 / (10^6 * 10^19)) = floor(u64::MAX / 10^17)
     //          = floor(18_446_744_073_709_551_615 / 100_000_000_000_000_000) = 184.
     // scale_lo = ceil(10^0) = 1 <= 184, feasible -> price_scale = 184.
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(37, 8, 6, 0, 19, 184 * 497, scenario.ctx());
+    // (see test_utils::realistic_decimals_book, shared with fee_redesign_tests.move)
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(37, &mut scenario);
     assert!(tiny_clob::price_scale(&book) == 184, 0);
 
     // --- Two makers rest on opposite sides, at different prices. Every

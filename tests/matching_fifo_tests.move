@@ -11,7 +11,7 @@ use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
+    default_price, default_size, shortfall_price, new_book, realistic_decimals_book, destroy_book_and_cap,
     rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
 };
 
@@ -29,9 +29,16 @@ use tiny_clob::test_utils::{
 
 const FEE_TEST_TAKER_FEE_BPS: u64 = 7;
 const FEE_TEST_MAKER_FEE_BPS: u64 = 3;
-const FEE_TEST_PRICE: u64 = 47_500;
-const FEE_TEST_RESTING_SIZE: u64 = 4_000;
-const FEE_TEST_TAKER_SIZE: u64 = 3_400;
+// A realistic BTC(8 decimals)/USDC(6 decimals) book (`realistic_decimals_book`)
+// derives `price_scale == 184` (see `full_lifecycle_tests.move`'s header
+// comment for the full derivation). `FEE_TEST_PRICE` is deliberately NOT a
+// multiple of 184, so `quote_cost = bid_escrow_amount(book, price, size) =
+// ceil(price * size / 184)` requires genuine ceiling rounding -- unlike the
+// `new_book()` fixture (`price_scale == 1`), where `quote_cost == price *
+// size` exactly and rounding never actually happens.
+const FEE_TEST_PRICE: u64 = 1_000;
+const FEE_TEST_RESTING_SIZE: u64 = 500;
+const FEE_TEST_TAKER_SIZE: u64 = 337;
 const FEE_TEST_MAX_FILLS: u64 = 1_000_000_000;
 
 // === Fix 2: fee rounding — ceiling division closes the dust-fee exploit ===
@@ -65,7 +72,7 @@ fun gen_distinct_prices(n: u64, seed: u64, span: u64): vector<u64> {
 #[test]
 fun match_bid_produces_expected_fill_and_fee_amounts() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, FEE_TEST_TAKER_FEE_BPS);
     tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, FEE_TEST_MAKER_FEE_BPS);
 
@@ -79,25 +86,30 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     tiny_clob::insert_resting_order_for_testing(&mut book, false, FEE_TEST_PRICE, ask, scenario.ctx());
 
     // Taker fully filled by the larger resting ask, so fill_qty ==
-    // FEE_TEST_TAKER_SIZE:
-    //   quote_cost = price * fill_qty = 47_500 * 3_400 = 161_500_000
+    // FEE_TEST_TAKER_SIZE. On this book, `price_scale == 184` and
+    // `FEE_TEST_PRICE = 1_000` is deliberately not a multiple of it, so
+    // `quote_cost` itself requires genuine ceiling rounding (unlike
+    // `new_book()`, where `quote_cost == price * fill_qty` exactly):
+    //   quote_cost = ceil(price * fill_qty / 184) = ceil(1_000 * 337 / 184)
+    //              = ceil(1_831.52...) = 1_832
     //   taker_fee_base = ceil(fill_qty * taker_bps / 10_000)
-    //                  = ceil(3_400 * 7 / 10_000) = ceil(2.38) = 3
-    //   matched_base   = fill_qty - taker_fee_base = 3_400 - 3 = 3_397
+    //                  = ceil(337 * 7 / 10_000) = ceil(0.2359) = 1
+    //   matched_base   = fill_qty - taker_fee_base = 337 - 1 = 336
     //   maker_fee_quote = ceil(quote_cost * maker_bps / 10_000)
-    //                   = ceil(161_500_000 * 3 / 10_000) = 48_450 (exact)
+    //                   = ceil(1_832 * 3 / 10_000) = ceil(0.5496) = 1
     //   remaining_budget = payment - quote_cost = 0 (exact full fill)
     // The taker fee is charged once, in aggregate, at the end of the
     // matching loop -- with a single fill this equals the old per-fill
     // amount exactly. The maker fee, by contrast, is now only SET ASIDE in
     // the resting ask's own `fee_reserve_quote` at fill time -- since this
-    // resting order is only partially filled here (4_000 > 3_400) and
+    // resting order is only partially filled here (500 > 337) and
     // therefore never concludes, its maker fee is never actually
     // transferred into the book's fee accumulator; see
     // `resting_maker_order_defers_fee_until_conclusion` below for that
     // transfer actually happening.
-    let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
-    let expected_taker_fee_base = 3;
+    let expected_quote_cost = tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE);
+    assert!(expected_quote_cost == 1_832, 100);
+    let expected_taker_fee_base = 1;
     let expected_matched_base = FEE_TEST_TAKER_SIZE - expected_taker_fee_base;
 
     let payment = coin::mint_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE), scenario.ctx());
@@ -125,34 +137,37 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
 #[test]
 fun match_ask_produces_expected_fill_and_fee_amounts() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     tiny_clob::clob_admin_set_taker_fee(&cap, &mut book, FEE_TEST_TAKER_FEE_BPS);
     tiny_clob::clob_admin_set_maker_fee(&cap, &mut book, FEE_TEST_MAKER_FEE_BPS);
 
     // Resting bid.
     let order_id = tiny_clob::next_order_id(&mut book);
-    let escrow = balance::create_for_testing<USDC>(FEE_TEST_PRICE * FEE_TEST_RESTING_SIZE);
+    let escrow = balance::create_for_testing<USDC>(tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_RESTING_SIZE));
     let bid = order::new<BTC, USDC>(
         order_id, other(), FEE_TEST_RESTING_SIZE, option::none(), option::some(escrow), FEE_TEST_MAKER_FEE_BPS,
     );
     tiny_clob::insert_resting_order_for_testing(&mut book, true, FEE_TEST_PRICE, bid, scenario.ctx());
 
     // Taker fully filled by the larger resting bid, so fill_qty ==
-    // FEE_TEST_TAKER_SIZE:
-    //   quote_cost = price * fill_qty = 47_500 * 3_400 = 161_500_000
+    // FEE_TEST_TAKER_SIZE. Same `price_scale == 184`, non-multiple-of-184
+    // price as `match_bid_produces_expected_fill_and_fee_amounts` above:
+    //   quote_cost = ceil(price * fill_qty / 184) = ceil(1_000 * 337 / 184)
+    //              = ceil(1_831.52...) = 1_832
     //   taker_fee_quote = ceil(quote_cost * taker_bps / 10_000)
-    //                   = ceil(161_500_000 * 7 / 10_000) = 113_050 (exact)
-    //   matched_quote   = quote_cost - taker_fee_quote = 161_386_950
+    //                   = ceil(1_832 * 7 / 10_000) = ceil(1.2824) = 2
+    //   matched_quote   = quote_cost - taker_fee_quote = 1_832 - 2 = 1_830
     //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
-    //                  = ceil(3_400 * 3 / 10_000) = ceil(1.02) = 2
+    //                  = ceil(337 * 3 / 10_000) = ceil(0.1011) = 1
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
     // As in `match_bid_produces_expected_fill_and_fee_amounts` above, the
     // taker fee is charged once in aggregate (equal to the old per-fill
     // amount for this single-fill case); the maker fee is only set aside in
     // the resting bid's `fee_reserve_base` -- it never concludes here
-    // (4_000 > 3_400), so it's never actually collected.
-    let expected_quote_cost = FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE;
-    let expected_taker_fee_quote = 113_050;
+    // (500 > 337), so it's never actually collected.
+    let expected_quote_cost = tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE);
+    assert!(expected_quote_cost == 1_832, 100);
+    let expected_taker_fee_quote = 2;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
 
     let payment = coin::mint_for_testing<BTC>(FEE_TEST_TAKER_SIZE, scenario.ctx());
