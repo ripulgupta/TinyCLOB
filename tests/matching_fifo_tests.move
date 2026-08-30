@@ -150,13 +150,21 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     tiny_clob::insert_resting_order_for_testing(&mut book, true, FEE_TEST_PRICE, bid, scenario.ctx());
 
     // Taker fully filled by the larger resting bid, so fill_qty ==
-    // FEE_TEST_TAKER_SIZE. Same `price_scale == 184`, non-multiple-of-184
-    // price as `match_bid_produces_expected_fill_and_fee_amounts` above:
-    //   quote_cost = ceil(price * fill_qty / 184) = ceil(1_000 * 337 / 184)
-    //              = ceil(1_831.52...) = 1_832
+    // FEE_TEST_TAKER_SIZE, and since the resting bid (size 500) still has
+    // size left afterward (500 > 337), this fill is TAKER-limited in
+    // `fill_level_ask` -- the clamped-floor branch of the rounding fix (see
+    // the project's audit notes, findings L-A/L-B), not the old
+    // proportional-ceiling formula:
+    //   quote_cost = min(max(floor(price * fill_qty / price_scale), 1),
+    //                     escrow_quote_value)
+    //              = min(max(floor(1_000 * 337 / 184), 1), 2_718)
+    //              = min(max(1_831, 1), 2_718) = 1_831
+    //   (escrow_quote_value = total_reserved = bid_escrow_amount(book,
+    //   1_000, 500) = ceil(500_000 / 184) = 2_718, unspent so far since this
+    //   is the order's first fill)
     //   taker_fee_quote = ceil(quote_cost * taker_bps / 10_000)
-    //                   = ceil(1_832 * 7 / 10_000) = ceil(1.2824) = 2
-    //   matched_quote   = quote_cost - taker_fee_quote = 1_832 - 2 = 1_830
+    //                   = ceil(1_831 * 7 / 10_000) = ceil(1.2817) = 2
+    //   matched_quote   = quote_cost - taker_fee_quote = 1_831 - 2 = 1_829
     //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
     //                  = ceil(337 * 3 / 10_000) = ceil(0.1011) = 1
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
@@ -165,8 +173,11 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // amount for this single-fill case); the maker fee is only set aside in
     // the resting bid's `fee_reserve_base` -- it never concludes here
     // (500 > 337), so it's never actually collected.
-    let expected_quote_cost = tiny_clob::bid_escrow_amount(&book, FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE);
-    assert!(expected_quote_cost == 1_832, 100);
+    //
+    // `expected_quote_cost` is NOT `tiny_clob::bid_escrow_amount(...)`
+    // (which always ceils, and would give the stale, no-longer-charged
+    // 1_832) -- it's the hand-derived clamped-floor value above.
+    let expected_quote_cost = 1_831;
     let expected_taker_fee_quote = 2;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
 

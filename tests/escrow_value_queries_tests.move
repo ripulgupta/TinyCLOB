@@ -288,29 +288,43 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     let bid_ticket = option::destroy_some(ticket_opt);
     let order_id = tiny_clob::ticket_order_id(&bid_ticket);
 
-    // Fill 4 of the remaining 7 units: ceil(2*4/7) = 2 = total_reserved
-    // exactly, so the escrow is fully charged (clamped) while 3 units of
-    // remaining_size are still genuinely resting.
+    // Two 1-unit fills of the remaining 7 units, each taker-limited (maker
+    // still has size left afterward: 6, then 5). Under the rounding-
+    // direction fix, `fill_level_ask`'s taker-limited quote_cost is
+    // `min(max(floor(price * fill_qty / price_scale), 1),
+    // escrow_quote_value(&maker_order))`: `floor(5*1/18) = 0`, so each fill
+    // is `max(0, 1) = 1`, clamped against the live escrow (2, then 1) --
+    // both fills charge exactly 1, exhausting `total_reserved`(2) to 0
+    // exactly after the second fill, while 5 units of remaining_size are
+    // still genuinely resting.
     scenario.next_tx(maker_b());
-    let base = coin::mint_for_testing<BTC>(4, scenario.ctx());
-    let (t, lb, mq, _) = tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 4, base, 10, scenario.ctx());
-    assert!(t.is_none(), 0);
-    option::destroy_none(t);
-    coin::burn_for_testing(lb);
-    coin::burn_for_testing(mq);
+    let base_a = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (ta, lba, mqa, _) = tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 1, base_a, 10, scenario.ctx());
+    assert!(ta.is_none(), 0);
+    option::destroy_none(ta);
+    coin::burn_for_testing(lba);
+    assert!(coin::burn_for_testing(mqa) == 1, 10);
+
+    scenario.next_tx(maker_b());
+    let base_b = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (tb, lbb, mqb, _) = tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 1, base_b, 10, scenario.ctx());
+    assert!(tb.is_none(), 11);
+    option::destroy_none(tb);
+    coin::burn_for_testing(lbb);
+    assert!(coin::burn_for_testing(mqb) == 1, 12);
 
     let escrow_opt = tiny_clob::resting_order_escrow(&book, true, shortfall_price(), order_id);
     assert!(escrow_opt.is_some(), 1);
     let (escrow, remaining) = tiny_clob::resting_order_escrow_fields(escrow_opt.borrow());
     assert!(escrow == 0, 2);
-    assert!(remaining == 3, 3);
+    assert!(remaining == 5, 3);
 
     // Matches the same read via `resting_order_escrow_by_ticket`.
     let escrow_opt_via_ticket = tiny_clob::resting_order_escrow_by_ticket(&book, &bid_ticket);
     assert!(escrow_opt_via_ticket.is_some(), 4);
     let (escrow_2, remaining_2) = tiny_clob::resting_order_escrow_fields(escrow_opt_via_ticket.borrow());
     assert!(escrow_2 == 0, 5);
-    assert!(remaining_2 == 3, 6);
+    assert!(remaining_2 == 5, 6);
 
     unit_test::destroy(ask_ticket);
     unit_test::destroy(bid_ticket);

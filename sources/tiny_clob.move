@@ -1552,7 +1552,32 @@ fun fill_level_bid<Base, Quote>(
                 budget_exhausted = true;
                 break
             };
-            let quote_cost = scaled_ceil_mul_div(best_price, fill_qty, price_scale);
+            // Rounding direction depends on which side this fill is limited
+            // by (see the project's audit notes, findings L-A/L-B):
+            //
+            // - Maker-limited (`fill_qty == maker_remaining`, this fill fully
+            //   drains the resting ask): floor, not ceiling. Ceiling here was
+            //   the source of both findings -- independently ceiling-rounding
+            //   every full-drain fill is superadditive across fragmented
+            //   resting liquidity, so a taker sweeping N separate 1-unit asks
+            //   paid strictly more Quote than sweeping one consolidated
+            //   N-unit ask for the identical Base delivered (L-A), and a bid
+            //   escrowed with the textbook-exact `bid_escrow_amount` could
+            //   underfill against a sufficiently fragmented ask book (L-B).
+            //   `max(floor, 1)` still guarantees a genuinely nonzero fill
+            //   charges at least 1 quote atom, closing the same dust exploit
+            //   the old ceiling guarded against.
+            // - Taker-limited (maker order still has size left after this
+            //   fill): unchanged, ceiling -- this fill's own boundary is
+            //   already set by the taker's own budget/remaining_size, not by
+            //   fully draining a maker, so there is no cross-maker
+            //   superadditivity to worry about here.
+            let quote_cost = if (fill_qty == maker_remaining) {
+                let floor_u128 = ((best_price as u128) * (fill_qty as u128)) / (price_scale as u128);
+                (if (floor_u128 < 1) { 1 } else { floor_u128 }) as u64
+            } else {
+                scaled_ceil_mul_div(best_price, fill_qty, price_scale)
+            };
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
@@ -1713,6 +1738,7 @@ fun fill_level_ask<Base, Quote>(
     event_book_id: ID,
     fills_consumed: &mut u64,
     max_fills: u64,
+    price_scale: u64,
     last_price: &mut u64,
     taker_fee_basis: &mut u64,
 ): (bool, bool) {
@@ -1736,41 +1762,41 @@ fun fill_level_ask<Base, Quote>(
 
             let mut maker_order = price_tree::level_remove_order(level, head_key);
             order::decrease_remaining_size(&mut maker_order, fill_qty);
-            // Maker-side (bid-resting-order) charge: a proportional ceiling
-            // of the order's actual `total_reserved`. Ceiling (not floor)
-            // ensures any real, nonzero base fill charges at least 1 quote
-            // atom, closing an exploit where a floor rounds a tiny fill's
-            // charge down to 0 and lets the maker cancel afterward for a
-            // full escrow refund while keeping the base already received.
-            // At full drain, ceil(total_reserved * original_size /
-            // original_size) == total_reserved exactly, so this still
-            // telescopes to exactly `total_reserved` with zero dust no
-            // matter how many separate fills the order is drained across.
-            // Read AFTER `decrease_remaining_size` so `cumulative_filled`
-            // reflects this fill.
+            // Maker-side (bid-resting-order) charge, split by which side this
+            // fill is limited by (see the project's audit notes, findings
+            // L-A/L-B, and the matching comment in `fill_level_bid`):
             //
-            // `cumulative_filled <= original_size` always (checked-subtraction-
-            // enforced on `remaining_size`), so `ceil(total_reserved *
-            // cumulative_filled / original_size) <= total_reserved` always,
-            // with equality only at full drain. The `else` branch of the
-            // clamp below is therefore provably unreachable -- retained as a
-            // defensive backstop against a future change to this formula,
-            // not because it currently does any work.
-            let cumulative_filled = order::original_size(&maker_order) - order::remaining_size(&maker_order);
-            let total_reserved_u128 = order::total_reserved(&maker_order) as u128;
-            let original_size_u128 = order::original_size(&maker_order) as u128;
-            let cumulative_filled_u128 = cumulative_filled as u128;
-            let ceil_charged_u128 =
-                (total_reserved_u128 * cumulative_filled_u128 + original_size_u128 - 1) / original_size_u128;
-            let cumulative_charged_u128 =
-                if (ceil_charged_u128 < total_reserved_u128) { ceil_charged_u128 } else { total_reserved_u128 };
-            let cumulative_charged = cumulative_charged_u128 as u64;
-            // Derived on the fly from the pre-fill live escrow balance:
-            // always exactly equals what was already charged, since every
-            // fill decrements the escrow by precisely the amount it charges
-            // (see `escrow_quote_value`'s doc comment).
-            let quote_charged_so_far = order::total_reserved(&maker_order) - order::escrow_quote_value(&maker_order);
-            let quote_cost = cumulative_charged - quote_charged_so_far;
+            // - Maker-limited (`fill_qty == maker_remaining`, this fill fully
+            //   drains the resting bid): simply drain whatever's left in the
+            //   order's own reservation. Verified equal to the old
+            //   proportional-ceiling formula's value at full drain (both
+            //   telescope to exactly `total_reserved` minus whatever was
+            //   already charged), so this is a pure simplification for this
+            //   branch, not a behavior change.
+            // - Taker-limited (maker order still has size left after this
+            //   fill): `max(floor(price * fill_qty / price_scale), 1)`,
+            //   clamped to never exceed what's actually left in the maker's
+            //   reservation. The `escrow_quote_value` clamp is mandatory: a
+            //   bid's fixed, placement-time Quote reservation can already be
+            //   nearly exhausted by prior fills against the same order (its
+            //   `total_reserved` was computed once, ceiling-rounded, at
+            //   placement time), so an unclamped floor/ceiling here could
+            //   demand more Quote than the order has left and abort
+            //   `split_escrow_quote` -- a real, maker-triggerable DoS. Once
+            //   `escrow_quote_value` is fully exhausted this correctly falls
+            //   back to charging 0 on a taker-limited fill rather than
+            //   aborting; no assertion or invariant in this module depends
+            //   on `quote_cost > 0` for a fill with `fill_qty > 0` (see
+            //   `tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel`
+            //   in `tests/escrow_shortfall_and_edge_case_tests.move`).
+            let quote_cost = if (fill_qty == maker_remaining) {
+                order::escrow_quote_value(&maker_order)
+            } else {
+                let floor_u128 = ((best_price as u128) * (fill_qty as u128)) / (price_scale as u128);
+                let floor_u128 = if (floor_u128 < 1) { 1 } else { floor_u128 };
+                let escrow_u128 = order::escrow_quote_value(&maker_order) as u128;
+                (if (floor_u128 < escrow_u128) { floor_u128 } else { escrow_u128 }) as u64
+            };
 
             let quote_out = order::split_escrow_quote(&mut maker_order, quote_cost);
             // Taker fee (Quote) is no longer deducted per-fill -- see the
@@ -1842,6 +1868,7 @@ fun match_ask<Base, Quote>(
     taker: address,
     event_book_id: ID,
     max_fills: u64,
+    price_scale: u64,
     last_price: &mut u64,
 ): (Balance<Quote>, Balance<Base>, u64, bool, u64) {
     let mut remaining_size = remaining_size_in;
@@ -1878,6 +1905,7 @@ fun match_ask<Base, Quote>(
             event_book_id,
             &mut fills_consumed,
             max_fills,
+            price_scale,
             last_price,
             &mut taker_fee_basis,
         );
@@ -2204,12 +2232,13 @@ public fun place_limit_order_ask<Base, Quote>(
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
+    let price_scale = book.price_scale;
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, option::some(price), size, escrow_base, taker, event_book_id,
-            max_fills, last_price,
+            max_fills, price_scale, last_price,
         );
 
     let order_id = next_order_id(book);
@@ -2338,12 +2367,13 @@ public fun place_market_order_ask<Base, Quote>(
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
+    let price_scale = book.price_scale;
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, option::none(), size, escrow_base, taker, event_book_id,
-            max_fills, last_price,
+            max_fills, price_scale, last_price,
         );
 
     if (max_base_in.is_some()) {
@@ -2468,12 +2498,13 @@ public fun swap_ask<Base, Quote>(
     let event_book_id = book.event_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
+    let price_scale = book.price_scale;
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, limit_price, size, escrow_base, taker, event_book_id,
-            max_fills, last_price,
+            max_fills, price_scale, last_price,
         );
 
     if (max_base_in.is_some()) {
@@ -2980,12 +3011,13 @@ public fun match_ask_for_testing<Base, Quote>(
     let event_book_id = book.event_id;
     let escrow_base = coin::into_balance(payment);
     let taker_fee_bps = book.taker_fee_bps;
+    let price_scale = book.price_scale;
     let (bids, proceeds, fees, last_price) =
         (&mut book.bids, &mut book.proceeds, &mut book.fee_accumulator, &mut book.last_price);
     let (matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing, taker_fee_amount) =
         match_ask(
             bids, proceeds, fees, taker_fee_bps, limit_price, remaining_size_in, escrow_base, taker, event_book_id,
-            max_fills, last_price,
+            max_fills, price_scale, last_price,
         );
     (
         coin::from_balance(matched_quote, ctx),

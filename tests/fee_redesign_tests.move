@@ -35,16 +35,24 @@ const REALISTIC_PRICE: u64 = 1_000;
 
 /// Category (a): fill-drain, inside `fill_level_bid` -- an ask-side maker
 /// (fee denominated in Quote) fully drained across two separate 1-unit
-/// fills, each independently ceiling-rounding its own fee to 1 (dust,
-/// `ceil(6 * 1 / 10_000) = 1`), for a reserve of 2. The CORRECT aggregate
-/// fee owed on the full 12-unit basis is `ceil(12 * 1 / 10_000) = 1`, so
-/// this order's conclusion must refund exactly 1 unit of slack back to the
-/// maker instead of over-collecting the naive per-fill sum of 2.
+/// fills. Under the rounding-direction fix (findings L-A/L-B), a fill's
+/// `quote_cost` formula depends on whether it fully drains the maker:
+///   - Fill 1 (ask still has 1 unit left afterward -- taker-limited, formula
+///     UNCHANGED): `quote_cost = ceil(1_000 * 1 / 184) = ceil(5.43...) = 6`.
+///   - Fill 2 (fully drains the ask -- maker-limited, formula CHANGED to
+///     floor): `quote_cost = max(floor(1_000 * 1 / 184), 1) =
+///     max(5, 1) = 5` (was 6 under the old ceiling formula).
+/// Each fill's own dust fee still independently ceiling-rounds to 1
+/// (`ceil(6 * 1 / 10_000) = 1`, `ceil(5 * 1 / 10_000) = 1`), for a reserve
+/// of 2. The CORRECT aggregate fee owed on the full 11-unit basis (6 + 5) is
+/// `ceil(11 * 1 / 10_000) = 1`, so this order's conclusion must refund
+/// exactly 1 unit of slack back to the maker instead of over-collecting the
+/// naive per-fill sum of 2.
 ///
 /// Uses `realistic_decimals_book` (`price_scale == 184`) with a
 /// non-multiple-of-184 price, so each fill's own `quote_cost` -- the basis
 /// each per-fill fee and the final aggregate fee are computed from -- is
-/// itself genuinely ceiling-rounded (`ceil(1_000 * 1 / 184) = 6`), unlike
+/// itself genuinely rounded (ceiling on fill 1, floor on fill 2), unlike
 /// `new_book()`'s `price_scale == 1` shape where `quote_cost == price`
 /// exactly and no such rounding ever occurs.
 #[test]
@@ -94,13 +102,14 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     assert!(fee_quote_after == 1, 9);
 
     // The maker's pooled proceeds must reflect the slack refund: 5 (fill 1,
-    // net of its own dust fee) + 6 (fill 2's net-of-fee 5, plus the 1-unit
-    // slack folded in at conclusion) = 11, not 10 (which is what
-    // over-collecting the naive per-fill sum would have left).
+    // quote_cost=6 net of its own dust fee of 1) + 5 (fill 2's net-of-fee
+    // quote_cost(5) - fee(1) = 4, plus the 1-unit slack folded in at
+    // conclusion) = 10, not 9 (which is what over-collecting the naive
+    // per-fill sum would have left).
     tiny_clob::push_proceeds(&cap, &mut book, order_id, scenario.ctx());
     scenario.next_tx(other());
     let payout = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
-    assert!(coin::value(&payout) == 11, 10);
+    assert!(coin::value(&payout) == 10, 10);
     coin::burn_for_testing(payout);
 
     destroy_book_and_cap(book, cap);

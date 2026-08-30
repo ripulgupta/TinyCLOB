@@ -822,23 +822,41 @@ notification. Taker fees are now computed once per call, in aggregate, and
 reported on `OrderExecuted.taker_fee_amount` below; maker fees are set
 aside per-fill into a reserve private to the resting order and only
 actually collected — and reported via `MakerFeeSettled` — when that order
-concludes. See §9's Fees section for the full model. On the maker-bid side
-(`maker_side == true`), `quote_amount` is derived from a proportional slice
-of the maker's original escrow reservation (not a direct `price * size`
-recomputation) and may differ by rounding from
-`ceil(price * size / price_scale)` — this is expected.
+concludes. See §9's Fees section for the full model.
 
-Although any single `quote_amount` may deviate by rounding on the maker-bid
-side, the sum is exact: for a given `maker_order_id`, the total of
-`quote_amount` across every `OrderFilled` event with `maker_side == true`
+`quote_amount`'s rounding direction on a given fill depends on whether that
+fill fully drains the resting maker order (leaving `remaining_size == 0`) or
+leaves it still resting, and differs by side:
+
+- A fill that **fully drains** the maker order: on the maker-ask side
+  (`maker_side == false`), `quote_amount = max(floor(price * size /
+  price_scale), 1)` — at least 1 atom, but may be *less* than
+  `ceil(price * size / price_scale)`. On the maker-bid side
+  (`maker_side == true`), `quote_amount` is exactly whatever Quote remains of
+  that order's original escrow reservation, which may also differ from
+  `ceil(price * size / price_scale)`.
+- A fill that leaves the order **still resting**: on the maker-ask side,
+  `quote_amount = ceil(price * size / price_scale)` exactly, unchanged. On
+  the maker-bid side, `quote_amount` is at least 1 atom whenever that order's
+  remaining Quote escrow still holds at least 1 atom, and never more than
+  what remains in it — `0` only in the pre-existing, separately documented
+  `(escrow == 0, remaining_size > 0)` state (§12,
+  `resting_order_escrow_fields`).
+
+This rounding is deliberately asymmetric: a fill that exhausts a resting
+order's own liquidity (not the taker's choice) never costs the taker more
+than a single consolidated fill of the same total size would have, while a
+fill the taker chooses to stop short of draining the maker keeps the
+maker-protective ceiling. Although any single `quote_amount` may deviate by
+rounding, the sum is exact: for a given `maker_order_id`, the total of
+`quote_amount` across every `OrderFilled` event with the same `maker_side`
 emitted over that order's entire lifetime equals exactly the amount debited
-from that order's quote escrow — and equals exactly the full escrow
-originally reserved for it if the order is filled to completion, with zero
-residual dust, no matter how many separate fills or transactions it was
-drained across. If the order is only partially filled, the sum is strictly
-less than the original reservation, and the exact difference is what
-`cancel_order` (or `clob_admin_cancel_order` / `clob_admin_drain_step`)
-refunds.
+from that order's escrow — and equals exactly the full escrow originally
+reserved for it if the order is filled to completion, with zero residual
+dust, no matter how many separate fills or transactions it was drained
+across. If the order is only partially filled, the sum is strictly less than
+the original reservation, and the exact difference is what `cancel_order`
+(or `clob_admin_cancel_order` / `clob_admin_drain_step`) refunds.
 
 `OrderExecuted` is emitted exactly once, unconditionally, as the last event
 of every call to `place_limit_order_bid` / `place_limit_order_ask` /

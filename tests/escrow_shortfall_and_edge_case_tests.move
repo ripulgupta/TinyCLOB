@@ -265,6 +265,117 @@ fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
     scenario.end();
 }
 
+// === Regression: fill_level_ask's taker-limited clamp (rounding-direction
+// fix, findings L-A/L-B) never aborts once a maker's escrow is exhausted ===
+//
+// The taker-limited branch of `fill_level_ask` now computes
+// `quote_cost = min(max(floor(price * fill_qty / price_scale), 1),
+// escrow_quote_value(&maker_order))`. The `escrow_quote_value` clamp is
+// mandatory: a resting bid's `total_reserved` is a fixed, placement-time
+// ceiling-rounded reservation, and once every fill's floor-rounded share has
+// consumed it down to 0 the maker can still have real remaining size left
+// (floor rounding, unlike the old per-fill ceiling, does not guarantee every
+// fill claws back at least 1 atom) -- an unclamped floor/ceiling term could
+// then demand more Quote than the order has left and abort
+// `split_escrow_quote`, a real, maker-triggerable DoS.
+//
+// This test drives FIVE separate ask-taker fills against one fresh resting
+// bid to prove the clamp keeps working correctly fill after fill: several
+// nonzero taker-limited fills, then the escrow hits exactly 0 while the
+// maker still has real size left, then a taker-limited fill correctly
+// charges 0 instead of aborting, then the final fill fully drains the maker
+// (maker-limited, which uses the separate `escrow_quote_value(&maker_order)`
+// full-drain formula, not this clamp) and still closes the order out
+// cleanly.
+//
+// Fixture: same shortfall book as above (`price=5`, `price_scale=18`), but a
+// FRESH resting bid this time (no partial-cross clamp needed) of size 10:
+// `total_reserved = bid_escrow_amount(book, 5, 10) = ceil(50/18) =
+// ceil(2.77...) = 3`.
+#[test]
+fun taker_limited_fills_clamp_to_zero_after_escrow_exhausted_then_maker_limited_fill_closes_out() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let reserved = tiny_clob::bid_escrow_amount(&book, shortfall_price(), 10);
+    assert!(reserved == 3, 0); // ceil(5*10/18) = ceil(2.77..) = 3
+    let bid_ticket = rest_bid(&mut book, shortfall_price(), 10, 10, scenario.ctx());
+
+    // Fills 1-3: qty=1 each, taker-limited (maker still has size left
+    // afterward: 9, 8, 7 respectively). Each: floor(5*1/18) = 0,
+    // max(.., 1) = 1, clamped against the escrow, which is still nonzero
+    // going into each of these three fills (3, then 2, then 1) -- so each
+    // charges exactly 1, driving the escrow to exactly 0 after fill 3.
+    let mut total_charged: u64 = 0;
+    let mut i = 0;
+    while (i < 3) {
+        scenario.next_tx(maker_b());
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (t, lb, mq, _) =
+            tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 1, base, 10, scenario.ctx());
+        assert!(option::is_none(&t), 100 + i);
+        option::destroy_none(t);
+        assert!(coin::burn_for_testing(lb) == 0, 200 + i);
+        let charged = coin::burn_for_testing(mq);
+        assert!(charged == 1, 300 + i);
+        total_charged = total_charged + charged;
+        i = i + 1;
+    };
+    // Escrow is now exactly 0; maker still has remaining_size = 10 - 3 = 7.
+
+    // Fill 4: qty=1, maker has 6 left afterward -- still taker-limited.
+    // floor(5*1/18) = 0, max(.., 1) = 1, but escrow_quote_value is now 0:
+    // min(1, 0) = 0. Charges exactly 0 -- proving the clamp prevents
+    // `split_escrow_quote` from ever being asked for more than the order
+    // actually has left, rather than aborting.
+    scenario.next_tx(maker_b());
+    let base4 = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (t4, lb4, mq4, _) =
+        tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 1, base4, 10, scenario.ctx());
+    assert!(option::is_none(&t4), 4);
+    option::destroy_none(t4);
+    assert!(coin::burn_for_testing(lb4) == 0, 5);
+    let charged4 = coin::burn_for_testing(mq4);
+    assert!(charged4 == 0, 6);
+    total_charged = total_charged + charged4;
+
+    // Fill 5: qty=6, fully drains the resting bid's remaining size (6 -> 0)
+    // -- maker-limited, so this uses the OTHER (full-drain) formula:
+    // quote_cost = escrow_quote_value(&maker_order) = 0 (already exhausted
+    // by fill 3). The order still closes out cleanly with a genuinely
+    // zero-valued `Balance<Quote>` escrow -- `destroy_drained_bid_escrow`'s
+    // internal `balance::destroy_zero` does not abort -- and the Base
+    // received flows through to pooled maker proceeds exactly as any other
+    // fill's would.
+    scenario.next_tx(maker_b());
+    let base5 = coin::mint_for_testing<BTC>(6, scenario.ctx());
+    let (t5, lb5, mq5, _) =
+        tiny_clob::place_limit_order_ask(&mut book, shortfall_price(), 6, base5, 10, scenario.ctx());
+    assert!(option::is_none(&t5), 7);
+    option::destroy_none(t5);
+    assert!(coin::burn_for_testing(lb5) == 0, 8);
+    let charged5 = coin::burn_for_testing(mq5);
+    assert!(charged5 == 0, 9);
+    total_charged = total_charged + charged5;
+
+    // Exact conservation across the resting bid's whole lifetime: the five
+    // fills' quote_cost sums to exactly its `total_reserved` of 3
+    // (1 + 1 + 1 + 0 + 0 == 3) -- nothing overcharged, nothing stranded.
+    assert!(total_charged == reserved, 10);
+
+    // Cancelling the now-fully-drained ticket confirms it: all 10 Base
+    // units received (via pooled proceeds), 0 further Quote from an
+    // already-empty escrow.
+    scenario.next_tx(taker());
+    let (cb, cq) = tiny_clob::cancel_order(&mut book, bid_ticket, scenario.ctx());
+    assert!(coin::burn_for_testing(cb) == 10, 11);
+    assert!(coin::burn_for_testing(cq) == 0, 12);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 // === Coverage-audit gap closures ===
 //
 // The tests below close specific gaps identified by a blind test-coverage
