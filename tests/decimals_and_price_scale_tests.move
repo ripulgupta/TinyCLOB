@@ -69,7 +69,7 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     assert!(ticket_opt.is_some(), 4);
     let ticket = ticket_opt.destroy_some();
     // Quote-denominated for a bid -- equal to the escrow reserved, not `size`.
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == expected_escrow, 5);
+    assert!(book.depth_at_price(tiny_clob::bid(), price) == expected_escrow, 5);
 
     let (b, q) = book.cancel_order(ticket, scenario.ctx());
     assert!(b.burn_for_testing() == 0, 6);
@@ -333,7 +333,7 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     assert!(!min_stopped, 0);
     assert!(min_leftover.burn_for_testing() == 0, 1);
     assert!(min_matched.burn_for_testing() == 0, 2);
-    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), p_min) == min_leg_size, 3);
+    assert!(book.depth_at_price(tiny_clob::ask(), p_min) == min_leg_size, 3);
     let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
     assert!(min_b.burn_for_testing() == min_leg_size, 4);
     assert!(min_q.burn_for_testing() == 0, 5);
@@ -349,7 +349,7 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     assert!(!max_stopped, 6);
     assert!(max_leftover.burn_for_testing() == 0, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
-    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), p_max) == size, 9);
+    assert!(book.depth_at_price(tiny_clob::ask(), p_max) == size, 9);
     let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
     assert!(max_b.burn_for_testing() == size, 10);
     assert!(max_q.burn_for_testing() == 0, 11);
@@ -436,6 +436,68 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     assert!(full_fill_quote >= expected_quote_output, 9);
     ask_leftover_base.burn_for_testing();
     book.destroy_orphaned_ticket(ask_ticket);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === `EPriceOverflow` coverage ===
+//
+// Both `place_limit_order_bid` and `place_limit_order_ask` derive their raw
+// `price` via a `u128` intermediate and assert it fits in `u64` before
+// casting (see `EPriceOverflow`'s doc comment on each). To reach that
+// assert, the book needs a very large `price_scale` combined with a small
+// size/expected-output so the intermediate product exceeds `u64::MAX`
+// (~1.8446744e19).
+//
+// `base_decimals=0, quote_decimals=0, precision=18, exponent=1` gives
+// `scale_lo = ceil(10^0 * 10^18 / 10^0) = 10^18` and
+// `scale_hi = floor(u64::MAX * 10^0 / (10^0 * 10^1)) = floor(u64::MAX / 10)
+// = 1_844_674_407_370_955_161`, which is `>= scale_lo`, so construction
+// succeeds with `price_scale = 10^18`. `min_size=1` lets a size of `1` pass
+// `validate_size`, and `initial_last_price=1` is comfortably within the
+// declared `[10^-18, 10^1]` true-price range (true price `1e-18` sits
+// exactly at the declared minimum).
+
+/// Bid side: `price = payment.value() * price_scale / expected_base_output`.
+/// With `price_scale = 10^18`, `payment.value() = 100`, and
+/// `expected_base_output = 1`, the intermediate product is
+/// `100 * 10^18 = 10^20`, far exceeding `u64::MAX` (~1.8446744e19).
+#[test]
+#[expected_failure(abort_code = 29, location = tiny_clob)] // EPriceOverflow
+fun place_limit_order_bid_price_overflow_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, scenario.ctx());
+
+    let payment = coin::mint_for_testing<USDC>(100, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 1, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
+    ticket_opt.destroy_none();
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Ask side: `price = ceil(expected_quote_output * price_scale /
+/// payment.value())`. With `price_scale = 10^18`, `payment.value() = 1`, and
+/// `expected_quote_output = 100`, the intermediate numerator is
+/// `100 * 10^18 = 10^20`, far exceeding `u64::MAX` (~1.8446744e19).
+#[test]
+#[expected_failure(abort_code = 29, location = tiny_clob)] // EPriceOverflow
+fun place_limit_order_ask_price_overflow_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, scenario.ctx());
+
+    let payment = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (ticket_opt, leftover_base, matched_quote, stopped) =
+        book.place_limit_order_ask(payment, 100, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    leftover_base.burn_for_testing();
+    matched_quote.burn_for_testing();
+    ticket_opt.destroy_none();
 
     destroy_book_and_cap(book, cap);
     scenario.end();

@@ -1126,6 +1126,207 @@ fun key_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
     teardown(scenario, tree);
 }
 
+// === High-bit / crit-bit-mask boundary tests ===
+//
+// Every key used elsewhere in this file is well under 2^23 in magnitude, so
+// `highest_set_bit_mask` (the crit-bit mask computation in `insert`) has
+// never been exercised with a mask anywhere near bit 63 — the sign/top bit,
+// which numerically aliases `PARTITION_INDEX`/`NO_PARENT`
+// (`0x8000000000000000`). These tests specifically exercise keys that force
+// a crit-bit split right at bit 63, plus the extreme `u64` boundary values.
+// (Key `0` is not exercised here: `price_tree` itself has no zero-key check
+// — see `no_tick_divisibility_check` above — but `0` is not a legal price in
+// this tree's real caller, `tiny_clob`, which rejects it via `EZeroPrice`
+// before it would ever reach `price_tree::insert`. Testing it here would
+// exercise a state the tree never actually sees in practice.)
+
+const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFF;
+const U64_SIGN_BIT: u64 = 0x8000000000000000;
+const U64_MAX_MINUS_SIGN_BIT: u64 = 0x7FFFFFFFFFFFFFFF; // U64_MAX with bit 63 cleared
+
+// === insert_keys_differing_only_at_bit_63_splits_correctly ===
+
+/// Two keys identical in every bit except bit 63 (the sign/top bit): `1` and
+/// `0x8000000000000001`. Their XOR is exactly `U64_SIGN_BIT`, so
+/// `highest_set_bit_mask` must return that value as the crit-bit mask — the
+/// same numeric value as `PARTITION_INDEX`/`NO_PARENT`. Confirms the split
+/// still lands correctly (right key ends up on the correct side, min/max
+/// track correctly, both remain independently findable and removable).
+#[test]
+fun insert_keys_differing_only_at_bit_63_splits_correctly() {
+    let (mut scenario, mut tree) = setup();
+
+    let low_key = 1u64;
+    let high_key = 0x8000000000000001u64; // low_key with bit 63 also set
+    // Confirm the two keys genuinely differ by exactly the sign bit, not
+    // merely by hex literals that happen to look that way.
+    assert!((low_key ^ high_key) == U64_SIGN_BIT, 100);
+
+    tree.insert(low_key, mock(1));
+    tree.insert(high_key, mock(2));
+
+    assert!(tree.size() == 2, 0);
+    assert!(tree.find(low_key).is_some(), 1);
+    assert!(tree.find(high_key).is_some(), 2);
+
+    let min_ptr = tree.min_leaf().destroy_some();
+    let max_ptr = tree.max_leaf().destroy_some();
+    assert!(tree.key(min_ptr) == low_key, 3);
+    assert!(tree.key(max_ptr) == high_key, 4);
+
+    // Remove the high (max) key first, then confirm the low key alone
+    // becomes both min and max of the now-single-leaf tree.
+    let high_ptr = tree.find(high_key).destroy_some();
+    let _v1 = tree.remove(high_ptr);
+    assert!(tree.size() == 1, 5);
+    assert!(tree.find(low_key).is_some(), 6);
+    assert!(tree.find(high_key).is_none(), 7);
+    let sole_ptr = tree.min_leaf().destroy_some();
+    assert!(sole_ptr == tree.max_leaf().destroy_some(), 8);
+    assert!(tree.key(sole_ptr) == low_key, 9);
+
+    let _v2 = tree.remove(sole_ptr);
+    assert!(tree.size() == 0, 10);
+    teardown(scenario, tree);
+}
+
+/// Same key pair as above, but the LOW key (min) is removed first instead of
+/// the high one — exercises `remove`'s `min_leaf` re-descent path when the
+/// sibling subtree is the bit-63-tagged leaf.
+#[test]
+fun insert_keys_differing_only_at_bit_63_remove_min_first() {
+    let (mut scenario, mut tree) = setup();
+
+    let low_key = 1u64;
+    let high_key = 0x8000000000000001u64;
+    // Confirm the two keys genuinely differ by exactly the sign bit, not
+    // merely by hex literals that happen to look that way.
+    assert!((low_key ^ high_key) == U64_SIGN_BIT, 100);
+
+    tree.insert(low_key, mock(1));
+    tree.insert(high_key, mock(2));
+
+    let low_ptr = tree.find(low_key).destroy_some();
+    let _v1 = tree.remove(low_ptr);
+
+    assert!(tree.size() == 1, 0);
+    assert!(tree.find(low_key).is_none(), 1);
+    assert!(tree.find(high_key).is_some(), 2);
+    let sole_ptr = tree.min_leaf().destroy_some();
+    assert!(sole_ptr == tree.max_leaf().destroy_some(), 3);
+    assert!(tree.key(sole_ptr) == high_key, 4);
+
+    let _v2 = tree.remove(sole_ptr);
+    teardown(scenario, tree);
+}
+
+// === insert_extreme_boundary_keys_with_normal_magnitudes ===
+
+/// Inserts `1`, `u64::MAX`, and a handful of normal-magnitude (6-decimal
+/// price-like) keys together, confirming correct min/max tracking and
+/// find-ability across the whole span, then removes in a mixed order (max
+/// first, then min, then a middle key, then the rest) — following this
+/// file's established practice of varying removal order across tests.
+#[test]
+fun insert_extreme_boundary_keys_with_normal_magnitudes() {
+    let (mut scenario, mut tree) = setup();
+
+    let normal_keys = vector[5_000_000u64, 6_250_000, 8_800_000];
+    tree.insert(1, mock(0));
+    let mut i = 0;
+    while (i < normal_keys.length()) {
+        tree.insert(normal_keys[i], mock(i + 1));
+        i = i + 1;
+    };
+    tree.insert(U64_MAX, mock(99));
+
+    assert!(tree.size() == 5, 0);
+    assert!(tree.find(1).is_some(), 1);
+    assert!(tree.find(U64_MAX).is_some(), 2);
+    i = 0;
+    while (i < normal_keys.length()) {
+        assert!(tree.find(normal_keys[i]).is_some(), 3);
+        i = i + 1;
+    };
+
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 1, 4);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == U64_MAX, 5);
+
+    // Remove max first.
+    let max_ptr = tree.find(U64_MAX).destroy_some();
+    let _v1 = tree.remove(max_ptr);
+    assert!(tree.size() == 4, 6);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == 8_800_000, 7);
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 1, 8);
+
+    // Then remove min.
+    let min_ptr = tree.find(1).destroy_some();
+    let _v2 = tree.remove(min_ptr);
+    assert!(tree.size() == 3, 9);
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 5_000_000, 10);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == 8_800_000, 11);
+
+    // Then remove a middle key.
+    let mid_ptr = tree.find(6_250_000).destroy_some();
+    let _v3 = tree.remove(mid_ptr);
+    assert!(tree.size() == 2, 12);
+    assert!(tree.find(6_250_000).is_none(), 13);
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 5_000_000, 14);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == 8_800_000, 15);
+
+    cleanup(&mut tree, vector[5_000_000, 8_800_000]);
+    teardown(scenario, tree);
+}
+
+// === insert_max_u64_and_sign_bit_boundary_key_together ===
+
+/// `u64::MAX` (`0xFFFFFFFFFFFFFFFF`) and `0x7FFFFFFFFFFFFFFF` differ ONLY at
+/// bit 63 — the sign boundary itself. Together with a normal-magnitude key
+/// (to give the tree some depth beyond a single 2-leaf split), confirms the
+/// crit-bit split at this exact boundary lands correctly: `min`/`max`
+/// tracking, `find`-ability, and removal in a third distinct order (middle
+/// first, then min, then max) not yet used by the tests above.
+#[test]
+fun insert_max_u64_and_sign_bit_boundary_key_together() {
+    let (mut scenario, mut tree) = setup();
+
+    tree.insert(U64_MAX, mock(1));
+    tree.insert(U64_MAX_MINUS_SIGN_BIT, mock(2));
+    tree.insert(4_000_000, mock(3));
+
+    assert!(tree.size() == 3, 0);
+    assert!(tree.find(U64_MAX).is_some(), 1);
+    assert!(tree.find(U64_MAX_MINUS_SIGN_BIT).is_some(), 2);
+    assert!(tree.find(4_000_000).is_some(), 3);
+
+    // 4_000_000 is the smallest of the three; U64_MAX is the largest.
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 4_000_000, 4);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == U64_MAX, 5);
+
+    // Remove the middle key first.
+    let mid_ptr = tree.find(U64_MAX_MINUS_SIGN_BIT).destroy_some();
+    let _v1 = tree.remove(mid_ptr);
+    assert!(tree.size() == 2, 6);
+    assert!(tree.find(U64_MAX_MINUS_SIGN_BIT).is_none(), 7);
+    assert!(tree.key(tree.min_leaf().destroy_some()) == 4_000_000, 8);
+    assert!(tree.key(tree.max_leaf().destroy_some()) == U64_MAX, 9);
+
+    // Then remove the min.
+    let min_ptr = tree.find(4_000_000).destroy_some();
+    let _v2 = tree.remove(min_ptr);
+    assert!(tree.size() == 1, 10);
+    let sole_ptr = tree.min_leaf().destroy_some();
+    assert!(sole_ptr == tree.max_leaf().destroy_some(), 11);
+    assert!(tree.key(sole_ptr) == U64_MAX, 12);
+
+    // Then remove the last (max) leaf, emptying the tree.
+    let _v3 = tree.remove(sole_ptr);
+    assert!(tree.size() == 0, 13);
+    assert!(tree.min_leaf().is_none(), 14);
+    assert!(tree.max_leaf().is_none(), 15);
+    teardown(scenario, tree);
+}
+
 // === test helpers ===
 
 fun setup(): (ts::Scenario, PriceTree<MockLevel>) {

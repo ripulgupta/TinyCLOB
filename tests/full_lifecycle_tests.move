@@ -114,7 +114,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(cross1_ticket_opt.is_none(), 13); // taker's own order fully filled, doesn't rest
     cross1_ticket_opt.destroy_none();
     // ask1 now has 269 - 113 = 156 remaining, pooling 70_399 quote for maker_a().
-    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), ask1_price) == 156, 14);
+    assert!(book.depth_at_price(tiny_clob::ask(), ask1_price) == 156, 14);
 
     // --- A market-order taker partially crosses bid1 (the higher of the ---
     // --- two resting bids; fees still 0).                              ---
@@ -132,7 +132,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     // divides out exactly with zero rounding slop at any cumulative fill
     // count, so the remaining Quote escrow is exactly `601 * 187 = 112_387`
     // (i.e. `bid_escrow_amount(bid1_price, 187)`, exactly), not `187`.
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid1_price) == 601 * 187, 18);
+    assert!(book.depth_at_price(tiny_clob::bid(), bid1_price) == 601 * 187, 18);
 
     // --- Fees change mid-lifecycle. ---
     scenario.next_tx(admin());
@@ -319,7 +319,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     assert!(cross1_ticket_opt.is_none(), 9);
     cross1_ticket_opt.destroy_none();
     // ask now has 173 - 59 = 114 remaining.
-    assert!(book.depth_at_price(tiny_clob::ask_for_testing(), ask_price) == 114, 10);
+    assert!(book.depth_at_price(tiny_clob::ask(), ask_price) == 114, 10);
 
     // A market-order taker partially crosses the bid.
     scenario.next_tx(taker());
@@ -334,7 +334,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     // Quote-denominated; `bid_price` is an exact multiple of `price_scale`,
     // so the remaining escrow divides out exactly to `289 * 56 = 16_184`
     // (`bid_escrow_amount(bid_price, 56)`, exactly), not `56`.
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), bid_price) == 289 * 56, 13);
+    assert!(book.depth_at_price(tiny_clob::bid(), bid_price) == 289 * 56, 13);
 
     // Reassign the remaining 56 of the bid to maker_a() -- left resting
     // (untouched) until the retire/drain finale below, to prove force-drain
@@ -403,6 +403,100 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     let (deleted_order_book_id, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
     assert!(deleted_order_book_id == deleted_id, 33);
 
+    scenario.end();
+}
+
+/// The REVERSE direction of `full_lifecycle_realistic_btc_usdc_decimals`'s
+/// maker-fee-snapshot story above: there, an order rests while
+/// `maker_fee_bps` is 0 and is later RAISED off of 0, proving the snapshot
+/// (not the live rate) governs settlement. Here, an order rests while
+/// `maker_fee_bps` is ALREADY nonzero (3) and is later raised AGAIN, to a
+/// different nonzero value (`MAX_MAKER_FEE_BPS` = 5, the ceiling this module
+/// enforces) -- the order must still settle at its ORIGINAL 3-bps snapshot,
+/// not the live 5-bps rate. Uses the same realistic BTC/USDC book shape
+/// (`price_scale = 100`) as that test.
+#[test]
+fun full_lifecycle_maker_fee_snapshot_survives_nonzero_to_nonzero_change() {
+    let mut scenario = ts::begin(admin());
+
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(53, &mut scenario);
+    assert!(book.price_scale() == 100, 0);
+
+    // maker_fee_bps starts nonzero (3) -- unlike the 0-to-nonzero test above.
+    cap.clob_admin_set_maker_fee(&mut book, 3);
+
+    // A bid rests while maker_fee_bps == 3, snapshotting that rate.
+    let bid_price = 100 * 500; // = 50_000, an exact multiple of price_scale
+    let bid_size = 2500; // chosen so the 3-bps vs. 5-bps ceil()s land on
+    // genuinely different integers (see the hand computation below), not on
+    // the same value by coincidence.
+    scenario.next_tx(maker_a());
+    let bid_escrow = book.bid_escrow_amount(bid_price, bid_size);
+    assert!(bid_escrow == 500 * 2500, 1); // = 1_250_000, exact
+    let bid_payment = coin::mint_for_testing<USDC>(bid_escrow, scenario.ctx());
+    let (bid_ticket_opt, bid_matched, bid_leftover, _) =
+        book.place_limit_order_bid(bid_payment, bid_size, 10, scenario.ctx());
+    assert!(bid_matched.burn_for_testing() == 0, 2);
+    assert!(bid_leftover.burn_for_testing() == 0, 3);
+    let bid_ticket = bid_ticket_opt.destroy_some();
+    let bid_order_id = bid_ticket.ticket_order_id();
+
+    // The rate is raised AGAIN, to a DIFFERENT nonzero value (the module's
+    // max, 5), while the bid still rests -- this must not retroactively
+    // touch its 3-bps snapshot.
+    scenario.next_tx(admin());
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+
+    // A taker fully crosses the bid with a matching-size limit ask; the
+    // resting bid concludes in this single fill.
+    scenario.next_tx(taker());
+    let cross_size = bid_size;
+    let cross_payment = coin::mint_for_testing<BTC>(cross_size, scenario.ctx());
+    let cross_expected_quote_output = book.bid_escrow_amount(bid_price, cross_size);
+    assert!(cross_expected_quote_output == 1_250_000, 4);
+    let (cross_ticket_opt, cross_leftover, cross_matched, cross_stopped) =
+        book.place_limit_order_ask(cross_payment, cross_expected_quote_output, 10, scenario.ctx());
+    assert!(!cross_stopped, 5);
+    assert!(cross_ticket_opt.is_none(), 6); // taker's own order fully filled, doesn't rest
+    cross_ticket_opt.destroy_none();
+    assert!(cross_leftover.burn_for_testing() == 0, 7);
+    assert!(cross_matched.burn_for_testing() == cross_expected_quote_output, 8); // taker fee still 0
+
+    // The bid is now fully concluded and gone from the book.
+    assert!(book.resting_order_escrow(true, bid_price, bid_order_id).is_none(), 9);
+
+    // The settled `MakerFeeSettled` amount must reflect the ORIGINAL 3-bps
+    // snapshot (ceil(2_500 * 3 / 10_000) = 1), not the NEW live rate of 5
+    // bps (which would have produced the visibly different ceil(2_500 * 5 /
+    // 10_000) = 2).
+    let original_rate_fee = (bid_size * 3 + 9_999) / 10_000;
+    assert!(original_rate_fee == 1, 10);
+    let wrong_live_rate_fee = (bid_size * 5 + 9_999) / 10_000;
+    assert!(wrong_live_rate_fee == 2, 11);
+    assert!(original_rate_fee != wrong_live_rate_fee, 12); // the two must be distinguishable
+
+    let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
+    assert!(settled.length() == 1, 13);
+    let (ev_order_id, ev_book_id, ev_maker, ev_amount) = settled[0].maker_fee_settled_fields_for_testing();
+    assert!(ev_order_id == bid_order_id, 14);
+    assert!(ev_book_id == book.event_id_for_testing(), 15);
+    assert!(ev_maker == maker_a(), 16);
+    assert!(ev_amount == original_rate_fee, 17); // = 1, NOT wrong_live_rate_fee's 2
+
+    let (fee_base, fee_quote) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(fee_base.burn_for_testing() == original_rate_fee, 18); // = 1
+    assert!(fee_quote.burn_for_testing() == 0, 19);
+
+    // Claim maker_a()'s pooled proceeds (bid_size - original_rate_fee base)
+    // before disposing of the now-orphaned ticket.
+    scenario.next_tx(maker_a());
+    let (claim_base, claim_quote, claim_ticket_opt) = book.claim_proceeds(bid_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == bid_size - original_rate_fee, 20); // = 2_499
+    assert!(claim_quote.burn_for_testing() == 0, 21);
+    assert!(claim_ticket_opt.is_none(), 22); // nothing left resting -> ticket consumed
+    claim_ticket_opt.destroy_none();
+    std::unit_test::destroy(book);
+    std::unit_test::destroy(cap);
     scenario.end();
 }
 

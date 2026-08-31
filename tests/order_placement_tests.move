@@ -20,7 +20,7 @@ use tiny_clob::test_utils::{
 fun place_limit_order_bid_rests_and_emits_orderplaced() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
     let payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
@@ -31,7 +31,10 @@ fun place_limit_order_bid_rests_and_emits_orderplaced() {
     assert!(matched_base.burn_for_testing() == 0, 1);
     assert!(leftover_quote.burn_for_testing() == 0, 2);
     let ticket = ticket_opt.destroy_some();
-    let (t_order_id, t_book_id, t_side, t_price) = ticket.ticket_fields_for_testing();
+    let t_order_id = ticket.ticket_order_id();
+    let t_book_id = ticket.ticket_order_book_id();
+    let t_side = ticket.ticket_side();
+    let t_price = ticket.ticket_price();
     assert!(t_book_id == book_id, 3);
     assert!(t_side == true, 4);
     assert!(t_price == default_price(), 5);
@@ -57,7 +60,7 @@ fun place_limit_order_bid_rests_and_emits_orderplaced() {
 fun place_limit_order_ask_rests_and_emits_orderplaced() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     let payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
     let expected_quote_output = book.bid_escrow_amount(default_price(), default_size());
@@ -68,7 +71,10 @@ fun place_limit_order_ask_rests_and_emits_orderplaced() {
     assert!(leftover_base.burn_for_testing() == 0, 1);
     assert!(matched_quote.burn_for_testing() == 0, 2);
     let ticket = ticket_opt.destroy_some();
-    let (_t_order_id, t_book_id, t_side, t_price) = ticket.ticket_fields_for_testing();
+    let _t_order_id = ticket.ticket_order_id();
+    let t_book_id = ticket.ticket_order_book_id();
+    let t_side = ticket.ticket_side();
+    let t_price = ticket.ticket_price();
     assert!(t_book_id == book_id, 3);
     assert!(t_side == false, 4);
     assert!(t_price == default_price(), 5);

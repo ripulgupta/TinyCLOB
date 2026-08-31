@@ -6,7 +6,7 @@ use sui::balance;
 use sui::coin;
 use sui::event;
 use sui::test_scenario as ts;
-use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsClaimed};
+use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsClaimed, MakerFeeSettled};
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
@@ -238,8 +238,8 @@ fun resting_order_escrow_wrong_lookup_is_none() {
 
     // Ticket-based wrapper aborts on a ticket minted by a different book.
     let (other_book, other_cap) = new_book(&mut scenario);
-    let other_book_id = other_book.id_for_testing();
-    let foreign_ticket = tiny_clob::new_ticket_for_testing(order_id, other_book_id, tiny_clob::bid_for_testing(), default_price());
+    let other_book_id = other_book.book_id();
+    let foreign_ticket = tiny_clob::new_ticket_for_testing(order_id, other_book_id, tiny_clob::bid(), default_price());
     // (Not calling resting_order_escrow_by_ticket(&book, &foreign_ticket)
     // here to avoid an abort mid-test; wrong-book behavior is exercised in
     // resting_order_escrow_by_ticket_wrong_book_aborts below.)
@@ -258,8 +258,8 @@ fun resting_order_escrow_by_ticket_wrong_book_aborts() {
     let (book, cap) = new_book(&mut scenario);
     let (other_book, other_cap) = new_book(&mut scenario);
 
-    let other_book_id = other_book.id_for_testing();
-    let foreign_ticket = tiny_clob::new_ticket_for_testing(0, other_book_id, tiny_clob::bid_for_testing(), default_price());
+    let other_book_id = other_book.book_id();
+    let foreign_ticket = tiny_clob::new_ticket_for_testing(0, other_book_id, tiny_clob::bid(), default_price());
     let _ = book.resting_order_escrow_by_ticket(&foreign_ticket);
 
     unit_test::destroy(foreign_ticket);
@@ -372,6 +372,324 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     scenario.end();
 }
 
+
+// === Follow-ons to the zero-escrow-while-still-resting state above ===
+//
+// Three scenarios sharing the exact same book/price/size construction as
+// `resting_order_escrow_reaches_some_zero_escrow_while_still_resting`
+// (`base_decimals = quote_decimals = 0, precision = 2, exponent = 16` =>
+// `price_scale = 100`; a fresh size-100 bid at price 33, reserving
+// `total_reserved = ceil(33*100/100) = 33`; the escrow hits exactly 0 after
+// 97 one-unit taker fills, while 3 units of genuinely resting Base capacity
+// remain) but each continuing past that point differently: (1) draining the
+// remaining 3 units to full conclusion, (2) cancelling mid-way through that
+// zero-escrow state, (3) repeating the same construction with a nonzero
+// `maker_fee_bps` set beforehand.
+
+#[test]
+fun resting_order_zero_escrow_continues_to_full_drain_conclusion() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    assert!(book.price_scale() == 100, 0);
+
+    scenario.next_tx(maker_a());
+    let reserved = book.bid_escrow_amount(33, 100);
+    assert!(reserved == 33, 1);
+    let bid_ticket = rest_bid(&mut book, 33, 100, 200, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    // Same 97-fill sequence as the base fixture: escrow hits exactly 0 while
+    // 3 units of Base capacity are still genuinely resting.
+    scenario.next_tx(maker_b());
+    let mut i = 0;
+    while (i < 97) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        mq.burn_for_testing();
+        i = i + 1;
+    };
+    let escrow_opt = book.resting_order_escrow(true, 33, order_id);
+    let (escrow, remaining) = escrow_opt.borrow().resting_order_escrow_fields();
+    assert!(escrow == 0, 2);
+    assert!(remaining == 0, 3);
+
+    // Continue draining the remaining 3 genuinely-resting Base units to full
+    // conclusion (through `destroy_drained_bid_escrow`/`conclude_order_fee`
+    // in `fill_level_bid`), starting from a Quote escrow that was already 0
+    // *before* this final stretch of fills -- exercising whether the drain
+    // path underflows or double-charges when there's nothing left in escrow
+    // to draw from. `already_charged == total_reserved` for every one of
+    // these remaining fills, so each one's `quote_cost` is exactly 0.
+    while (i < 100) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        assert!(mq.burn_for_testing() == 0, 4);
+        i = i + 1;
+    };
+
+    // The order must now be fully gone from the book (fully drained and
+    // removed at the 100th fill).
+    assert!(book.resting_order_escrow(true, 33, order_id).is_none(), 5);
+
+    // Claiming must return the ticket's full `original_size = 100` worth of
+    // Base proceeds (no fee, so no shortfall), 0 Quote (all consumed as
+    // escrow across the 97 charged fills), and no ticket back (order fully
+    // concluded).
+    scenario.next_tx(maker_a());
+    let (base_coin, quote_coin, ticket_opt) = book.claim_proceeds(bid_ticket, scenario.ctx());
+    assert!(ticket_opt.is_none(), 6);
+    ticket_opt.destroy_none();
+    assert!(base_coin.burn_for_testing() == 100, 7);
+    assert!(quote_coin.burn_for_testing() == 0, 8);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun resting_order_zero_escrow_cancel_returns_pooled_base_proceeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    assert!(book.price_scale() == 100, 0);
+
+    scenario.next_tx(maker_a());
+    let reserved = book.bid_escrow_amount(33, 100);
+    assert!(reserved == 33, 1);
+    let bid_ticket = rest_bid(&mut book, 33, 100, 200, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    scenario.next_tx(maker_b());
+    let mut i = 0;
+    while (i < 97) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        mq.burn_for_testing();
+        i = i + 1;
+    };
+    let escrow_opt = book.resting_order_escrow(true, 33, order_id);
+    let (escrow, remaining) = escrow_opt.borrow().resting_order_escrow_fields();
+    assert!(escrow == 0, 2);
+    assert!(remaining == 0, 3);
+
+    // Cancel while still zero-escrow-but-resting: the ticket's own Quote
+    // escrow is genuinely empty (0 additional Quote), but the 97 units of
+    // Base proceeds already pooled in the maker-proceeds table by the prior
+    // 97 fills (1 unit credited per fill, no fee) must still be returned in
+    // full.
+    scenario.next_tx(maker_a());
+    let (base_coin, quote_coin) = book.cancel_order(bid_ticket, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == 97, 4);
+    assert!(quote_coin.burn_for_testing() == 0, 5);
+
+    assert!(book.resting_order_escrow(true, 33, order_id).is_none(), 6);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    assert!(book.price_scale() == 100, 0);
+
+    // Nonzero maker fee (the max allowed rate), set on the book BEFORE the
+    // bid rests -- the base fixture test uses `maker_fee_bps == 0` to
+    // isolate the Quote-escrow mechanic; this repeats the exact same
+    // construction with the Base-side maker-fee reserve/settlement
+    // machinery (`fee_reserve_base`/`conclude_order_fee`) also live.
+    let nonzero_maker_fee_bps: u64 = 5; // == MAX_MAKER_FEE_BPS in sources/tiny_clob.move
+    scenario.next_tx(admin());
+    cap.clob_admin_set_maker_fee(&mut book, nonzero_maker_fee_bps);
+
+    scenario.next_tx(maker_a());
+    let reserved = book.bid_escrow_amount(33, 100);
+    assert!(reserved == 33, 1);
+    let bid_ticket = rest_bid(&mut book, 33, 100, 200, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    // Each 1-unit fill's own dust fee independently ceiling-rounds up to 1
+    // (`fee_amount(1, 5) = ceil(5/10_000) = 1`), so the maker's
+    // `fee_reserve_base` grows by 1 per fill and each fill's own credited
+    // Base proceeds are 0 (the whole 1-unit fill is absorbed by its own
+    // dust fee) -- this is exactly the superadditive over-collection
+    // `conclude_order_fee` exists to true up.
+    scenario.next_tx(maker_b());
+    let mut i = 0;
+    while (i < 97) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        mq.burn_for_testing();
+        i = i + 1;
+    };
+    let escrow_opt = book.resting_order_escrow(true, 33, order_id);
+    let (escrow, remaining) = escrow_opt.borrow().resting_order_escrow_fields();
+    assert!(escrow == 0, 2);
+    assert!(remaining == 0, 3);
+
+    // Continue to full conclusion (same rationale as the fill-drain
+    // follow-on above, now with the fee reserve also live).
+    while (i < 100) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        assert!(mq.burn_for_testing() == 0, 4);
+        i = i + 1;
+    };
+    assert!(book.resting_order_escrow(true, 33, order_id).is_none(), 5);
+
+    // Hand-computed expected settled fee: the CORRECT aggregate fee over the
+    // order's whole fill history is `fee_amount(fee_basis_accumulated =
+    // original_size = 100, maker_fee_bps = 5) = ceil(100*5/10_000) =
+    // ceil(0.05) = 1` -- collected exactly once, at conclusion, regardless
+    // of the 100 separate per-fill dust fees (100 total) independently
+    // ceiling-rounding to 1 each; the superadditive slack (100 - 1 = 99) is
+    // refunded back into the maker's own proceeds instead of being
+    // double-charged.
+    let settled = event::events_by_type<MakerFeeSettled>();
+    assert!(settled.length() == 1, 6);
+    let (_settled_order_id, _settled_book_id, _settled_maker, settled_amount) =
+        settled[0].maker_fee_settled_fields_for_testing();
+    assert!(settled_amount == 1, 7);
+
+    // Total claimed Base proceeds must be exactly `original_size(100) -
+    // correct_total_fee(1) = 99`, with 0 Quote and no ticket back.
+    scenario.next_tx(maker_a());
+    let (base_coin, quote_coin, ticket_opt) = book.claim_proceeds(bid_ticket, scenario.ctx());
+    assert!(ticket_opt.is_none(), 8);
+    ticket_opt.destroy_none();
+    assert!(base_coin.burn_for_testing() == 99, 9);
+    assert!(quote_coin.burn_for_testing() == 0, 10);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+
+// === Non-tautological cross-check: literal `escrow_base` Balance value ===
+//
+// `resting_order_escrow`'s ask-side branch (`sources/tiny_clob.move`) returns
+// `order.remaining_size()` for BOTH the "escrow" and "remaining_size" fields
+// of its result -- by construction, not by re-reading two independently
+// maintained values. So `resting_order_escrow_fields` agreeing with itself on
+// the ask side (as asserted in `resting_order_escrow_fresh_bid_and_ask` and
+// elsewhere in this file) can never fail regardless of whether the order's
+// *actual* `escrow_base: Option<Balance<Base>>` field genuinely tracks
+// `remaining_size` -- there is no public/`test_only` accessor that reads
+// `escrow_base`'s literal `Balance` value directly.
+//
+// The genuinely non-tautological check available with the current API
+// surface is not an extra assertion the test computes -- it's already baked
+// into the Move runtime's own balance primitives, and this test is built to
+// let a real divergence surface as an abort rather than a silently-passing
+// re-read:
+//
+//   - Every fill against a resting ask calls `split_escrow_base(fill_qty)`
+//     (`Order::split_escrow_base`, `sources/order.move`), which is
+//     `o.escrow_base.borrow_mut().split(amount)` -- `sui::balance::split`
+//     ABORTS if `amount` exceeds the balance's real, live value. If
+//     `escrow_base` had ever silently fallen behind `remaining_size` (held
+//     LESS than the getter reports), the very next fill's split would abort
+//     the whole test right there -- not produce a comparison this test could
+//     get wrong.
+//   - The final fill that fully drains the order (`fill_level_bid`) removes
+//     it and calls `destroy_drained_ask_escrow`, which does
+//     `escrow_base.destroy_some().destroy_zero()` -- `sui::balance::destroy_zero`
+//     ABORTS unless the balance's real, live value is EXACTLY zero. If
+//     `escrow_base` had instead drifted AHEAD of `remaining_size` (held MORE,
+//     leftover Base never spent), `remaining_size` would reach 0 while
+//     `escrow_base` was still nonzero, and this call would abort.
+//
+// So a test that drives several varying-size fills against one resting ask
+// down to an exact, fully-draining final fill, and simply completes without
+// aborting while ending in `resting_order_escrow(..) == None`, is a real,
+// runtime-enforced proof that `escrow_base`'s literal value tracked
+// `remaining_size` exactly at every step -- a divergence in EITHER direction
+// would have aborted the transaction instead of letting the test finish.
+// Layered on top: `depth_at_price`'s ask-side aggregate (`level.total_size`,
+// `price_tree.move`) is maintained via `level_remove_order`/
+// `level_insert_order_front` at fill time -- a different code path
+// (per-price-level bookkeeping across the FIFO queue) than the single
+// order's own `remaining_size()` getter that `resting_order_escrow` reads --
+// so cross-checking it against the test's own independently-computed
+// "original size minus cumulative fills" catches FIFO/level-aggregate bugs
+// that a per-order-only check would miss.
+#[test]
+fun resting_ask_escrow_base_tracks_remaining_size_exactly_across_fills() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario); // price_scale == 1, no rounding to account for.
+
+    scenario.next_tx(maker_a());
+    let price = default_price();
+    let original_size = 500;
+    let ask_ticket = rest_ask(&mut book, price, original_size, 10, scenario.ctx());
+    let order_id = ask_ticket.ticket_order_id();
+
+    // Fresh order: both cross-checks agree with the full size.
+    let fresh_opt = book.resting_order_escrow(false, price, order_id);
+    assert!(fresh_opt.is_some(), 0);
+    let (fresh_escrow, fresh_remaining) = fresh_opt.borrow().resting_order_escrow_fields();
+    assert!(fresh_escrow == original_size, 1);
+    assert!(fresh_remaining == original_size, 2);
+    assert!(book.depth_at_price(false, price) == original_size, 3);
+
+    // Five varying-size fills, none of which drain the order except the
+    // last: 80 + 150 + 40 + 130 + 100 == 500 == original_size. `price_scale
+    // == 1` means every fill's Quote cost is exactly `price * fill_qty`, no
+    // rounding, so an exact-value payment produces an exact-`fill_qty` match
+    // every time (taker-limited on the budget, not the resting order, for
+    // every fill but the last).
+    let fill_sizes = vector[80, 150, 40, 130, 100];
+    let mut cumulative: u64 = 0;
+    let mut i = 0;
+    scenario.next_tx(taker());
+    while (i < fill_sizes.length()) {
+        let fill_qty = fill_sizes[i];
+        let quote_payment_value = price * fill_qty;
+        let payment = coin::mint_for_testing<USDC>(quote_payment_value, scenario.ctx());
+        let (matched_base, leftover_quote, _) =
+            book.place_market_order_bid(payment, 10, 0, u64_max(), u64_max(), scenario.ctx());
+        // Confirms this fill matched exactly `fill_qty` Base (0 taker fee on
+        // this book) and consumed the whole exact payment -- so `cumulative`
+        // below is genuinely this fill's own contribution, not a guess.
+        assert!(matched_base.burn_for_testing() == fill_qty, 4);
+        assert!(leftover_quote.burn_for_testing() == 0, 5);
+
+        cumulative = cumulative + fill_qty;
+        let expected_remaining = original_size - cumulative;
+        i = i + 1;
+
+        if (expected_remaining > 0) {
+            // Order still resting: both cross-checks must independently
+            // agree with the test's own hand-computed expected remainder.
+            let opt = book.resting_order_escrow(false, price, order_id);
+            assert!(opt.is_some(), 6);
+            let (escrow, remaining) = opt.borrow().resting_order_escrow_fields();
+            assert!(escrow == expected_remaining, 7);
+            assert!(remaining == expected_remaining, 8);
+            // Independently-derived aggregate (level.total_size, a different
+            // code path than the order's own remaining_size() getter).
+            assert!(book.depth_at_price(false, price) == expected_remaining, 9);
+        } else {
+            // Last fill fully drained the order: `sui::balance::destroy_zero`
+            // inside `destroy_drained_ask_escrow` would already have aborted
+            // this transaction had `escrow_base` held anything other than
+            // exactly 0 at this point -- reaching here at all is part of the
+            // genuine, non-tautological proof (see the header comment
+            // above). The order must now be entirely gone from the book.
+            assert!(book.resting_order_escrow(false, price, order_id).is_none(), 10);
+            assert!(book.depth_at_price(false, price) == 0, 11);
+        };
+    };
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
 
 // === Additional coverage: independently-verified gaps from the design review ===
 

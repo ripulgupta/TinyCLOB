@@ -225,16 +225,6 @@ fun destroy_fee_accumulator<Base, Quote>(
     (base, quote)
 }
 
-#[test_only]
-fun credit_fee_accumulator<Base, Quote>(
-    fees: &mut FeeAccumulator<Base, Quote>,
-    base: Balance<Base>,
-    quote: Balance<Quote>,
-) {
-    fees.base.join(base);
-    fees.quote.join(quote);
-}
-
 // === OrderBook<Base, Quote> ===
 
 /// `retiring` is a genuinely separate, sticky flag from `paused`. It is set
@@ -2824,12 +2814,6 @@ public fun push_proceeds<Base, Quote>(
 // === Test-only accessors ===
 
 #[test_only]
-public fun bid_for_testing(): bool { true }
-
-#[test_only]
-public fun ask_for_testing(): bool { false }
-
-#[test_only]
 public fun clob_admin_cap_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID {
     book.clob_admin_cap_id
 }
@@ -2837,14 +2821,6 @@ public fun clob_admin_cap_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quo
 #[test_only]
 public fun bids_size_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): u64 {
     book.bids.size()
-}
-
-/// The book's own object id, derived from its `id: UID` field directly
-/// (`object::id` requires `key`, which this struct deliberately does not
-/// have — see the struct's own doc comment above).
-#[test_only]
-public fun id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID {
-    object::uid_to_inner(&book.id)
 }
 
 /// Exposes this module's own internal insertion path (`insert_resting_order`
@@ -2860,16 +2836,6 @@ public fun insert_resting_order_for_testing<Base, Quote>(
     ctx: &mut TxContext,
 ) {
     insert_resting_order(book, side, price, order, ctx);
-}
-
-#[test_only]
-public fun credit_fee_accumulator_for_testing<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    base: Balance<Base>,
-    quote: Balance<Quote>,
-) {
-    let fees = &mut book.fee_accumulator;
-    credit_fee_accumulator(fees, base, quote);
 }
 
 #[test_only]
@@ -2980,11 +2946,6 @@ public fun new_ticket_for_testing(
 }
 
 #[test_only]
-public fun ticket_fields_for_testing(t: &OrderTicket): (u64, ID, bool, u64) {
-    (t.order_id, t.order_book_id, t.side, t.price)
-}
-
-#[test_only]
 public fun order_filled_fields_for_testing(e: &OrderFilled): (u64, ID, u64, u64, address, address) {
     (e.maker_order_id, e.order_book_id, e.price, e.size, e.maker, e.taker)
 }
@@ -3004,59 +2965,3 @@ public fun maker_fee_settled_fields_for_testing(e: &MakerFeeSettled): (u64, ID, 
     (e.order_id, e.order_book_id, e.maker, e.amount)
 }
 
-/// Direct `match_bid` exposure, used by behavioral-equivalence tests that
-/// need to drive the matching engine directly with an arbitrary (not
-/// escrow-derived) `payment`.
-#[test_only]
-public fun match_bid_for_testing<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    limit_price: Option<u64>,
-    remaining_size_in: u64,
-    payment: Coin<Quote>,
-    max_fills: u64,
-    ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, u64, bool, u64) {
-    let taker = ctx.sender();
-    let budget = payment.into_balance();
-    let taker_fee_bps = book.taker_fee_bps;
-    let (mut matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(book, limit_price, remaining_size_in, budget, taker, max_fills);
-    let taker_fee_amount = fee_amount(matched_base.value(), taker_fee_bps);
-    let taker_fee_balance = matched_base.split(taker_fee_amount);
-    book.fee_accumulator.base.join(taker_fee_balance);
-    (
-        matched_base.into_coin(ctx),
-        remaining_budget.into_coin(ctx),
-        remaining_size,
-        stopped_on_max_fills_while_crossing,
-        taker_fee_amount,
-    )
-}
-
-/// Direct `match_ask` exposure — symmetric counterpart to
-/// `match_bid_for_testing` above.
-#[test_only]
-public fun match_ask_for_testing<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    limit_price: Option<u64>,
-    remaining_size_in: u64,
-    payment: Coin<Base>,
-    max_fills: u64,
-    ctx: &mut TxContext,
-): (Coin<Quote>, Coin<Base>, u64, bool, u64) {
-    let taker = ctx.sender();
-    let escrow_base = payment.into_balance();
-    let taker_fee_bps = book.taker_fee_bps;
-    let (mut matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(book, limit_price, remaining_size_in, escrow_base, taker, max_fills);
-    let taker_fee_amount = fee_amount(matched_quote.value(), taker_fee_bps);
-    let taker_fee_balance = matched_quote.split(taker_fee_amount);
-    book.fee_accumulator.quote.join(taker_fee_balance);
-    (
-        matched_quote.into_coin(ctx),
-        remaining_escrow.into_coin(ctx),
-        remaining_size,
-        stopped_on_max_fills_while_crossing,
-        taker_fee_amount,
-    )
-}

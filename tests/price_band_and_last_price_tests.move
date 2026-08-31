@@ -58,6 +58,47 @@ fun price_band_factor_just_outside_band_above_aborts() {
 }
 
 #[test]
+fun price_band_factor_just_inside_band_succeeds_ask() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    // band: [1000/2, 1000*2] = [500, 2000]
+    let low_ticket = rest_ask(&mut book, 500, min_size(), 10, scenario.ctx());
+    let high_ticket = rest_ask(&mut book, 2000, min_size(), 10, scenario.ctx());
+    unit_test::destroy(low_ticket);
+    unit_test::destroy(high_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 23, location = tiny_clob)] // EPriceBelowBand
+fun price_band_factor_just_outside_band_below_aborts_ask() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    let ticket = rest_ask(&mut book, 499, min_size(), 10, scenario.ctx()); // just below the [500, 2000] band
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 24, location = tiny_clob)] // EPriceAboveBand
+fun price_band_factor_just_outside_band_above_aborts_ask() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    let ticket = rest_ask(&mut book, 2001, min_size(), 10, scenario.ctx()); // just above the [500, 2000] band
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
 fun set_last_price_empty_book_is_unconstrained() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
@@ -346,7 +387,7 @@ fun set_last_price_zero_aborts() {
 fun last_price_set_event_records_setter_and_value() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     scenario.next_tx(maker_a());
     assert!(book.last_price() == 1, 0); // initial_last_price, not yet touched
@@ -415,7 +456,7 @@ fun set_last_price_succeeds_on_paused_book() {
 fun set_last_price_succeeds_on_retiring_book_and_finalize_still_works() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
     cap.clob_admin_retire(&mut book);
 
     // Not gated on `retiring` either: succeeds on a retiring book.

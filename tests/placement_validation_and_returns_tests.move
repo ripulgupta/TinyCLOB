@@ -75,13 +75,50 @@ fun place_limit_order_zero_price_aborts() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
 fun place_limit_order_size_validation_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let payment = coin::mint_for_testing<USDC>(1, scenario.ctx());
+    // `expected_base_output == min_size() - 1` is genuinely below `new_book`'s
+    // `min_size` (100), so `validate_size` is the only check this fixture can
+    // possibly fail. `payment` is chosen as `100 * expected_base_output` so
+    // the derived `price == floor(payment * price_scale / expected_base_output)
+    // == 100` (this book's `price_scale == 1`) is comfortably nonzero and well
+    // within the book's declared `[1, 10^19]` range -- unlike the old `payment
+    // == 1` fixture (which derived `price == 0`), `EZeroPrice` cannot also
+    // fire here, so an `abort_code`-asserted failure unambiguously proves
+    // `ESizeBelowMinSize` is what aborts (deleting the `validate_size` call
+    // in `place_limit_order_bid` would make this test fail, not stay green).
+    let size = min_size() - 1;
+    let payment = coin::mint_for_testing<USDC>(size * 100, scenario.ctx());
     let (ticket_opt, mb, ml, _) =
-        book.place_limit_order_bid(payment, PLACEMENT_SIZE - 1, 10, scenario.ctx());
+        book.place_limit_order_bid(payment, size, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// =====================================================================
+// A paused book must reject every placement/market entry point. Each of the
+// 4 current entry points (`swap_bid`/`swap_ask` no longer exist) gets its own
+// test below: `assert_book_version`/`is_paused` runs first in every one of
+// them, before any size/price/ordering validation (verified by reading
+// `sources/tiny_clob.move`), so a fixture that is otherwise fully valid
+// (real payment, size >= min_size, a comfortably-in-range derived price)
+// isolates `EBookPaused` as the only possible failure reason.
+// =====================================================================
+
+#[test]
+#[expected_failure(abort_code = 15, location = tiny_clob)] // EBookPaused
+fun place_limit_order_bid_aborts_when_paused() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_pause_book(&mut book);
+    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), scenario.ctx());
+    let (ticket_opt, mb, ml, _) =
+        book.place_limit_order_bid(payment, PLACEMENT_SIZE, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
@@ -90,15 +127,46 @@ fun place_limit_order_size_validation_aborts() {
 }
 
 #[test]
-#[expected_failure]
-fun placement_functions_abort_when_paused() {
+#[expected_failure(abort_code = 15, location = tiny_clob)] // EBookPaused
+fun place_limit_order_ask_aborts_when_paused() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_pause_book(&mut book);
+    let payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
+    let expected_quote_output = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
+    let (ticket_opt, mb, ml, _) =
+        book.place_limit_order_ask(payment, expected_quote_output, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 15, location = tiny_clob)] // EBookPaused
+fun place_market_order_bid_aborts_when_paused() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     cap.clob_admin_pause_book(&mut book);
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), scenario.ctx());
-    let (ticket_opt, mb, ml, _) =
-        book.place_limit_order_bid(payment, PLACEMENT_SIZE, 10, scenario.ctx());
-    unit_test::destroy(ticket_opt);
+    let (mb, ml, _) =
+        book.place_market_order_bid(payment, 10, 0, PLACEMENT_SIZE, u64_max(), scenario.ctx());
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 15, location = tiny_clob)] // EBookPaused
+fun place_market_order_ask_aborts_when_paused() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_pause_book(&mut book);
+    let payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
+    let (mb, ml, _) =
+        book.place_market_order_ask(payment, 10, 0, PLACEMENT_SIZE, scenario.ctx());
     unit_test::destroy(mb);
     unit_test::destroy(ml);
     destroy_book_and_cap(book, cap);
@@ -262,9 +330,9 @@ fun cancel_and_claim_never_block_on_pause_or_retiring() {
     // resting, claim_proceeds auto-destroys the ticket and returns
     // option::none().
     cap.clob_admin_retire(&mut book);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
     let dummy_ticket =
-        tiny_clob::new_ticket_for_testing(999, book_id, tiny_clob::bid_for_testing(), PLACEMENT_PRICE);
+        tiny_clob::new_ticket_for_testing(999, book_id, tiny_clob::bid(), PLACEMENT_PRICE);
     let (claim_base, claim_quote, returned_ticket_opt) =
         book.claim_proceeds(dummy_ticket, scenario.ctx());
     assert!(claim_base.burn_for_testing() == 0, 2);
@@ -358,6 +426,120 @@ fun place_limit_order_bid_truncated_by_max_fills_returns_none() {
 
     unit_test::destroy(ask_a);
     unit_test::destroy(ask_b);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// PIN DOWN: `fill_level_bid`'s inner loop checks `fills_consumed ==
+/// max_fills` BEFORE checking `level_is_empty()` (see
+/// `sources/tiny_clob.move`, `fill_level_bid`). Concretely: on the fill that
+/// exactly drains the last resting order the level had, `fills_consumed` is
+/// incremented to equal `max_fills` and the loop's `max_fills` check is
+/// re-evaluated (and fires) on the *next* iteration, before the also-true
+/// `level_is_empty()` check ever gets a chance to run. So when `max_fills`
+/// exactly equals the number of resting orders present, the sweep reports
+/// `stopped_on_max_fills_while_crossing = true` even though the level was
+/// completely, naturally drained -- there was no counterparty depth left to
+/// truncate against. `is_empty_now` is still recomputed unconditionally
+/// after the loop, so the level IS correctly removed and `depth_at_price`
+/// still correctly reads 0 regardless of this ordering quirk.
+///
+/// This has a real, user-visible consequence on the bid side:
+/// `place_limit_order_bid`'s `should_rest` is
+/// `actual_resting_size > 0 && !stopped_on_max_fills_while_crossing`, so a
+/// taker whose own requested size exceeds what those exactly-`max_fills`
+/// resting orders could supply gets `should_rest = false` purely because of
+/// this ordering quirk -- its own leftover does NOT rest, even though the
+/// book at that price is now fully, genuinely empty (not because more
+/// counterparty depth was withheld by the `max_fills` cap). This test pins
+/// down the current, exact behavior at that boundary so a future accidental
+/// change to the check ordering becomes visible, not to argue this is wrong.
+#[test]
+fun place_limit_order_bid_max_fills_exact_match_reports_stopped_despite_fully_draining_level() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    // Exactly 3 resting asks at one price level.
+    let ask_a = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let ask_b = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let ask_c = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+
+    scenario.next_tx(taker());
+    // Taker wants 400: strictly more than the 300 those 3 orders can supply,
+    // so there is a genuine, nonzero leftover from the taker's own
+    // perspective. max_fills == 3, exactly the number of resting orders.
+    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 400), scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 400, 3, scenario.ctx());
+
+    // Actual behavior at the exact-match boundary: `stopped` comes back
+    // `true`, even though all 300 base of genuine counterparty depth was
+    // consumed and nothing was actually left un-swept in the book.
+    assert!(stopped, 0);
+    assert!(matched_base.burn_for_testing() == 300, 1);
+    assert!(leftover_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 2);
+    // Consequence: the taker's own 100 leftover does NOT rest, solely
+    // because `stopped_on_max_fills_while_crossing` is true.
+    assert!(ticket_opt.is_none(), 3);
+    ticket_opt.destroy_none();
+    // But the level was genuinely, fully drained: depth is 0 regardless.
+    assert!(book.depth_at_price(tiny_clob::ask(), OPT_PRICE) == 0, 4);
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(event_stopped, 5);
+    assert!(unmatched_size == 100, 6);
+    assert!(rested_size == 0, 7);
+
+    unit_test::destroy(ask_a);
+    unit_test::destroy(ask_b);
+    unit_test::destroy(ask_c);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Companion to the exact-match case above: with `max_fills` set to ONE MORE
+/// than the number of resting orders needed (4, for 3 orders), the sweep
+/// naturally ends via `level_is_empty()` on the loop's next check -- before
+/// `fills_consumed` (which only reaches 3) could ever equal `max_fills` (4).
+/// So `stopped_on_max_fills_while_crossing` correctly comes back `false`
+/// here, and the taker's own leftover legitimately rests. This is the exact
+/// contrast to the boundary pinned down above.
+#[test]
+fun place_limit_order_bid_max_fills_one_more_than_needed_does_not_report_stopped() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let ask_a = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let ask_b = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let ask_c = rest_ask(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+
+    scenario.next_tx(taker());
+    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 400), scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 400, 4, scenario.ctx());
+
+    assert!(!stopped, 0);
+    assert!(matched_base.burn_for_testing() == 300, 1);
+    assert!(leftover_quote.burn_for_testing() == 0, 2);
+    // The taker's own 100 leftover genuinely rests this time.
+    assert!(ticket_opt.is_some(), 3);
+    let ticket = ticket_opt.destroy_some();
+    let (cb, cq) = book.cancel_order(ticket, scenario.ctx());
+    assert!(cb.burn_for_testing() == 0, 4);
+    assert!(cq.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 5);
+    // The level is equally, fully drained in this case too.
+    assert!(book.depth_at_price(tiny_clob::ask(), OPT_PRICE) == 0, 6);
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(!event_stopped, 7);
+    assert!(unmatched_size == 100, 8);
+    assert!(rested_size == 100, 9);
+
+    unit_test::destroy(ask_a);
+    unit_test::destroy(ask_b);
+    unit_test::destroy(ask_c);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

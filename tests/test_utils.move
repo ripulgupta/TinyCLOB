@@ -258,7 +258,7 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(min_leftover.burn_for_testing() == 0, 3);
     // Quote-denominated for a bid (see `depth_at_price`'s doc comment) --
     // equal to the escrow reserved, not the Base `size`.
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_min) == min_escrow, 4);
+    assert!(book.depth_at_price(tiny_clob::bid(), p_min) == min_escrow, 4);
     let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
     assert!(min_b.burn_for_testing() == 0, 5);
     assert!(min_q.burn_for_testing() == min_escrow, 6);
@@ -271,7 +271,7 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(!max_stopped, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
     assert!(max_leftover.burn_for_testing() == 0, 9);
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_max) == max_escrow, 10);
+    assert!(book.depth_at_price(tiny_clob::bid(), p_max) == max_escrow, 10);
     let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
     assert!(max_b.burn_for_testing() == 0, 11);
     assert!(max_q.burn_for_testing() == max_escrow, 12);
@@ -299,8 +299,8 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(mid_next_matched.burn_for_testing() == 0, 17);
     assert!(mid_next_leftover.burn_for_testing() == 0, 18);
 
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid) == mid_escrow, 19);
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), p_mid_next) == mid_next_escrow, 20);
+    assert!(book.depth_at_price(tiny_clob::bid(), p_mid) == mid_escrow, 19);
+    assert!(book.depth_at_price(tiny_clob::bid(), p_mid_next) == mid_next_escrow, 20);
     assert!(p_mid != p_mid_next, 21);
 
     unit_test::destroy(mid_ticket_opt.destroy_some());

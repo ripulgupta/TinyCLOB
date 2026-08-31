@@ -80,7 +80,7 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     // `resting_order_escrow`/`depth_at_price` must both report the FULL
     // Quote reservation up front -- Quote-denominated `remaining_size` for a
     // bid means these now report 50 (Quote), not 100 (Base).
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == 50, 104);
+    assert!(book.depth_at_price(tiny_clob::bid(), price) == 50, 104);
     assert!(book.bid_quote_escrow_at_price(price) == 50, 105);
 
     // Fill 1: incoming ask sells 7 Base. Expect quote_cost == 4.
@@ -130,9 +130,9 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     assert!(ask4_matched_quote.burn_for_testing() == 25, 15);
 
     // The resting bid must now be fully gone (drained, popped off the book).
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == 0, 16);
+    assert!(book.depth_at_price(tiny_clob::bid(), price) == 0, 16);
     assert!(book.bid_quote_escrow_at_price(price) == 0, 17);
-    assert!(book.resting_order_escrow(tiny_clob::bid_for_testing(), price, 0).is_none(), 18);
+    assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 18);
 
     // Sum of all 4 quote_cost deltas exactly equals `total_reserved` -- zero
     // stranded, zero over-collected: 4+6+15+25 == 50.
@@ -148,6 +148,141 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     assert!(claim_base.burn_for_testing() == 100, 19);
     assert!(claim_quote.burn_for_testing() == 0, 20);
     assert!(ticket_opt.is_none(), 21); // order no longer resting -> ticket consumed
+    ticket_opt.destroy_none();
+
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
+    scenario.end();
+}
+
+/// Scale version of `cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly`:
+/// same `shortfall_book`/`shortfall_price` fixture (price=5, price_scale=10),
+/// but a size-1000 resting bid (`total_reserved =
+/// ceil(5*1000/10) == 500`) drained across 25 separate incoming asks instead
+/// of 4, with deliberately varied, non-round, mostly-small fill sizes
+/// (1, 2, 3, 5, 7, 11, ... up to 101 -- the first 25 primes plus a leading
+/// 1, chosen specifically so no two fills are the same size and the
+/// remainders being ceil-rounded away vary fill to fill) summing to exactly
+/// 1000. This is the exact regression class ("drain what's left" dumping
+/// accumulated rounding slack onto whichever fill concludes the order) that
+/// reportedly broke three prior implementations of this scheme -- a 4-fill
+/// scenario can pass by accident, so this test hammers the same guarantee
+/// with many more, more irregular fills to make an accidental pass far less
+/// plausible.
+///
+/// Rather than hand-deriving each fill's expected `quote_cost` (as the
+/// 4-fill test above does), this test tracks the RUNNING SUM of Quote
+/// actually taken from the resting bid -- computed each iteration as the
+/// drop in `bid_quote_escrow_at_price` -- and, after the 25th fill fully
+/// drains the bid, asserts that running sum lands exactly on
+/// `total_reserved` (zero dust, nothing stranded or over-collected) AND
+/// that the maker's claimed Base proceeds exactly equal the bid's full
+/// `original_size` (zero shortfall).
+#[test]
+fun cumulative_ceiling_scheme_at_scale_25_fragmented_fills_still_conserves_exactly() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+    let price = shortfall_price(); // 5, price_scale == 10
+
+    let original_size = 1000;
+
+    scenario.next_tx(maker_a());
+    let total_reserved = book.bid_escrow_amount(price, original_size);
+    assert!(total_reserved == 500, 100);
+    let bid_payment = coin::mint_for_testing<USDC>(total_reserved, scenario.ctx());
+    let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, bid_stopped) =
+        book.place_limit_order_bid(bid_payment, original_size, MAX_FILLS, scenario.ctx());
+    assert!(!bid_stopped, 101);
+    assert!(bid_matched_base.burn_for_testing() == 0, 102);
+    assert!(bid_leftover_quote.burn_for_testing() == 0, 103);
+    let bid_ticket = bid_ticket_opt.destroy_some();
+
+    assert!(book.bid_quote_escrow_at_price(price) == total_reserved, 104);
+
+    // 25 deliberately irregular, non-round fill sizes -- a leading 1 plus 24
+    // distinct primes (not the first 24 -- 79 and 83 were swapped out for 97
+    // and 101 so the total lands exactly on `original_size` (1000)) -- with
+    // no two fills the same size.
+    let fill_sizes = vector[
+        1, 2, 3, 5, 7, 11, 13, 17, 19, 23,
+        29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
+        71, 73, 89, 97, 101,
+    ];
+    assert!(fill_sizes.length() == 25, 105);
+    let mut expected_total = 0;
+    let mut i = 0;
+    while (i < fill_sizes.length()) {
+        expected_total = expected_total + fill_sizes[i];
+        i = i + 1;
+    };
+    assert!(expected_total == original_size, 106);
+
+    let mut cumulative_quote_charged = 0;
+    let mut escrow_before = total_reserved;
+    // Independently track the telescoping-ceiling scheme's expected
+    // per-fill charge, per `fill_level_ask`'s documented handling of a
+    // maker-bid in `sources/tiny_clob.move`:
+    //   target_charge   = ceil(total_reserved * cumulative_filled / original_size)
+    //   quote_cost      = target_charge - already_charged
+    // This is computed here from scratch (not derived from the escrow
+    // delta above), so a bug that mis-times *when* Quote gets charged --
+    // even one that still sums to `total_reserved` overall and still
+    // matches each fill's own escrow drop -- would surface as a mismatch
+    // against this independently-computed expectation.
+    let mut cumulative_filled = 0;
+    let mut already_charged = 0;
+    let mut i = 0;
+    while (i < fill_sizes.length()) {
+        let fill_size = fill_sizes[i];
+        scenario.next_tx(taker());
+        let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+        let (ask_leftover_base, ask_matched_quote, _ask_stopped) =
+            book.place_market_order_ask(ask_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
+        assert!(ask_leftover_base.burn_for_testing() == 0, 200 + i);
+
+        let quote_cost = ask_matched_quote.burn_for_testing();
+        cumulative_quote_charged = cumulative_quote_charged + quote_cost;
+
+        // Independently-computed expected charge for this fill, via the
+        // telescoping-ceiling formula, using only `fill_sizes`.
+        cumulative_filled = cumulative_filled + fill_size;
+        let target_charge =
+            (total_reserved * cumulative_filled + original_size - 1) / original_size;
+        let expected_quote_cost = target_charge - already_charged;
+        assert!(quote_cost == expected_quote_cost, 600 + i);
+        already_charged = target_charge;
+
+        let escrow_after = book.bid_quote_escrow_at_price(price);
+        // Every fill's `quote_cost` must exactly equal the drop in the
+        // resting bid's live Quote escrow -- no fill ever over- or
+        // under-charges relative to what's actually deducted from the book.
+        assert!(escrow_before - escrow_after == quote_cost, 300 + i);
+        escrow_before = escrow_after;
+
+        i = i + 1;
+    };
+
+    // After all 25 fills (cumulative Base = 1000 == original_size), the
+    // resting bid must be fully gone: zero live escrow, zero depth, popped
+    // off the book.
+    assert!(book.depth_at_price(tiny_clob::bid(), price) == 0, 400);
+    assert!(book.bid_quote_escrow_at_price(price) == 0, 401);
+    assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 402);
+
+    // (a) Zero dust: the running sum of Quote charged across all 25 fills
+    // (each verified per-fill above to equal that fill's escrow drop)
+    // exactly equals `total_reserved` -- nothing stranded, nothing
+    // over-collected.
+    assert!(cumulative_quote_charged == total_reserved, 500);
+
+    // (b) Zero shortfall: the maker's claimed Base proceeds exactly equal
+    // the bid's full `original_size`, no matter how fragmented the draining
+    // fills were.
+    scenario.next_tx(maker_a());
+    let (claim_base, claim_quote, ticket_opt) = book.claim_proceeds(bid_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == original_size, 502);
+    assert!(claim_quote.burn_for_testing() == 0, 503);
+    assert!(ticket_opt.is_none(), 504);
     ticket_opt.destroy_none();
 
     unit_test::destroy(book);

@@ -33,6 +33,25 @@ const MAKER_FEE_BPS: u64 = 1;
 // `quote_cost == price * size` exactly.
 const REALISTIC_PRICE: u64 = 1_037;
 
+// `place_limit_order_bid` derives `price = floor(payment * price_scale /
+// size)`; for `realistic_decimals_book`'s `price_scale == 100` and a size-1
+// crossing bid, that derived price is always an exact multiple of 100, so it
+// can never land back on the non-multiple-of-100 `REALISTIC_PRICE` itself.
+// Since a bid only needs its *limit* price to be at or above the resting
+// ask's price to fully cross it (the fill still executes at the resting
+// ask's own price, `REALISTIC_PRICE`), `1_100` -- the smallest multiple of
+// 100 at or above `REALISTIC_PRICE` -- is used as the taker's own limit
+// price for these single-unit crossing bids, and reproduces exactly via
+// `bid_payment_for_price` at size 1.
+//
+// Accepted tradeoff: because this is always a multiple of 100 rather than
+// `REALISTIC_PRICE` itself, these size-one tests never exercise "taker
+// limit price exactly equal to the resting price" on a `price_scale > 1`
+// book -- that exact-equality boundary is still covered elsewhere on
+// `price_scale == 1` books. Intentional given this test's one-unit-at-a-time
+// design, not an oversight.
+const TAKER_LIMIT_PRICE_FOR_SIZE_ONE: u64 = 1_100;
+
 /// Category (a): fill-drain, inside `fill_level_bid` -- an ask-side maker
 /// (fee denominated in Quote) fully drained across two separate 1-unit
 /// fills. Under the rounding-direction fix (findings L-A/L-B), a fill's
@@ -70,30 +89,39 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     assert!(unit_quote_cost == 11, 100);
 
     // Fill 1: 1 unit -- ask still rests with 1 unit remaining afterward.
-    let payment1 = coin::mint_for_testing<USDC>(unit_quote_cost, scenario.ctx());
-    let (mb1, mq1, _, _, _) = book.match_bid_for_testing(
-        option::some(REALISTIC_PRICE), 1, payment1, 1_000_000, scenario.ctx(),
+    let payment1 = coin::mint_for_testing<USDC>(
+        test_utils::bid_payment_for_price(&book, TAKER_LIMIT_PRICE_FOR_SIZE_ONE, 1), scenario.ctx(),
     );
+    let (ticket_opt1, mb1, mq1, _) = book.place_limit_order_bid(payment1, 1, 1_000_000, scenario.ctx());
+    ticket_opt1.destroy_none(); // fully crossed: nothing rests for the taker
     mb1.burn_for_testing();
     mq1.burn_for_testing();
+    let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed1.length() == 1, 12);
+    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    assert!(unmatched_size1 == 0, 13);
     let (fee_base_mid, fee_quote_mid) = book.fee_accumulator_balances();
     assert!(fee_base_mid == 0 && fee_quote_mid == 0, 0); // still resting: fee only reserved, not collected
     assert!(event::events_by_type<tiny_clob::MakerFeeSettled>().length() == 0, 1);
 
     // Fill 2: 1 more unit -- fully drains the ask, triggering conclusion.
-    let payment2 = coin::mint_for_testing<USDC>(unit_quote_cost, scenario.ctx());
-    let (mb2, mq2, remaining_size2, _, _) = book.match_bid_for_testing(
-        option::some(REALISTIC_PRICE), 1, payment2, 1_000_000, scenario.ctx(),
+    let payment2 = coin::mint_for_testing<USDC>(
+        test_utils::bid_payment_for_price(&book, TAKER_LIMIT_PRICE_FOR_SIZE_ONE, 1), scenario.ctx(),
     );
+    let (ticket_opt2, mb2, mq2, _) = book.place_limit_order_bid(payment2, 1, 1_000_000, scenario.ctx());
+    ticket_opt2.destroy_none(); // fully crossed: nothing rests for the taker
     mb2.burn_for_testing();
     mq2.burn_for_testing();
-    assert!(remaining_size2 == 0, 2);
+    let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed2.length() == 2, 14);
+    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    assert!(unmatched_size2 == 0, 15);
 
     let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
     assert!(settled.length() == 1, 3);
     let (ev_order_id, ev_book_id, ev_maker, ev_amount) = settled[0].maker_fee_settled_fields_for_testing();
     assert!(ev_order_id == order_id, 4);
-    assert!(ev_book_id == book.id_for_testing(), 5);
+    assert!(ev_book_id == book.event_id_for_testing(), 5);
     assert!(ev_maker == other(), 6);
     assert!(ev_amount == 1, 7); // CORRECT aggregate fee, not the naive per-fill sum of 2
 
@@ -203,11 +231,17 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
 
     let mut i = 0;
     while (i < 2) {
-        let payment = coin::mint_for_testing<USDC>(unit_quote_cost, scenario.ctx());
-        let (mb, mq, _, _, _) =
-            book.match_bid_for_testing(option::some(REALISTIC_PRICE), 1, payment, 1_000_000, scenario.ctx());
+        let payment = coin::mint_for_testing<USDC>(
+            test_utils::bid_payment_for_price(&book, TAKER_LIMIT_PRICE_FOR_SIZE_ONE, 1), scenario.ctx(),
+        );
+        let (ticket_opt, mb, mq, _) = book.place_limit_order_bid(payment, 1, 1_000_000, scenario.ctx());
+        ticket_opt.destroy_none(); // fully crossed: nothing rests for the taker
         mb.burn_for_testing();
         mq.burn_for_testing();
+        let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+        assert!(executed.length() == i + 1, 102);
+        let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        assert!(unmatched_size == 0, 103);
         i = i + 1;
     };
 
@@ -310,7 +344,12 @@ fun maker_fee_reserve_trues_up_on_clob_admin_drain_step_with_nonzero_slack() {
 #[test]
 fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_fills() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
+    // A `min_size` of 1 (rather than `test_utils::new_book`'s 100) is needed
+    // so this test's 10-unit crossing bid -- deliberately small, to keep the
+    // many-small-fills setup readable -- clears `place_limit_order_bid`'s
+    // placement validation; `price_scale` still comes out to 1, same as
+    // `new_book`.
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, scenario.ctx());
     let taker_fee_bps = 10; // MAX_TAKER_FEE_BPS
     cap.clob_admin_set_taker_fee(&mut book, taker_fee_bps);
 
@@ -324,11 +363,19 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
         i = i + 1;
     };
 
-    let payment = coin::mint_for_testing<USDC>(PRICE * num_fills, scenario.ctx());
-    let (matched_base, remaining_budget, remaining_size, _stopped, taker_fee_amount) =
-        book.match_bid_for_testing(option::some(PRICE), num_fills, payment, 1_000_000, scenario.ctx());
-    assert!(remaining_size == 0, 0);
+    let payment = coin::mint_for_testing<USDC>(
+        test_utils::bid_payment_for_price(&book, PRICE, num_fills), scenario.ctx(),
+    );
+    let (ticket_opt, matched_base, remaining_budget, _stopped) =
+        book.place_limit_order_bid(payment, num_fills, 1_000_000, scenario.ctx());
+    ticket_opt.destroy_none(); // fully crossed: nothing rests for the taker
     assert!(remaining_budget.burn_for_testing() == 0, 1);
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 102);
+    let (_book_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(unmatched_size == 0, 103);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == (num_fills as u64), 2);
@@ -348,10 +395,9 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
     scenario.end();
 }
 
-/// `OrderExecuted.taker_fee_amount` (Part D), exercised through a real
-/// public entry point rather than the `match_bid_for_testing` test-only
-/// accessor: the same many-small-fills setup as the aggregation test above,
-/// driven through `place_market_order_bid`, confirming the aggregate fee
+/// `OrderExecuted.taker_fee_amount` (Part D), exercised through the real
+/// `place_market_order_bid` public entry point: the same many-small-fills
+/// setup as the aggregation test above, confirming the aggregate fee
 /// reported on the event matches the fee accumulator and the taker's actual
 /// net proceeds.
 #[test]

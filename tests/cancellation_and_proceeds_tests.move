@@ -20,11 +20,11 @@ use tiny_clob::test_utils::{
 fun cancel_order_refunds_escrow_and_emits_ordercancelled() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
     let ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
-    let (t_order_id, _, _, _) = ticket.ticket_fields_for_testing();
+    let t_order_id = ticket.ticket_order_id();
 
     let (refund_base, refund_quote) = book.cancel_order(ticket, scenario.ctx());
     assert!(refund_base.burn_for_testing() == 0, 0);
@@ -53,7 +53,7 @@ fun cancel_order_sweeps_combined_escrow_and_proceeds() {
     let size = 200;
     let fill_size = 100;
     let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
-    let (order_id, _, _, _) = bid_ticket.ticket_fields_for_testing();
+    let order_id = bid_ticket.ticket_order_id();
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
@@ -143,7 +143,7 @@ fun new_event_id_override_is_used_and_stable_across_placement_and_cancel() {
 
     // The override, not the book's own internal id, is what got stamped
     // on events.
-    let book_own_id = book.id_for_testing();
+    let book_own_id = book.book_id();
     assert!(book.event_id_for_testing() == override_id, 0);
     assert!(override_id != book_own_id, 1);
 
@@ -153,7 +153,7 @@ fun new_event_id_override_is_used_and_stable_across_placement_and_cancel() {
     // construction.
     let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
     let ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
-    let (_, t_book_id, _, _) = ticket.ticket_fields_for_testing();
+    let t_book_id = ticket.ticket_order_book_id();
     assert!(t_book_id == book_own_id, 2);
 
     // No function exists that could change event_id after the fact — it is
@@ -176,7 +176,7 @@ fun new_event_id_defaults_to_self_id_when_override_is_none() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
 
-    let book_own_id = book.id_for_testing();
+    let book_own_id = book.book_id();
     assert!(book.event_id_for_testing() == book_own_id, 0);
 
     destroy_book_and_cap(book, cap);
@@ -187,7 +187,7 @@ fun new_event_id_defaults_to_self_id_when_override_is_none() {
 fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     // admin() rests a bid; other() crosses it fully as a market ask, crediting
     // admin()'s order_id proceeds table entry with quote. Keep the ticket
@@ -233,7 +233,7 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
 fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
 
     let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
     let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
@@ -380,9 +380,9 @@ fun update_resting_order_not_found_is_a_noop() {
     // order_id exist. Must return false and touch nothing. Synthesize a
     // ticket for a non-existent order since the real not-found path has no
     // genuine ticket to offer.
-    let book_id = book.id_for_testing();
+    let book_id = book.book_id();
     let empty_book_ticket =
-        tiny_clob::new_ticket_for_testing(0, book_id, tiny_clob::bid_for_testing(), default_price());
+        tiny_clob::new_ticket_for_testing(0, book_id, tiny_clob::bid(), default_price());
     let found_empty_book =
         book.update_resting_order(&empty_book_ticket, other());
     assert!(!found_empty_book, 0);
@@ -392,7 +392,9 @@ fun update_resting_order_not_found_is_a_noop() {
     // now-existing price level — the level exists but the specific order
     // does not.
     let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
-    let (order_id, _, side, price) = bid_ticket.ticket_fields_for_testing();
+    let order_id = bid_ticket.ticket_order_id();
+    let side = bid_ticket.ticket_side();
+    let price = bid_ticket.ticket_price();
     let wrong_order_id = order_id + 1;
     let wrong_id_ticket = tiny_clob::new_ticket_for_testing(wrong_order_id, book_id, side, price);
     let found_wrong_id = book.update_resting_order(&wrong_id_ticket, other());
@@ -553,12 +555,15 @@ fun destroy_orphaned_ticket_disposes_with_no_abort() {
     let (book, cap) = new_book(&mut scenario);
 
     let order_id = 7;
-    let order_book_id = book.id_for_testing();
+    let order_book_id = book.book_id();
     let side = true;
     let price = 50_000;
     let ticket = tiny_clob::new_ticket_for_testing(order_id, order_book_id, side, price);
 
-    let (t_order_id, t_book_id, t_side, t_price) = ticket.ticket_fields_for_testing();
+    let t_order_id = ticket.ticket_order_id();
+    let t_book_id = ticket.ticket_order_book_id();
+    let t_side = ticket.ticket_side();
+    let t_price = ticket.ticket_price();
     assert!(t_order_id == order_id, 0);
     assert!(t_book_id == order_book_id, 1);
     assert!(t_side == side, 2);
@@ -658,7 +663,7 @@ fun destroy_orphaned_ticket_after_all_zero_credited_fill_disposes_cleanly() {
     let bid = order::new<BTC, USDC>(order_id, maker_a(), 1, option::none(), option::some(escrow_quote), 1);
     book.insert_resting_order_for_testing(true, shortfall_price(), bid, scenario.ctx());
     let bid_ticket = tiny_clob::new_ticket_for_testing(
-        order_id, book.id_for_testing(), tiny_clob::bid_for_testing(), shortfall_price(),
+        order_id, book.book_id(), tiny_clob::bid(), shortfall_price(),
     );
 
     scenario.next_tx(taker());
@@ -1112,6 +1117,114 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
     assert!(payout_admin.value() == 200, 5);
     payout_admin.burn_for_testing();
 
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Pause never blocks recovery ===
+//
+// `clob_admin_pause_book` blocks placement/market entry points only (see
+// its doc comment in `sources/tiny_clob.move`) — it must never block
+// `cancel_order`, `claim_proceeds`, `update_resting_order`,
+// `set_last_price`, or `clob_admin_cancel_order`. None of the five checks
+// `is_paused` at all (confirmed by inspection: the `EBookPaused` guard only
+// appears in the placement/market-order functions), but this was never
+// exercised end-to-end against an actually-paused book. This test pauses a
+// live book and confirms all five still succeed normally, with real
+// assertions on their return values/state changes, not just "no abort".
+#[test]
+fun pause_never_blocks_cancel_claim_update_or_admin_recovery_paths() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    // Four resting bids at the same price, one per recovery path exercised
+    // below: `proceeds_ticket` is partially filled first (while unpaused) to
+    // pool real proceeds for `claim_proceeds`; `update_ticket` is reassigned
+    // via `update_resting_order`; `admin_cancel_order_id` is force-cancelled
+    // via `clob_admin_cancel_order`; `cancel_ticket` is self-cancelled via
+    // `cancel_order`.
+    let proceeds_size = 200;
+    let proceeds_fill_size = 100;
+    let proceeds_ticket = rest_bid(&mut book, default_price(), proceeds_size, 1_000_000_000, scenario.ctx());
+    let proceeds_order_id = proceeds_ticket.ticket_order_id();
+
+    let update_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+
+    let admin_cancel_escrow = book.bid_escrow_amount(default_price(), default_size());
+    let admin_cancel_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let admin_cancel_order_id = admin_cancel_ticket.ticket_order_id();
+    let admin_cancel_side = admin_cancel_ticket.ticket_side();
+    let admin_cancel_price = admin_cancel_ticket.ticket_price();
+    unit_test::destroy(admin_cancel_ticket);
+
+    let cancel_escrow = book.bid_escrow_amount(default_price(), default_size());
+    let cancel_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+
+    // Partially fill `proceeds_ticket` while the book is still unpaused, so
+    // there is a genuine, nonzero pooled proceeds balance to claim later.
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(proceeds_fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, proceeds_fill_size, scenario.ctx(),
+    );
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(proceeds_order_id), 0);
+
+    // Now pause the book. Everything from here on must succeed exactly as it
+    // would on an unpaused book.
+    scenario.next_tx(admin());
+    cap.clob_admin_pause_book(&mut book);
+
+    // (1) `set_last_price` still succeeds while paused. All resting bids sit
+    // at `default_price()` with no asks in the book, so any price >=
+    // `default_price()` is a valid reset target (>= best bid, no best ask to
+    // violate). The earlier partial fill above already left `last_price ==
+    // default_price()` as a side effect of matching, so asserting against
+    // that same value here would be vacuous -- it would pass even if
+    // `set_last_price` were a no-op. Target a strictly different value
+    // (`default_price() + 1`) instead, so this assertion only passes if the
+    // call genuinely updated `last_price`.
+    let new_last_price = default_price() + 1;
+    book.set_last_price(new_last_price, scenario.ctx());
+    assert!(book.last_price() == new_last_price, 1);
+
+    // (2) `update_resting_order` still succeeds while paused: reassigns the
+    // resting order's owner and reports found.
+    let found = book.update_resting_order(&update_ticket, other());
+    assert!(found, 2);
+    unit_test::destroy(update_ticket);
+
+    // (3) `clob_admin_cancel_order` still succeeds while paused: force-cancels
+    // a resting order and refunds its escrow to the original owner (admin()).
+    cap.clob_admin_cancel_order(&mut book, admin_cancel_side, admin_cancel_price, admin_cancel_order_id, scenario.ctx());
+    let admin_cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(admin_cancelled_events.length() == 1, 3);
+    scenario.next_tx(admin());
+    let admin_cancel_refund = scenario.take_from_address<coin::Coin<USDC>>(admin());
+    assert!(admin_cancel_refund.value() == admin_cancel_escrow, 4);
+    admin_cancel_refund.burn_for_testing();
+
+    // (4) `cancel_order` still succeeds while paused: cancels via the ticket
+    // itself and returns the correct escrow refund.
+    let (cancel_refund_base, cancel_refund_quote) = book.cancel_order(cancel_ticket, scenario.ctx());
+    assert!(cancel_refund_base.burn_for_testing() == 0, 5);
+    assert!(cancel_refund_quote.burn_for_testing() == cancel_escrow, 6);
+
+    // (5) `claim_proceeds` still succeeds while paused: pays out the real
+    // pooled proceeds from the earlier fill, and returns the still-live
+    // ticket (the order has 100 left resting out of the original 200).
+    let (claim_base, claim_quote, returned_ticket_opt) = book.claim_proceeds(proceeds_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == proceeds_fill_size, 7);
+    assert!(claim_quote.burn_for_testing() == 0, 8);
+    assert!(!book.proceeds_contains_for_testing(proceeds_order_id), 9);
+    assert!(returned_ticket_opt.is_some(), 10);
+    let returned_ticket = returned_ticket_opt.destroy_some();
+
+    // The book is still paused throughout — confirms none of the five paths
+    // above went through some code path that accidentally unpaused it.
+    assert!(book.is_paused(), 11);
+
+    unit_test::destroy(returned_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
