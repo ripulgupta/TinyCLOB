@@ -159,44 +159,8 @@ fun place_market_order_bid_slippage_bound_aborts() {
     scenario.end();
 }
 
-#[test]
-fun swap_bid_ask_happy_path_and_max_fills_stop_signal() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-
-    let ask_ticket = rest_ask(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
-
-    scenario.next_tx(taker());
-    let budget = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
-    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stop) = book.swap_bid(
-        PLACEMENT_SIZE, budget, bid_payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
-    );
-    assert!(matched_base.burn_for_testing() == PLACEMENT_SIZE, 0);
-    assert!(leftover.burn_for_testing() == 0, 1);
-    assert!(!stop, 2);
-
-    // max_fills = 0 against a crossing resting ask signals the stop-reason.
-    scenario.next_tx(taker());
-    let ask_ticket2 = rest_ask(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
-    scenario.next_tx(taker());
-    let budget2 = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
-    let bid_payment2 = coin::mint_for_testing<USDC>(budget2, scenario.ctx());
-    let (matched_base2, leftover2, stop2) = book.swap_bid(
-        PLACEMENT_SIZE, budget2, bid_payment2, 0, option::none(), option::none(), option::none(), scenario.ctx(),
-    );
-    assert!(matched_base2.burn_for_testing() == 0, 4);
-    assert!(leftover2.burn_for_testing() == budget2, 5);
-    assert!(stop2, 6);
-
-    unit_test::destroy(ask_ticket);
-    unit_test::destroy(ask_ticket2);
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-// === Fix 3: `place_market_order_bid`/`ask` now surface the max_fills
-// truncation signal, matching `swap_bid`/`swap_ask`'s existing precedent ===
+// === Fix 3: `place_market_order_bid`/`ask` surface the max_fills
+// truncation signal ===
 
 #[test]
 fun place_market_order_bid_returns_true_when_truncated_by_max_fills() {
@@ -273,28 +237,6 @@ fun place_market_order_ask_returns_false_when_fully_filled_within_max_fills() {
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 1);
     assert!(!stopped, 2);
 
-    unit_test::destroy(bid_ticket);
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-#[test]
-#[expected_failure]
-fun swap_ask_slippage_bound_aborts() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-    let bid_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
-
-    scenario.next_tx(taker());
-    let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
-    let min_quote_bound = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE) + 1;
-    let (leftover_base, matched_quote, stop) = book.swap_ask(
-        PLACEMENT_SIZE, ask_payment, 10, option::none(),
-        option::some(min_quote_bound), option::none(), scenario.ctx(),
-    );
-    unit_test::destroy(leftover_base);
-    unit_test::destroy(matched_quote);
-    let _ = stop;
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();

@@ -277,15 +277,13 @@ fun last_price_reflects_last_of_two_fully_filled_bid_levels() {
     scenario.end();
 }
 
-// --- Price-band exemption for market orders / no-limit swaps ---
+// --- Price-band exemption for market orders ---
 //
-// `place_market_order_bid`/`_ask` and `swap_bid`/`_ask` (when called with
-// `limit_price = option::none()`) never read `book.price_band_factor` at
+// `place_market_order_bid`/`_ask` never read `book.price_band_factor` at
 // all in the source — the band only ever gates a NEW RESTING limit-order
-// price, never a taker fill. The tests below pin this down concretely: a
+// price, never a taker fill. The test below pins this down concretely: a
 // resting ask is placed outside a band that is tightened only afterward,
-// then a market order / swap with no limit price is shown to fill against
-// it anyway.
+// then a market order is shown to fill against it anyway.
 
 #[test]
 fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
@@ -302,32 +300,6 @@ fun market_order_bid_fills_against_resting_ask_outside_subsequently_set_band() {
     let budget = book.bid_escrow_amount(5000, min_size());
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
     let (matched_base, leftover, stopped) = book.place_market_order_bid(payment, 10, 0, min_size(), u64_max(), scenario.ctx(),
-    );
-    assert!(!stopped, 0);
-    assert!(matched_base.burn_for_testing() == min_size(), 1); // filled despite being outside the band
-    assert!(leftover.burn_for_testing() == 0, 2);
-
-    unit_test::destroy(ask_ticket);
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-/// Mirrors the test above for `swap_bid` called with `limit_price =
-/// option::none()`.
-#[test]
-fun swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-    let ask_ticket = rest_ask(&mut book, 5000, min_size(), 10, scenario.ctx());
-    book.set_last_price(1000, scenario.ctx());
-    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
-    // band is now [500, 2000] -- 5000 is well outside it.
-
-    scenario.next_tx(taker());
-    let budget = book.bid_escrow_amount(5000, min_size());
-    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.swap_bid(
-        min_size(), budget, payment, 10, option::none(), option::none(), option::none(), scenario.ctx(),
     );
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == min_size(), 1); // filled despite being outside the band
@@ -360,73 +332,8 @@ fun set_last_price_zero_aborts() {
     scenario.end();
 }
 
-// === L-02 coverage gaps: swap band-check removal, `LastPriceSet`, and ===
-// === `set_last_price`'s permissionless / pause-and-retire-agnostic surface ===
-
-// --- Gap 1: `swap_bid`/`swap_ask` with an explicit `Some(limit_price)` ---
-// --- outside the active band must still fill (the band never gated a ---
-// --- taker's own protective limit_price, even before this diff removed ---
-// --- the check for `limit_price = option::none()`). ---
-
-/// Mirrors `swap_bid_with_no_limit_price_fills_against_resting_ask_outside_band`,
-/// but the CHANGED case: an explicit `Some(price)` limit_price that is
-/// itself outside the band. Before the diff under audit, this exact call
-/// would have aborted with `EPriceAboveBand`; it must now succeed.
-#[test]
-fun swap_bid_with_off_band_limit_price_fills_against_resting_ask_outside_band() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-    let ask_ticket = rest_ask(&mut book, 5000, min_size(), 10, scenario.ctx());
-    book.set_last_price(1000, scenario.ctx());
-    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
-    // band is now [500, 2000] -- 5000 is well outside it, and the taker's
-    // own limit_price below is ALSO 5000 (outside the band).
-
-    scenario.next_tx(taker());
-    let budget = book.bid_escrow_amount(5000, min_size());
-    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover, stopped) = book.swap_bid(
-        min_size(), budget, payment, 10, option::some(5000), option::none(), option::none(),
-        scenario.ctx(),
-    );
-    assert!(!stopped, 0);
-    // Fills despite both the resting price AND the taker's own limit_price
-    // being outside the band -- proving the band no longer gates the
-    // taker's protective cap at all, not just the no-limit-price path.
-    assert!(matched_base.burn_for_testing() == min_size(), 1);
-    assert!(leftover.burn_for_testing() == 0, 2);
-
-    unit_test::destroy(ask_ticket);
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-/// Mirrors the test above for `swap_ask`: a resting bid rests below a band
-/// that is subsequently tightened around it, and the taker's own
-/// `Some(limit_price)` -- also below the band -- must still fill against it.
-#[test]
-fun swap_ask_with_off_band_limit_price_fills_against_resting_bid_outside_band() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-    let bid_ticket = rest_bid(&mut book, 100, min_size(), 10, scenario.ctx());
-    book.set_last_price(1000, scenario.ctx()); // >= best_bid (100), so this succeeds
-    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
-    // band is now [500, 2000] -- 100 is well outside it (below), and the
-    // taker's own limit_price below is ALSO 100 (outside the band).
-
-    scenario.next_tx(taker());
-    let payment = coin::mint_for_testing<BTC>(min_size(), scenario.ctx());
-    let (leftover_base, matched_quote, stopped) = book.swap_ask(
-        min_size(), payment, 10, option::some(100), option::none(), option::none(), scenario.ctx(),
-    );
-    assert!(!stopped, 0);
-    assert!(leftover_base.burn_for_testing() == 0, 1);
-    assert!(matched_quote.burn_for_testing() == 100 * min_size(), 2);
-
-    unit_test::destroy(bid_ticket);
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
+// === L-02 coverage gaps: `LastPriceSet`, and `set_last_price`'s ===
+// === permissionless / pause-and-retire-agnostic surface ===
 
 // --- Gap 2: `LastPriceSet` event fields (`setter`, `last_price`) are ---
 // --- otherwise never asserted anywhere in this file. ---

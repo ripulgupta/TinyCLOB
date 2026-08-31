@@ -387,9 +387,9 @@ fun u64_max_as_u256(): u256 { U64_MAX as u256 }
 /// to a true price within the range the book's declared
 /// `precision`/`exponent` guarantee is representable: true price must be at
 /// least `10^-precision` and at most `10^exponent`. Raw scalars only —
-/// deliberately NOT `&OrderBook` — reused unmodified across 6 call sites in
+/// deliberately NOT `&OrderBook` — reused unmodified across 4 call sites in
 /// 3 categories: construction (`new_impl`), `set_last_price`, and
-/// order placement (`place_limit_order_bid`/`_ask`, `swap_bid`/`_ask`), the
+/// order placement (`place_limit_order_bid`/`_ask`), the
 /// first of which has no live book reference to borrow yet.
 fun assert_price_in_declared_range(
     price: u64,
@@ -2067,9 +2067,9 @@ public struct ProceedsClaimed has copy, drop {
 
 /// Emitted exactly once, unconditionally, as the final event of every call to
 /// `place_limit_order_bid`/`place_limit_order_ask`/`place_market_order_bid`/
-/// `place_market_order_ask`/`swap_bid`/`swap_ask` (identified by
+/// `place_market_order_ask` (identified by
 /// `entry_point`, see below) — after any slippage-guard asserts in the
-/// market/swap functions, so an abort emits nothing.
+/// market functions, so an abort emits nothing.
 ///
 /// Event-ordering contract: within one call, the sequence is zero-or-more
 /// `OrderFilled`, then an optional `OrderPlaced`, then exactly one
@@ -2081,18 +2081,18 @@ public struct OrderExecuted has copy, drop {
     taker: address,
     taker_side: bool,
     /// 0 = place_limit_order_bid, 1 = place_limit_order_ask,
-    /// 2 = place_market_order_bid, 3 = place_market_order_ask,
-    /// 4 = swap_bid, 5 = swap_ask
+    /// 2 = place_market_order_bid, 3 = place_market_order_ask.
+    /// (Entry point values 4 and 5, formerly `swap_bid`/`swap_ask`, are no
+    /// longer produced now that those functions have been removed; they are
+    /// not reused for anything else.)
     entry_point: u8,
     /// `None` for market orders; for `place_limit_order_*`, the
-    /// resting/placement price; for `swap_*`, the taker's protective
-    /// slippage cap (exempt from the price band — see `swap_bid`/`swap_ask`'s
-    /// own doc comment).
+    /// resting/placement price.
     limit_price: Option<u64>,
     /// The order's Base-denominated size: for `place_limit_order_bid`, the
     /// caller's `expected_base_output`; for `place_limit_order_ask`, the
-    /// caller's `payment.value()`; for the market/swap entry points, their
-    /// own `size` argument.
+    /// caller's `payment.value()`; for `place_market_order_bid`, `max_base_out`;
+    /// for `place_market_order_ask`, `min(payment.value(), max_base_in)`.
     requested_size: u64,
     /// Remaining size after matching (gross base; NOT reduced by taker fee,
     /// so `requested_size - unmatched_size` does not equal the base actually
@@ -2111,7 +2111,7 @@ public struct OrderExecuted has copy, drop {
     /// after matching completes — `fee_amount(taker_fee_basis,
     /// taker_fee_bps)` — and already deducted from `matched_base`/
     /// `matched_quote` (whichever the taker receives) before the slippage
-    /// checks in `place_market_order_*`/`swap_*` and before the coin(s)
+    /// checks in `place_market_order_*` and before the coin(s)
     /// returned to the taker. Denominated in Base for a bid-side taker
     /// (`taker_side == true`), Quote for an ask-side taker
     /// (`taker_side == false`). Replaces the old per-fill
@@ -2564,132 +2564,6 @@ public fun place_market_order_ask<Base, Quote>(
         taker_side: false,
         entry_point: 3,
         limit_price: option::none(),
-        requested_size: size,
-        unmatched_size: remaining_size,
-        rested_size: 0,
-        rested_order_id: option::none(),
-        stopped_on_max_fills_while_crossing,
-        taker_fee_amount,
-    });
-
-    (payment, matched_quote.into_coin(ctx), stopped_on_max_fills_while_crossing)
-}
-
-/// `limit_price`, when `Some`, is validated for representability via the
-/// same price-range check documented on `place_limit_order_bid`, but is
-/// NOT subject to the price-band check — it's the taker's own protective
-/// slippage cap, not a price that can rest on the book, so a self-imposed
-/// tighter cap must never be rejected.
-public fun swap_bid<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    budget: u64,
-    mut payment: Coin<Quote>,
-    max_fills: u64,
-    limit_price: Option<u64>,
-    max_quote_in: Option<u64>,
-    min_base_out: Option<u64>,
-    ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, bool) {
-    assert_book_version(book);
-    assert!(!is_paused(book), EBookPaused);
-    let price_scale = book.price_scale;
-    if (limit_price.is_some()) {
-        let price = *limit_price.borrow();
-        assert_price_in_declared_range(
-            price, price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
-        );
-    };
-    validate_size(book, size);
-
-    let budget_balance = payment.split(budget, ctx).into_balance();
-    let event_book_id = book.event_id;
-    let taker = ctx.sender();
-    let taker_fee_bps = taker_fee_bps(book);
-    let (mut matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_bid(book, limit_price, size, budget_balance, taker, max_fills);
-    let taker_fee_amount = fee_amount(matched_base.value(), taker_fee_bps);
-    let taker_fee_balance = matched_base.split(taker_fee_amount);
-    book.fee_accumulator.base.join(taker_fee_balance);
-
-    if (max_quote_in.is_some()) {
-        let quote_spent = budget - remaining_budget.value();
-        assert!(quote_spent <= *max_quote_in.borrow(), ESlippageExceeded);
-    };
-    if (min_base_out.is_some()) {
-        assert!(matched_base.value() >= *min_base_out.borrow(), ESlippageExceeded);
-    };
-
-    payment.join(remaining_budget.into_coin(ctx));
-
-    event::emit(OrderExecuted {
-        order_book_id: event_book_id,
-        taker,
-        taker_side: true,
-        entry_point: 4,
-        limit_price,
-        requested_size: size,
-        unmatched_size: remaining_size,
-        rested_size: 0,
-        rested_order_id: option::none(),
-        stopped_on_max_fills_while_crossing,
-        taker_fee_amount,
-    });
-
-    (matched_base.into_coin(ctx), payment, stopped_on_max_fills_while_crossing)
-}
-
-/// `limit_price`, when `Some`, is validated for representability via the
-/// same price-range check documented on `place_limit_order_bid`, but is
-/// NOT subject to the price-band check — it's the taker's own protective
-/// slippage cap, not a price that can rest on the book, so a self-imposed
-/// tighter cap must never be rejected.
-public fun swap_ask<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    mut payment: Coin<Base>,
-    max_fills: u64,
-    limit_price: Option<u64>,
-    min_quote_out: Option<u64>,
-    max_base_in: Option<u64>,
-    ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, bool) {
-    assert_book_version(book);
-    assert!(!is_paused(book), EBookPaused);
-    if (limit_price.is_some()) {
-        let price = *limit_price.borrow();
-        assert_price_in_declared_range(
-            price, book.price_scale, book.base_decimals, book.quote_decimals, book.precision, book.exponent,
-        );
-    };
-    validate_size(book, size);
-
-    let escrow_base = payment.split(size, ctx).into_balance();
-    let event_book_id = book.event_id;
-    let taker = ctx.sender();
-    let taker_fee_bps = taker_fee_bps(book);
-    let (mut matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
-        match_ask(book, limit_price, size, escrow_base, taker, max_fills);
-    let taker_fee_amount = fee_amount(matched_quote.value(), taker_fee_bps);
-    let taker_fee_balance = matched_quote.split(taker_fee_amount);
-    book.fee_accumulator.quote.join(taker_fee_balance);
-
-    if (max_base_in.is_some()) {
-        let base_spent = size - remaining_escrow.value();
-        assert!(base_spent <= *max_base_in.borrow(), ESlippageExceeded);
-    };
-    if (min_quote_out.is_some()) {
-        assert!(matched_quote.value() >= *min_quote_out.borrow(), ESlippageExceeded);
-    };
-
-    payment.join(remaining_escrow.into_coin(ctx));
-
-    event::emit(OrderExecuted {
-        order_book_id: event_book_id,
-        taker,
-        taker_side: false,
-        entry_point: 5,
-        limit_price,
         requested_size: size,
         unmatched_size: remaining_size,
         rested_size: 0,

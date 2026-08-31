@@ -143,7 +143,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     let reassigned = book.update_resting_order(&bid1_ticket, maker_c());
     assert!(reassigned, 19);
 
-    // --- A swap fully drains bid1's remaining 187 at a real limit price. ---
+    // --- A market ask fully drains bid1's remaining 187. ---
     // bid1's maker_fee_bps was snapshotted at 0 (rested before the fee
     // change above), so despite the book's CURRENT maker_fee_bps now being
     // 3, this fill still charges 0 maker fee -- proving the snapshot, not
@@ -151,10 +151,8 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     scenario.next_tx(taker());
     let cross3_size = 187;
     let cross3_payment = coin::mint_for_testing<BTC>(cross3_size, scenario.ctx());
-    let (cross3_leftover, cross3_matched, cross3_stopped) = book.swap_ask(
-        cross3_size, cross3_payment, 10,
-        option::some(bid1_price), option::none(), option::none(), scenario.ctx(),
-    );
+    let (cross3_leftover, cross3_matched, cross3_stopped) =
+        book.place_market_order_ask(cross3_payment, 10, 0, cross3_size, scenario.ctx());
     assert!(!cross3_stopped, 20);
     assert!(cross3_leftover.burn_for_testing() == 0, 21);
     let cross3_quote_cost = 601 * 187; // = 112_387, exact
@@ -345,17 +343,14 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     let reassigned = book.update_resting_order(&bid_ticket, maker_a());
     assert!(reassigned, 14);
 
-    // A swap fully drains the remaining 114 of the ask, via a real limit
-    // price rather than `option::none()`.
+    // A market bid fully drains the remaining 114 of the ask.
     scenario.next_tx(taker());
     let cross3_size = 114;
     let cross3_budget = book.bid_escrow_amount(ask_price, cross3_size);
     assert!(cross3_budget == 307 * 114, 15); // = 34_998, exact
     let cross3_payment = coin::mint_for_testing<SUI>(cross3_budget, scenario.ctx());
-    let (cross3_matched, cross3_leftover, cross3_stopped) = book.swap_bid(
-        cross3_size, cross3_budget, cross3_payment, 10,
-        option::some(ask_price), option::none(), option::none(), scenario.ctx(),
-    );
+    let (cross3_matched, cross3_leftover, cross3_stopped) =
+        book.place_market_order_bid(cross3_payment, 10, 0, cross3_size, cross3_budget, scenario.ctx());
     assert!(!cross3_stopped, 16);
     assert!(cross3_matched.burn_for_testing() == cross3_size, 17);
     assert!(cross3_leftover.burn_for_testing() == 0, 18);

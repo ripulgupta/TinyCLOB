@@ -63,8 +63,8 @@ stamping and is never used for authentication anywhere in this module.
 
 ### `min_size`
 
-Bounds order-placement size only — checked once, at the moment an order or
-swap is submitted. It is never re-checked against the size of a resulting
+Bounds order-placement size only — checked once, at the moment an order is
+submitted. It is never re-checked against the size of a resulting
 fill or a partial-fill remainder, so a partial fill can leave a resting
 order's remaining size below `min_size`. Such a remainder persists on the
 book until it is cancelled by its ticket holder, fully consumed by a later
@@ -148,12 +148,9 @@ This check is applied to:
 | `set_last_price` | `new_last_price` |
 | `place_limit_order_bid` | `price` (derived internally from `payment`/`expected_base_output`) |
 | `place_limit_order_ask` | `price` (derived internally from `expected_quote_output`/`payment.value()`) |
-| `swap_bid` | `limit_price`, only when `Some` |
-| `swap_ask` | `limit_price`, only when `Some` |
 
-It is **not** applied to `place_market_order_bid`, `place_market_order_ask`,
-or to `swap_bid`/`swap_ask` when `limit_price` is `None` — none of these
-take a price parameter to validate in that case.
+It is **not** applied to `place_market_order_bid` or `place_market_order_ask`
+— neither takes a price parameter to validate.
 
 ### `bid_escrow_amount`
 
@@ -190,10 +187,7 @@ price <= last_price * factor      (else EPriceAboveBand, 24)
 
 This check is applied only to `place_limit_order_bid` and
 `place_limit_order_ask` (both on their internally-derived `price`). It is **not**
-applied to `place_market_order_bid`, `place_market_order_ask`, `swap_bid`,
-or `swap_ask` — including `swap_bid`/`swap_ask` when `limit_price` is
-`Some` (that value is still subject to the declared-range check in §3, but
-never to the price band).
+applied to `place_market_order_bid` or `place_market_order_ask`.
 
 Every call to `clob_admin_set_price_band_factor` emits `PriceBandFactorSet {
 order_book_id, factor }`, including a call that sets the same value the
@@ -208,9 +202,9 @@ construction and can subsequently change in two ways:
 
 **Automatically, on a real fill.** Whenever a match against a resting order
 produces a nonzero fill, `last_price` is set to that resting order's price.
-For a single order/swap that sweeps multiple resting price levels in one
+For a single order that sweeps multiple resting price levels in one
 call, `last_price` ends at the price of the *last* level that received a
-nonzero fill, not the first, and not an average. An order or swap that
+nonzero fill, not the first, and not an average. An order that
 matches nothing leaves `last_price` unchanged.
 
 **Explicitly, via:**
@@ -462,47 +456,6 @@ This interface replaces an older `(size: u64, payment, max_fills,
 min_quote_out: Option<u64>, max_base_in: Option<u64>)` signature — likewise
 a redesign, not a positional drop-in.
 
-### `swap_bid`
-
-```
-public fun swap_bid<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    budget: u64,
-    payment: Coin<Quote>,
-    max_fills: u64,
-    limit_price: Option<u64>,
-    max_quote_in: Option<u64>,
-    min_base_out: Option<u64>,
-    ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, bool)
-```
-
-Behaves like `place_market_order_bid`, with one addition: an optional
-`limit_price` caps how far the sweep is willing to walk the book (it never
-fills at a price worse, for the caller, than `limit_price`). When `Some`,
-`limit_price` is validated only for declared-range representability (§3) —
-never against the price band (§4) — so it can be set tighter or looser than
-the currently active band without being rejected for either reason. It
-never itself becomes a resting price.
-
-### `swap_ask`
-
-```
-public fun swap_ask<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    size: u64,
-    payment: Coin<Base>,
-    max_fills: u64,
-    limit_price: Option<u64>,
-    min_quote_out: Option<u64>,
-    max_base_in: Option<u64>,
-    ctx: &mut TxContext,
-): (Coin<Base>, Coin<Quote>, bool)
-```
-
-Mirrors `swap_bid` for the ask side, with the same `limit_price` contract.
-
 ### Order-placement summary
 
 | Function | Price parameter | Declared-range check | Price-band check | Can rest an order |
@@ -511,25 +464,21 @@ Mirrors `swap_bid` for the ask side, with the same `limit_price` contract.
 | `place_limit_order_ask` | none (derived internally) | Yes | Yes | Yes |
 | `place_market_order_bid` | none | — | — | No |
 | `place_market_order_ask` | none | — | — | No |
-| `swap_bid` | `limit_price: Option<u64>` | Yes, only if `Some` | No, never | No |
-| `swap_ask` | `limit_price: Option<u64>` | Yes, only if `Some` | No, never | No |
 
-All four of `place_market_order_bid`/`place_market_order_ask`/`swap_bid`/
-`swap_ask` return three values: a matched-side coin, a single merged
-leftover coin, and the `stopped_on_max_fills_while_crossing` flag — but the
-order differs by side. `place_market_order_bid`/`swap_bid` return
-`(Coin<Base>, Coin<Quote>, bool)`: matched base first, merged leftover quote
-second. `place_market_order_ask`/`swap_ask` return
+Both of `place_market_order_bid`/`place_market_order_ask` return three
+values: a matched-side coin, a single merged leftover coin, and the
+`stopped_on_max_fills_while_crossing` flag — but the order differs by side.
+`place_market_order_bid` returns `(Coin<Base>, Coin<Quote>, bool)`: matched
+base first, merged leftover quote second. `place_market_order_ask` returns
 `(Coin<Base>, Coin<Quote>, bool)` too, but the first position is the
 leftover (unmatched) base returned to the caller and the second is the
 matched quote received — see each function's own signature for which is
 which. On the bid side, whatever internally-escrowed Quote goes unspent by
 matching, together with the portion of `payment` never escrowed for
 matching in the first place (e.g. capped out by `max_quote_in` on
-`place_market_order_bid`, or `budget` on `swap_bid`), are joined into that
-one leftover `Coin<Quote>` before it is returned, mirroring how
-`place_limit_order_bid`/`place_limit_order_ask` already merge their own
-internal escrow/payment
+`place_market_order_bid`), are joined into that one leftover `Coin<Quote>`
+before it is returned, mirroring how `place_limit_order_bid`/
+`place_limit_order_ask` already merge their own internal escrow/payment
 splits into a single returned coin.
 
 ## 7. Order lifecycle: tickets, cancellation, ownership
@@ -670,7 +619,7 @@ public fun clob_admin_pause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut Ord
 public fun clob_admin_unpause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>)
 ```
 
-Pausing blocks all six order-placement/market/swap entry points
+Pausing blocks all four order-placement/market entry points
 (`EBookPaused`). It does **not** block `cancel_order`, `claim_proceeds`,
 `update_resting_order`, `set_last_price`, or `clob_admin_cancel_order` — a
 trader can always recover funds already at rest, and the admin can always
@@ -701,8 +650,8 @@ not a bug (see §2's `min_size` guidance). Emits `TakerFeeSet { order_book_id,
 rate_bps }` / `MakerFeeSet { order_book_id, rate_bps }` unconditionally,
 including a same-value call.
 
-**Taker fee — computed once per call, in aggregate.** Each of the six
-order-placement/market/swap entry points computes its own taker fee exactly
+**Taker fee — computed once per call, in aggregate.** Each of the four
+order-placement/market entry points computes its own taker fee exactly
 once, after its entire matching sweep completes (across every price level it
 touched), from the aggregate raw (pre-fee) quantity the taker filled that
 call — never per individual fill. This aggregate fee is deducted from the
@@ -953,10 +902,9 @@ the original reservation, and the exact difference is what `cancel_order`
 
 `OrderExecuted` is emitted exactly once, unconditionally, as the last event
 of every call to `place_limit_order_bid` / `place_limit_order_ask` /
-`place_market_order_bid` / `place_market_order_ask` / `swap_bid` /
-`swap_ask` — after any slippage-guard asserts in the market/swap functions,
-so an abort emits nothing. `entry_point` identifies which of the six
-functions produced the event:
+`place_market_order_bid` / `place_market_order_ask` — after any
+slippage-guard asserts in the market functions, so an abort emits nothing.
+`entry_point` identifies which of the four functions produced the event:
 
 | `entry_point` | Function |
 |---|---|
@@ -964,12 +912,13 @@ functions produced the event:
 | 1 | `place_limit_order_ask` |
 | 2 | `place_market_order_bid` |
 | 3 | `place_market_order_ask` |
-| 4 | `swap_bid` |
-| 5 | `swap_ask` |
+
+(Entry point values 4 and 5, formerly `swap_bid`/`swap_ask`, are no longer
+produced now that those functions have been removed; they are not reused
+for anything else.)
 
 `limit_price` is `None` for market orders; for `place_limit_order_*`, the
-resting/placement price; for `swap_*`, the taker's protective slippage cap
-(exempt from the price band). `unmatched_size` is the remaining size after
+resting/placement price. `unmatched_size` is the remaining size after
 matching, gross of taker fee — it does not directly equal the base returned
 to the taker when `taker_fee_bps > 0`. `rested_size` is `0` if nothing rests;
 on the bid limit path it can be less than `unmatched_size` even when
@@ -1027,9 +976,7 @@ maker fee is actually paid in).
 
 - `price == 0` is rejected everywhere it is checked (`EZeroPrice`): at
   construction (`initial_last_price`), `set_last_price`, and
-  `place_limit_order_bid`/`_ask`. A zero `limit_price` passed to
-  `swap_bid`/`_ask` is instead rejected by the declared-range check, since
-  no book's declared range can ever include `0`.
+  `place_limit_order_bid`/`_ask`.
 - `price_band_factor` can only ever be `None` or `Some(f)` with `f >= 1`;
   `Some(0)` is always rejected.
 - A construction request whose `base_decimals`/`quote_decimals`/
@@ -1043,9 +990,9 @@ maker fee is actually paid in).
   value can fail one, both, or neither.
 - The price-band check is only ever applied to a price that can rest on the
   book. It never constrains what price a taker actually executes against
-  via `place_market_order_bid`/`_ask` or `swap_bid`/`_ask` — those fill at
-  whatever price the book's existing resting orders offer, regardless of
-  the current `price_band_factor` or `last_price`.
+  via `place_market_order_bid`/`_ask` — those fill at whatever price the
+  book's existing resting orders offer, regardless of the current
+  `price_band_factor` or `last_price`.
 - `set_last_price`, on a book with neither a best bid nor a best ask,
   accepts any declared-range value from any caller, at no cost beyond gas
   (§5).
@@ -1087,7 +1034,7 @@ maker fee is actually paid in).
   place — it is not created and later skipped, there is simply nothing to
   find. This is what lets `destroy_orphaned_ticket` dispose of such a
   ticket without hitting `EProceedsNotEmpty`.
-- Pausing blocks all order-placement/market/swap entry points but never
+- Pausing blocks all order-placement/market entry points but never
   `cancel_order`, `claim_proceeds`, `update_resting_order`, `set_last_price`,
   or `clob_admin_cancel_order`.
 - `clob_admin_unpause_book` always aborts on a retiring book; once
