@@ -120,11 +120,16 @@ pow_exp   = 10^exponent
 scale_lo = ceil(pow_base * pow_prec / pow_quote)
 scale_hi = floor(u64::MAX * pow_base / (pow_quote * pow_exp))
 
-price_scale = min(scale_hi, u64::MAX)
+price_scale = scale_lo
 ```
 
-Construction aborts with `EPriceRangeInfeasible` (20) if `scale_lo >
-scale_hi`, or if `scale_lo` itself does not fit in a `u64`.
+`price_scale` is chosen as `scale_lo`, the *smallest* value that guarantees
+resolution at least as fine as the book's declared `10^-precision` — not the
+largest value that fits in a `u64`. `scale_hi` is retained only as a
+feasibility bound: it guarantees `10^exponent` (the book's declared maximum
+true price) still decodes to a raw price that fits in a `u64` at the chosen
+`price_scale`. Construction aborts with `EPriceRangeInfeasible` (20) if
+`scale_lo > scale_hi`, or if `scale_lo` itself does not fit in a `u64`.
 
 `precision` and `exponent` jointly declare the range of true price the book
 guarantees to represent: at least `10^-precision` and at most `10^exponent`.
@@ -141,8 +146,8 @@ This check is applied to:
 |---|---|
 | `new` / `new_with_event_id_override` | `initial_last_price` |
 | `set_last_price` | `new_last_price` |
-| `place_limit_order_bid` | `price` |
-| `place_limit_order_ask` | `price` |
+| `place_limit_order_bid` | `price` (derived internally from `payment`/`expected_base_output`) |
+| `place_limit_order_ask` | `price` (derived internally from `expected_quote_output`/`payment.value()`) |
 | `swap_bid` | `limit_price`, only when `Some` |
 | `swap_ask` | `limit_price`, only when `Some` |
 
@@ -184,7 +189,7 @@ price <= last_price * factor      (else EPriceAboveBand, 24)
 ```
 
 This check is applied only to `place_limit_order_bid` and
-`place_limit_order_ask` (both on their `price` parameter). It is **not**
+`place_limit_order_ask` (both on their internally-derived `price`). It is **not**
 applied to `place_market_order_bid`, `place_market_order_ask`, `swap_bid`,
 or `swap_ask` — including `swap_bid`/`swap_ask` when `limit_price` is
 `Some` (that value is still subject to the declared-range check in §3, but
@@ -266,19 +271,35 @@ or already claimable.
 ```
 public fun place_limit_order_bid<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    price: u64,
-    size: u64,
     payment: Coin<Quote>,
+    expected_base_output: u64,
     max_fills: u64,
     ctx: &mut TxContext,
 ): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
 ```
 
-Aborts if the book is paused (`EBookPaused`, 15), if `price == 0`
-(`EZeroPrice`, 14), if `price` fails the declared-range check (§3), if
-`price` fails the price-band check when set (§4), or if `size < min_size`
-(`ESizeBelowMinSize`, 12). All of these checks run before any of `payment`
-is escrowed.
+This is the only entry point for placing a resting limit bid. There is no
+caller-supplied `price` parameter: raw `price` is an internal,
+`price_scale`-denominated unit that is easy to misinterpret (e.g. mistaking
+`price = 2` for "2 tokens per token"), so it is always derived internally
+from real quantities instead. The whole `payment` coin's value is derived,
+up front, into the implied limit `price` for a resting bid targeting exactly
+`expected_base_output` Base: `price = floor(payment.value() * price_scale /
+expected_base_output)` — the maximum price `payment`'s entire value can
+afford for `expected_base_output` Base — computed once and used both to
+cross the book and, unchanged, as the price any unfilled remainder rests at.
+This guarantees `bid_escrow_amount(book, price, expected_base_output) <=
+payment.value()`, so this function can never itself abort for lack of funds
+on account of this derivation; any leftover (rounding slack from the
+`floor`, plus whatever isn't matched/rested) is returned merged into the
+leftover `Coin<Quote>`.
+
+Aborts if the book is paused (`EBookPaused`, 15), if `expected_base_output <
+min_size` (`ESizeBelowMinSize`, 12), if the derived `price` rounds down to
+`0` (`EZeroPrice`, 14), if the derivation would overflow `u64`
+(`EPriceOverflow`, 29), if `price` fails the declared-range check (§3), or if
+`price` fails the price-band check when set (§4). All of these checks run
+before any of `payment` is escrowed.
 
 `max_fills` bounds how many resting orders this call will cross before
 stopping the crossing sweep early (whether or not the book had more
@@ -295,65 +316,27 @@ payment; `bool` — the max-fills-stopped flag above.
 Any unmatched remainder that ends up resting may be **smaller** than the
 originally requested unmatched size, if the payment left over after any
 crossing fills is insufficient to fully back the ceiling-rounded escrow
-requirement (`bid_escrow_amount`, §3) for the full remainder at the
-requested price.
+requirement (`bid_escrow_amount`, §3) for the full remainder at the derived
+price.
 
-### `place_limit_order_ask`
-
-```
-public fun place_limit_order_ask<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    price: u64,
-    size: u64,
-    payment: Coin<Base>,
-    max_fills: u64,
-    ctx: &mut TxContext,
-): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
-```
-
-Same abort conditions as `place_limit_order_bid`, mirrored for the ask side.
-Unlike the bid side, an ask's unmatched remainder always rests at its full
-size — `Base`-denominated escrow requires no price-scale conversion or
-rounding, so there is no analogous shortfall case.
-
-### `place_limit_order_bid_expected_output`
-
-```
-public fun place_limit_order_bid_expected_output<Base, Quote>(
-    book: &mut OrderBook<Base, Quote>,
-    payment: Coin<Quote>,
-    expected_base_output: u64,
-    max_fills: u64,
-    ctx: &mut TxContext,
-): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
-```
-
-Convenience wrapper around `place_limit_order_bid` that derives its `price`
-from a whole `payment` coin rather than taking one directly. The implied
-`price` is `floor(payment.value() * price_scale / expected_base_output)` —
-the maximum price `payment`'s entire value can afford for
-`expected_base_output` Base — computed once and used both to cross the book
-and, unchanged, as the price any unfilled remainder rests at. This
-guarantees `bid_escrow_amount(book, price, expected_base_output) <=
-payment.value()`, so the delegated placement can never itself abort for
-lack of funds; any leftover (rounding slack from the `floor`, plus whatever
-isn't matched/rested) is returned merged into the leftover `Coin<Quote>`,
-same as `place_limit_order_bid`. Aborts with `EZeroPrice` (14) if the
-derived price rounds down to `0`, or `EPriceOverflow` (29) if it would
-overflow `u64`. Also aborts if `expected_base_output < min_size`.
+**Precision note**: `price_scale` is chosen (see §3) as the smallest value
+guaranteeing resolution at least as fine as the book's declared
+`10^-precision`, not a near-`u64::MAX` value — so this derived price snaps
+down to the nearest whole declared tick rather than tracking `payment`'s
+implied ratio near-exactly. Still fund-safe: `floor` rounding still
+guarantees the escrow bound above holds.
 
 **Worst-case resting price**: because the derived price is a maximum, any
 unmatched remainder rests at the *worst* price this payment could imply —
 potentially far above what a hand-computed limit price would use. This is
 deliberate (it is what makes the fund-safety guarantee above hold), not a
-bug, but callers who care about the resting price rather than just
-guaranteed non-reverting placement should compute and pass an explicit
-`price` to `place_limit_order_bid` directly instead.
+bug — it is the tradeoff inherent in there being no way to pass an explicit
+resting price.
 
-### `place_limit_order_ask_expected_output`
+### `place_limit_order_ask`
 
 ```
-public fun place_limit_order_ask_expected_output<Base, Quote>(
+public fun place_limit_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     payment: Coin<Base>,
     expected_quote_output: u64,
@@ -362,21 +345,36 @@ public fun place_limit_order_ask_expected_output<Base, Quote>(
 ): (Option<OrderTicket>, Coin<Base>, Coin<Quote>, bool)
 ```
 
-Mirrors `place_limit_order_bid_expected_output` for the ask side. The whole
-`payment` coin's value is the resting ask's `size`; the implied `price` is
-`ceil(expected_quote_output * price_scale / size)` — the lowest price at
-which fully filling `size` yields at least `expected_quote_output` Quote.
-Unlike the bid-side variant there is no rounding-slack leftover to return
-(an ask's escrow is exactly `size` Base, with no price-scale conversion).
-Aborts with `EZeroPrice` (14) if `expected_quote_output == 0`, or
-`EPriceOverflow` (29) if the derived price would overflow `u64`.
+The only entry point for placing a resting limit ask, mirroring
+`place_limit_order_bid`: no caller-supplied `price` parameter. The whole
+`payment` coin's value (`payment.value()`) is the resting ask's `size` — the
+whole coin is escrowed. The implied limit `price` is derived from
+`expected_quote_output` via `price = ceil(expected_quote_output *
+price_scale / size)` — the lowest price at which fully filling this ask
+would yield at least `expected_quote_output` Quote. Unlike the bid side,
+there is no rounding-slack leftover to return here: an ask's escrow is
+exactly `size` Base with no price-scale conversion involved, and an ask's
+unmatched remainder always rests at its full size.
+
+Aborts if the book is paused (`EBookPaused`, 15), if `size < min_size`
+(`ESizeBelowMinSize`, 12), if `expected_quote_output == 0` (the derived
+price would round down to `0`, `EZeroPrice`, 14), if the derivation would
+overflow `u64` (`EPriceOverflow`, 29), if `price` fails the declared-range
+check (§3), or if `price` fails the price-band check when set (§4).
+
+**Precision note**: as with the bid-side mirror, `price_scale` is the
+smallest value guaranteeing resolution at least as fine as the book's
+declared `10^-precision`, not a near-`u64::MAX` value — so this derived
+price snaps up to the nearest whole declared tick rather than tracking
+`expected_quote_output`'s implied ratio near-exactly. Still fund-safe:
+`ceil` rounding still guarantees the yield bound above holds.
 
 **Worst-case resting price**: the derived price is the *lowest* price
 satisfying the constraint above, so any unmatched remainder rests at the
 worst price for the ask's own maker (least Quote received per unit sold).
 Deliberate, for the same fund-safety reason as the bid-side mirror — not a
-bug, but a caller who cares about the resting price should pass an explicit
-`price` to `place_limit_order_ask` directly instead.
+bug, but the tradeoff inherent in there being no way to pass an explicit
+resting price.
 
 ### `place_market_order_bid`
 
@@ -509,8 +507,8 @@ Mirrors `swap_bid` for the ask side, with the same `limit_price` contract.
 
 | Function | Price parameter | Declared-range check | Price-band check | Can rest an order |
 |---|---|---|---|---|
-| `place_limit_order_bid` | `price: u64` (mandatory) | Yes | Yes | Yes |
-| `place_limit_order_ask` | `price: u64` (mandatory) | Yes | Yes | Yes |
+| `place_limit_order_bid` | none (derived internally) | Yes | Yes | Yes |
+| `place_limit_order_ask` | none (derived internally) | Yes | Yes | Yes |
 | `place_market_order_bid` | none | — | — | No |
 | `place_market_order_ask` | none | — | — | No |
 | `swap_bid` | `limit_price: Option<u64>` | Yes, only if `Some` | No, never | No |

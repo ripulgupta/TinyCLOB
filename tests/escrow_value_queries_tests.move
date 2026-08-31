@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -41,9 +41,9 @@ fun bid_quote_escrow_at_price_matches_single_order_after_partial_fill() {
     scenario.next_tx(maker_b());
     let fill_qty = 30;
     let base = coin::mint_for_testing<BTC>(fill_qty, scenario.ctx());
-    let (t, lb, mq, _) = book.place_limit_order_ask(shortfall_price(), fill_qty, base, 10, scenario.ctx());
-    assert!(t.is_none(), 2);
-    t.destroy_none();
+    // Pure crossing fill (never rests): `place_market_order_ask` needs no
+    // price/expected-output derivation.
+    let (lb, mq, _) = book.place_market_order_ask(base, 10, 0, u64_max(), scenario.ctx());
     lb.burn_for_testing();
     let quote_charged = mq.burn_for_testing();
 
@@ -278,98 +278,95 @@ fun resting_order_escrow_by_ticket_wrong_book_aborts() {
 // remaining_size: 0)` (both fields are the same live Quote escrow value for
 // a bid -- see the field's own doc comment). Distinct from `None` (not
 // resting at all).
+//
+// NOTE: this does NOT reuse the shared `shortfall_book`/`shortfall_price`
+// fixture (`price=5`, `price_scale=10`). Under the new `price_scale =
+// scale_lo` derivation `price_scale` is always a power of ten (see
+// `new_impl`'s doc comment), so a `price` of `5` against a `price_scale` of
+// `10` is always exactly `1/2` -- the cumulative-ceiling target reaches
+// `total_reserved` only ONE unit before `original_size` is exhausted (a
+// structural consequence of a `1/2` ratio, independent of the chosen size),
+// leaving no room for a genuinely resting, zero-escrow, NOT-yet-fully-drained
+// state with more than one further fill's worth of slack. A bespoke book
+// with a `1/3`-ish ratio (`price=33`, `price_scale=100`) is used instead so
+// the plateau at `total_reserved` has real width (`target(k)` first reaches
+// `33` at `k=97`, ninety-seven fills before `original_size=100`), leaving 3
+// full units of genuinely resting Base capacity to demonstrate this state
+// with.
 #[test]
 fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = shortfall_book(&mut scenario);
+    // base_decimals=0, quote_decimals=0, precision=2, exponent=16:
+    // scale_lo = ceil(10^2) = 100 = price_scale (scale_hi = floor(u64::MAX /
+    // 10^16) = 1_844, comfortably above scale_lo, so feasible).
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    assert!(book.price_scale() == 100, 0);
 
-    // Same setup as `partial_cross_then_rest_full_drain_across_multiple_fills_is_zero_dust`:
-    // resting bid remainder has original_size=7, total_reserved=2.
+    // A FRESH resting bid (no partial-cross clamp needed): size=100,
+    // total_reserved = bid_escrow_amount(33, 100) = ceil(3_300/100) = 33.
     scenario.next_tx(maker_a());
-    let ask_ticket = rest_ask(&mut book, shortfall_price(), 1, 10, scenario.ctx());
-
-    scenario.next_tx(taker());
-    let payment = coin::mint_for_testing<USDC>(3, scenario.ctx());
-    let (ticket_opt, matched_base, leftover_quote, _) =
-        book.place_limit_order_bid(shortfall_price(), 10, payment, 10, scenario.ctx());
-    matched_base.burn_for_testing();
-    leftover_quote.burn_for_testing();
-    let bid_ticket = ticket_opt.destroy_some();
+    let reserved = book.bid_escrow_amount(33, 100);
+    assert!(reserved == 33, 1);
+    let bid_ticket = rest_bid(&mut book, 33, 100, 200, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
 
-    // Four 1-unit fills of the remaining 7 units, each taker-limited (maker
-    // still has size left afterward: 6, 5, 4, then 3). Hand-derived
-    // cumulative-ceiling values (`target(k) = ceil(2*k/7)`, `k` = cumulative
-    // Base filled): `target(1..7) = 1,1,1,2,2,2,2`. Per-fill deltas:
-    //   fill_a (k=1): target=1, delta = 1 - 0 = 1
-    //   fill_b (k=2): target=1, delta = 1 - 1 = 0
-    //   fill_c (k=3): target=1, delta = 1 - 1 = 0
-    //   fill_d (k=4): target=2, delta = 2 - 1 = 1
-    // Sum = 2 == total_reserved: the escrow hits exactly 0 after the 4th
-    // fill, while the maker still has 7 - 4 = 3 units of genuinely resting
+    // Ninety-seven 1-unit fills of the 100-unit order, each taker-limited
+    // (maker still has size left afterward). Hand-derived cumulative-ceiling
+    // values: `target(k) = ceil(33*k/100)` first reaches `33`
+    // (`total_reserved`) at `k=97`, ninety-seven fills before
+    // `original_size=100` -- leaving 3 full units of genuinely resting Base
+    // capacity once the escrow is exhausted.
+    scenario.next_tx(maker_b());
+    let mut total_charged: u64 = 0;
+    let mut i = 0;
+    while (i < 97) {
+        let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
+        // Pure crossing fill (never rests): `place_market_order_ask` needs
+        // no price/expected-output derivation. This also sidesteps a
+        // structural constraint of the new API worth noting: any
+        // legitimately-DERIVED resting-ask price/size pair must satisfy
+        // `price * size >= price_scale`, so a genuinely resting size-1 ask
+        // could never derive a price as low as `33` at this book's
+        // `price_scale == 100` -- irrelevant here since this fill only ever
+        // crosses, never rests.
+        let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
+        lb.burn_for_testing();
+        total_charged = total_charged + mq.burn_for_testing();
+        i = i + 1;
+    };
+    // Sum == total_reserved: the escrow hits exactly 0 after the 97th fill,
+    // while the maker still has 100 - 97 = 3 units of genuinely resting
     // Base capacity.
-    scenario.next_tx(maker_b());
-    let base_a = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (ta, lba, mqa, _) = book.place_limit_order_ask(shortfall_price(), 1, base_a, 10, scenario.ctx());
-    assert!(ta.is_none(), 0);
-    ta.destroy_none();
-    lba.burn_for_testing();
-    assert!(mqa.burn_for_testing() == 1, 10);
+    assert!(total_charged == reserved, 2);
 
-    scenario.next_tx(maker_b());
-    let base_b = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (tb, lbb, mqb, _) = book.place_limit_order_ask(shortfall_price(), 1, base_b, 10, scenario.ctx());
-    assert!(tb.is_none(), 11);
-    tb.destroy_none();
-    lbb.burn_for_testing();
-    assert!(mqb.burn_for_testing() == 0, 12);
-
-    scenario.next_tx(maker_b());
-    let base_c = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (tc, lbc, mqc, _) = book.place_limit_order_ask(shortfall_price(), 1, base_c, 10, scenario.ctx());
-    assert!(tc.is_none(), 13);
-    tc.destroy_none();
-    lbc.burn_for_testing();
-    assert!(mqc.burn_for_testing() == 0, 14);
-
-    scenario.next_tx(maker_b());
-    let base_d = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (td, lbd, mqd, _) = book.place_limit_order_ask(shortfall_price(), 1, base_d, 10, scenario.ctx());
-    assert!(td.is_none(), 15);
-    td.destroy_none();
-    lbd.burn_for_testing();
-    assert!(mqd.burn_for_testing() == 1, 16);
-
-    let escrow_opt = book.resting_order_escrow(true, shortfall_price(), order_id);
-    assert!(escrow_opt.is_some(), 1);
+    let escrow_opt = book.resting_order_escrow(true, 33, order_id);
+    assert!(escrow_opt.is_some(), 3);
     let (escrow, remaining) = escrow_opt.borrow().resting_order_escrow_fields();
-    assert!(escrow == 0, 2);
+    assert!(escrow == 0, 4);
     // `remaining_size` is Quote-denominated for a bid (equal to `escrow`),
     // NOT the Base remaining capacity (which is genuinely 3, still
     // resting/fillable -- see the header comment above).
-    assert!(remaining == 0, 3);
+    assert!(remaining == 0, 5);
 
     // Matches the same read via `resting_order_escrow_by_ticket`.
     let escrow_opt_via_ticket = book.resting_order_escrow_by_ticket(&bid_ticket);
-    assert!(escrow_opt_via_ticket.is_some(), 4);
+    assert!(escrow_opt_via_ticket.is_some(), 6);
     let (escrow_2, remaining_2) = escrow_opt_via_ticket.borrow().resting_order_escrow_fields();
-    assert!(escrow_2 == 0, 5);
-    assert!(remaining_2 == 0, 6);
+    assert!(escrow_2 == 0, 7);
+    assert!(remaining_2 == 0, 8);
 
     // The order is genuinely still live and fillable: one more 1-unit ask
-    // fill succeeds and is charged 0 (target(5) = ceil(10/7) = 2,
-    // already_charged = 2, delta = 0), proving this is NOT the same as
-    // `None` (not resting at all).
+    // fill succeeds and is charged 0 (target(98) = ceil(33*98/100) =
+    // ceil(32.34) = 33, already_charged = 33, delta = 0), proving this is
+    // NOT the same as `None` (not resting at all) -- and NOT yet fully
+    // drained either (maker still has 100 - 98 = 2 remaining after this).
     scenario.next_tx(maker_b());
-    let base_e = coin::mint_for_testing<BTC>(1, scenario.ctx());
-    let (te, lbe, mqe, _) = book.place_limit_order_ask(shortfall_price(), 1, base_e, 10, scenario.ctx());
-    assert!(te.is_none(), 17);
-    te.destroy_none();
+    let base_extra = coin::mint_for_testing<BTC>(1, scenario.ctx());
+    let (lbe, mqe, _) = book.place_market_order_ask(base_extra, 200, 0, u64_max(), scenario.ctx());
     lbe.burn_for_testing();
-    assert!(mqe.burn_for_testing() == 0, 18);
-    assert!(book.resting_order_escrow(true, shortfall_price(), order_id).is_some(), 19);
+    assert!(mqe.burn_for_testing() == 0, 10);
+    assert!(book.resting_order_escrow(true, 33, order_id).is_some(), 11);
 
-    unit_test::destroy(ask_ticket);
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -394,12 +391,12 @@ fun bid_quote_escrow_at_price_sums_two_orders_one_partially_filled() {
     // Partially cross the FRONT order (A, by FIFO) only.
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(137, scenario.ctx());
-    let (ask_ticket_opt, leftover_b, matched_q, _) =
-        book.place_limit_order_ask(shortfall_price(), 137, ask_payment, 10, scenario.ctx());
+    // Pure crossing fill (never rests): `place_market_order_ask` needs no
+    // price/expected-output derivation.
+    let (leftover_b, matched_q, _) =
+        book.place_market_order_ask(ask_payment, 10, 0, u64_max(), scenario.ctx());
     assert!(leftover_b.burn_for_testing() == 0, 0);
     matched_q.burn_for_testing();
-    assert!(ask_ticket_opt.is_none(), 1);
-    ask_ticket_opt.destroy_none();
 
     // The maintained aggregate must equal the exact sum of each order's own
     // live escrow, even with one of the two orders now partially drained.

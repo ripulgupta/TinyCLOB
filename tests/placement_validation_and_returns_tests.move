@@ -34,8 +34,9 @@ fun place_limit_order_bid_ask_happy_path_fills_and_rests() {
 
     // Resting ask, then a crossing bid fills it fully.
     let ask_payment = coin::mint_for_testing<BTC>(PLACEMENT_SIZE, scenario.ctx());
+    let ask_expected_quote_output = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
     let (ask_ticket_opt, ask_matched_base, ask_leftover_base, ask_stop) =
-        book.place_limit_order_ask(PLACEMENT_PRICE, PLACEMENT_SIZE, ask_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(ask_payment, ask_expected_quote_output, 10, scenario.ctx());
     assert!(ask_matched_base.burn_for_testing() == 0, 0);
     assert!(ask_leftover_base.burn_for_testing() == 0, 1);
     assert!(!ask_stop, 2);
@@ -44,7 +45,7 @@ fun place_limit_order_bid_ask_happy_path_fills_and_rests() {
     scenario.next_tx(taker());
     let bid_payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), scenario.ctx());
     let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, bid_stop) =
-        book.place_limit_order_bid(PLACEMENT_PRICE, PLACEMENT_SIZE, bid_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid_payment, PLACEMENT_SIZE, 10, scenario.ctx());
     assert!(bid_matched_base.burn_for_testing() == PLACEMENT_SIZE, 3);
     assert!(bid_leftover_quote.burn_for_testing() == 0, 4);
     assert!(!bid_stop, 5);
@@ -61,8 +62,11 @@ fun place_limit_order_bid_ask_happy_path_fills_and_rests() {
 fun place_limit_order_zero_price_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
+    // `payment` of 1 against `PLACEMENT_SIZE` derives `price ==
+    // floor(1 * 1 / PLACEMENT_SIZE) == 0` -- the same `EZeroPrice` abort as
+    // passing `price == 0` directly used to trigger.
     let payment = coin::mint_for_testing<USDC>(1, scenario.ctx());
-    let (ticket_opt, mb, ml, _) = book.place_limit_order_bid(0, PLACEMENT_SIZE, payment, 10, scenario.ctx());
+    let (ticket_opt, mb, ml, _) = book.place_limit_order_bid(payment, PLACEMENT_SIZE, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
@@ -77,7 +81,7 @@ fun place_limit_order_size_validation_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let payment = coin::mint_for_testing<USDC>(1, scenario.ctx());
     let (ticket_opt, mb, ml, _) =
-        book.place_limit_order_bid(PLACEMENT_PRICE, PLACEMENT_SIZE - 1, payment, 10, scenario.ctx());
+        book.place_limit_order_bid(payment, PLACEMENT_SIZE - 1, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
@@ -93,7 +97,7 @@ fun placement_functions_abort_when_paused() {
     cap.clob_admin_pause_book(&mut book);
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), scenario.ctx());
     let (ticket_opt, mb, ml, _) =
-        book.place_limit_order_bid(PLACEMENT_PRICE, PLACEMENT_SIZE, payment, 10, scenario.ctx());
+        book.place_limit_order_bid(payment, PLACEMENT_SIZE, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
@@ -342,7 +346,7 @@ fun claim_proceeds_transfers_maker_proceeds() {
     // fully fills and never rests: the returned ticket option is `none`.
     let bid_payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), scenario.ctx());
     let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, _) =
-        book.place_limit_order_bid(PLACEMENT_PRICE, PLACEMENT_SIZE, bid_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid_payment, PLACEMENT_SIZE, 10, scenario.ctx());
     bid_ticket_opt.destroy_none();
     bid_matched_base.burn_for_testing();
     bid_leftover_quote.burn_for_testing();
@@ -376,7 +380,7 @@ fun place_limit_order_bid_fully_fills_returns_none() {
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 100), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(OPT_PRICE, 100, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, 100, 1_000_000_000, scenario.ctx());
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == 100, 1);
     assert!(leftover_quote.burn_for_testing() == 0, 2);
@@ -400,7 +404,7 @@ fun place_limit_order_bid_truncated_by_max_fills_returns_none() {
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 200), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(OPT_PRICE, 200, payment, 1, scenario.ctx());
+        book.place_limit_order_bid(payment, 200, 1, scenario.ctx());
     // Truncated after exactly one fill: 100 base matched, 100 remains
     // unmatched, but `should_rest` is false because the sweep stopped on
     // max_fills rather than genuinely running out of counterparty depth.
@@ -425,7 +429,7 @@ fun place_limit_order_bid_partial_fill_rests_returns_some_and_ticket_is_usable()
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 300), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(OPT_PRICE, 300, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, 300, 1_000_000_000, scenario.ctx());
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == 100, 1);
     assert!(leftover_quote.burn_for_testing() == 0, 2);
@@ -451,8 +455,9 @@ fun place_limit_order_ask_fully_fills_returns_none() {
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
+    let expected_quote_output = book.bid_escrow_amount(OPT_PRICE, 100);
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask(OPT_PRICE, 100, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output, 1_000_000_000, scenario.ctx());
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1);
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 2);
@@ -473,8 +478,9 @@ fun place_limit_order_ask_truncated_by_max_fills_returns_none() {
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(200, scenario.ctx());
+    let expected_quote_output_200 = book.bid_escrow_amount(OPT_PRICE, 200);
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask(OPT_PRICE, 200, payment, 1, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output_200, 1, scenario.ctx());
     assert!(stopped, 0);
     assert!(leftover_base.burn_for_testing() == 100, 1);
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 2);
@@ -495,8 +501,9 @@ fun place_limit_order_ask_partial_fill_rests_returns_some_and_ticket_is_usable()
 
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<BTC>(300, scenario.ctx());
+    let expected_quote_output_300 = book.bid_escrow_amount(OPT_PRICE, 300);
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask(OPT_PRICE, 300, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output_300, 1_000_000_000, scenario.ctx());
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1);
     assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 2);
@@ -537,7 +544,7 @@ fun place_limit_order_bid_full_fill_with_taker_fee_still_returns_none() {
     scenario.next_tx(taker());
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OPT_PRICE, 100), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(OPT_PRICE, 100, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, 100, 1_000_000_000, scenario.ctx());
     assert!(!stopped, 0);
     // Fee-net matched amount: ceil(100 * 10 / 10_000) = 1 taker fee -> 99.
     // The naive `size - coin::value(&matched_base)` derivation gives

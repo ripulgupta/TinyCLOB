@@ -643,8 +643,23 @@ fun destroy_orphaned_ticket_after_all_zero_credited_fill_disposes_cleanly() {
     cap.clob_admin_set_maker_fee(&mut book, 1);
 
     scenario.next_tx(maker_a());
-    let bid_ticket = rest_bid(&mut book, shortfall_price(), 1, 1_000_000_000, scenario.ctx());
-    let order_id = bid_ticket.ticket_order_id();
+    // A genuinely resting bid of ORIGINAL size 1 can no longer be
+    // constructed via `place_limit_order_bid`/`rest_bid` at this book's
+    // `price_scale` (10): any legitimately-derived nonzero price satisfies
+    // `price * size >= price_scale`, and `5 * 1 < 10`. Since this test isn't
+    // exercising `place_limit_order_bid`'s price derivation at all -- only
+    // `destroy_orphaned_ticket`'s behavior on a since-fully-drained,
+    // zero-credit order -- it constructs the exact same size-1 fixture
+    // directly via the test-only `insert_resting_order_for_testing` bypass
+    // instead (mirroring the same pattern already used for precise fixture
+    // construction in `fee_redesign_tests.move`).
+    let order_id = book.next_order_id();
+    let escrow_quote = balance::create_for_testing<USDC>(book.bid_escrow_amount(shortfall_price(), 1));
+    let bid = order::new<BTC, USDC>(order_id, maker_a(), 1, option::none(), option::some(escrow_quote), 1);
+    book.insert_resting_order_for_testing(true, shortfall_price(), bid, scenario.ctx());
+    let bid_ticket = tiny_clob::new_ticket_for_testing(
+        order_id, book.id_for_testing(), tiny_clob::bid_for_testing(), shortfall_price(),
+    );
 
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(1, scenario.ctx());

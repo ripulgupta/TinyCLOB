@@ -26,31 +26,31 @@ const PRICE: u64 = 100;
 const MAKER_FEE_BPS: u64 = 1;
 
 // The two `realistic_decimals_book`-based true-up tests below use a
-// deliberately non-multiple-of-184 price so `bid_escrow_amount` itself
-// requires genuine ceiling rounding (`price_scale == 184`; see
+// deliberately non-multiple-of-100 price so `bid_escrow_amount` itself
+// requires genuine ceiling rounding (`price_scale == 100`; see
 // `full_lifecycle_tests.move`'s header comment for the full derivation),
 // instead of `PRICE`/`new_book()`'s `price_scale == 1` shape where
 // `quote_cost == price * size` exactly.
-const REALISTIC_PRICE: u64 = 1_000;
+const REALISTIC_PRICE: u64 = 1_037;
 
 /// Category (a): fill-drain, inside `fill_level_bid` -- an ask-side maker
 /// (fee denominated in Quote) fully drained across two separate 1-unit
 /// fills. Under the rounding-direction fix (findings L-A/L-B), a fill's
 /// `quote_cost` formula depends on whether it fully drains the maker:
 ///   - Fill 1 (ask still has 1 unit left afterward -- taker-limited, formula
-///     UNCHANGED): `quote_cost = ceil(1_000 * 1 / 184) = ceil(5.43...) = 6`.
+///     UNCHANGED): `quote_cost = ceil(1_037 * 1 / 100) = ceil(10.37) = 11`.
 ///   - Fill 2 (fully drains the ask -- maker-limited, formula CHANGED to
-///     floor): `quote_cost = max(floor(1_000 * 1 / 184), 1) =
-///     max(5, 1) = 5` (was 6 under the old ceiling formula).
+///     floor): `quote_cost = max(floor(1_037 * 1 / 100), 1) =
+///     max(10, 1) = 10` (was 11 under the old ceiling formula).
 /// Each fill's own dust fee still independently ceiling-rounds to 1
-/// (`ceil(6 * 1 / 10_000) = 1`, `ceil(5 * 1 / 10_000) = 1`), for a reserve
-/// of 2. The CORRECT aggregate fee owed on the full 11-unit basis (6 + 5) is
-/// `ceil(11 * 1 / 10_000) = 1`, so this order's conclusion must refund
+/// (`ceil(11 * 1 / 10_000) = 1`, `ceil(10 * 1 / 10_000) = 1`), for a reserve
+/// of 2. The CORRECT aggregate fee owed on the full 21-unit basis (11 + 10)
+/// is `ceil(21 * 1 / 10_000) = 1`, so this order's conclusion must refund
 /// exactly 1 unit of slack back to the maker instead of over-collecting the
 /// naive per-fill sum of 2.
 ///
-/// Uses `realistic_decimals_book` (`price_scale == 184`) with a
-/// non-multiple-of-184 price, so each fill's own `quote_cost` -- the basis
+/// Uses `realistic_decimals_book` (`price_scale == 100`) with a
+/// non-multiple-of-100 price, so each fill's own `quote_cost` -- the basis
 /// each per-fill fee and the final aggregate fee are computed from -- is
 /// itself genuinely rounded (ceiling on fill 1, floor on fill 2), unlike
 /// `new_book()`'s `price_scale == 1` shape where `quote_cost == price`
@@ -67,7 +67,7 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     book.insert_resting_order_for_testing(false, REALISTIC_PRICE, ask, scenario.ctx());
 
     let unit_quote_cost = book.bid_escrow_amount(REALISTIC_PRICE, 1);
-    assert!(unit_quote_cost == 6, 100);
+    assert!(unit_quote_cost == 11, 100);
 
     // Fill 1: 1 unit -- ask still rests with 1 unit remaining afterward.
     let payment1 = coin::mint_for_testing<USDC>(unit_quote_cost, scenario.ctx());
@@ -101,15 +101,15 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     assert!(fee_base_after == 0, 8);
     assert!(fee_quote_after == 1, 9);
 
-    // The maker's pooled proceeds must reflect the slack refund: 5 (fill 1,
-    // quote_cost=6 net of its own dust fee of 1) + 5 (fill 2's net-of-fee
-    // quote_cost(5) - fee(1) = 4, plus the 1-unit slack folded in at
-    // conclusion) = 10, not 9 (which is what over-collecting the naive
+    // The maker's pooled proceeds must reflect the slack refund: 10 (fill 1,
+    // quote_cost=11 net of its own dust fee of 1) + 10 (fill 2's net-of-fee
+    // quote_cost(10) - fee(1) = 9, plus the 1-unit slack folded in at
+    // conclusion) = 20, not 19 (which is what over-collecting the naive
     // per-fill sum would have left).
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     scenario.next_tx(other());
     let payout = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
-    assert!(payout.value() == 10, 10);
+    assert!(payout.value() == 20, 10);
     payout.burn_for_testing();
 
     destroy_book_and_cap(book, cap);
@@ -134,7 +134,7 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
     scenario.next_tx(maker_a());
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(PRICE, 300), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, _) =
-        book.place_limit_order_bid(PRICE, 300, payment, 1_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, 300, 1_000_000, scenario.ctx());
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
@@ -183,9 +183,9 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
 /// `None` for an ask-side order, exactly like `fold_maker_fee_slack`'s
 /// bid-side mirror in the cancel_order test above.
 ///
-/// Same `realistic_decimals_book` fixture and non-multiple-of-184 price as
+/// Same `realistic_decimals_book` fixture and non-multiple-of-100 price as
 /// `maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack` above, so
-/// the two 1-unit fills' `quote_cost` (`6` each) is itself genuinely
+/// the two 1-unit fills' `quote_cost` (`11` each) is itself genuinely
 /// ceiling-rounded.
 #[test]
 fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
@@ -199,7 +199,7 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
     book.insert_resting_order_for_testing(false, REALISTIC_PRICE, ask, scenario.ctx());
 
     let unit_quote_cost = book.bid_escrow_amount(REALISTIC_PRICE, 1);
-    assert!(unit_quote_cost == 6, 100);
+    assert!(unit_quote_cost == 11, 100);
 
     let mut i = 0;
     while (i < 2) {
@@ -235,13 +235,13 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
     assert!(quote_refund.value() == 1, 7);
     quote_refund.burn_for_testing();
 
-    // The 10 units of Quote proceeds pooled by the two fills (5 each, net
+    // The 20 units of Quote proceeds pooled by the two fills (10 each, net
     // of their own per-fill dust fee) are untouched by the force-cancel and
     // remain separately claimable.
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     scenario.next_tx(other());
     let proceeds_payout = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
-    assert!(proceeds_payout.value() == 10, 8);
+    assert!(proceeds_payout.value() == 20, 8);
     proceeds_payout.burn_for_testing();
 
     destroy_book_and_cap(book, cap);
@@ -405,15 +405,15 @@ fun order_executed_taker_fee_amount_matches_aggregate_across_many_small_fills() 
 /// `price_scale` rounding of `quote_cost` never enters its fee basis at all.
 /// Here the taker is an ASK, so its fee is Quote-denominated and computed
 /// from the accumulated `quote_cost` across fills -- exactly the quantity
-/// `realistic_decimals_book`'s non-multiple-of-184 price makes genuinely
-/// rounded (`bid_escrow_amount(book, 1_000, 1) = ceil(1_000 * 1 / 184) = 6`,
+/// `realistic_decimals_book`'s non-multiple-of-100 price makes genuinely
+/// rounded (`bid_escrow_amount(book, 1_037, 1) = ceil(1_037 * 1 / 100) = 11`,
 /// not the `price * size` identity `new_book()` would give). 10 separate
 /// 1-unit resting bids (maker fee zeroed out on each, to isolate taker-fee
 /// behavior) are filled by one `place_market_order_ask` selling 10 Base
 /// total, in 10 separate 1-unit fills. Each fill's OWN per-fill ceiling
-/// would independently round up to 1 unit of fee (`ceil(6 * 10 / 10_000) =
+/// would independently round up to 1 unit of fee (`ceil(11 * 10 / 10_000) =
 /// 1`), for a naive per-fill sum of 10; the actual once-per-call aggregate
-/// instead charges `ceil(60 * 10 / 10_000) = 1`, strictly less than the
+/// instead charges `ceil(110 * 10 / 10_000) = 1`, strictly less than the
 /// naive sum, and matches exactly what `OrderExecuted.taker_fee_amount` and
 /// the fee accumulator both report.
 #[test]
@@ -424,7 +424,7 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
     cap.clob_admin_set_taker_fee(&mut book, taker_fee_bps);
 
     let unit_quote_cost = book.bid_escrow_amount(REALISTIC_PRICE, 1);
-    assert!(unit_quote_cost == 6, 100);
+    assert!(unit_quote_cost == 11, 100);
 
     let num_fills = 10;
     let mut i = 0;
@@ -446,12 +446,12 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
     assert!(fills.length() == (num_fills as u64), 2);
 
     let total_quote_basis = unit_quote_cost * num_fills;
-    assert!(total_quote_basis == 60, 101);
+    assert!(total_quote_basis == 110, 101);
 
     // Naive per-fill sum: this is exactly the OLD (pre-redesign) behavior --
     // each of the 10 one-unit fills, on its own, would have ceiling-rounded
-    // its own 6-unit quote_cost to 1 unit of fee.
-    let naive_per_fill_sum = num_fills; // 10 * ceil(6 * 10 / 10_000) = 10 * 1
+    // its own 11-unit quote_cost to 1 unit of fee.
+    let naive_per_fill_sum = num_fills; // 10 * ceil(11 * 10 / 10_000) = 10 * 1
     let matched_quote_val = matched_quote.burn_for_testing();
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
@@ -461,8 +461,8 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
     assert!(requested_size == num_fills, 4);
     assert!(unmatched_size == 0, 5);
     assert!(taker_fee_amount < naive_per_fill_sum, 6);
-    assert!(taker_fee_amount == 1, 7); // ceil(60 * 10 / 10_000) = 1
-    assert!(matched_quote_val == total_quote_basis - taker_fee_amount, 8); // 60 - 1 = 59
+    assert!(taker_fee_amount == 1, 7); // ceil(110 * 10 / 10_000) = 1
+    assert!(matched_quote_val == total_quote_basis - taker_fee_amount, 8); // 110 - 1 = 109
 
     let (fee_base_after, fee_quote_after) = book.fee_accumulator_balances();
     assert!(fee_base_after == 0, 9);
@@ -473,7 +473,7 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
 }
 
 // The two tests below use the same realistic BTC(8 decimals)/USDC(6
-// decimals) book (`price_scale = 184`, same derivation as
+// decimals) book (`price_scale = 100`, same derivation as
 // `full_lifecycle_tests.move`) as several of the true-up/aggregation tests
 // above, with a price that is deliberately NOT a multiple of `price_scale`,
 // so `bid_escrow_amount` itself requires genuine ceiling rounding -- not
@@ -488,20 +488,20 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
 #[test]
 fun cancel_order_with_zero_fills_and_nonzero_fee_refunds_full_escrow_under_realistic_decimals_bid_side() {
     let mut scenario = ts::begin(admin());
-    // base_decimals=8, quote_decimals=6, precision=0, exponent=19 => price_scale = 184
+    // base_decimals=8, quote_decimals=6, precision=0, exponent=19 => price_scale = 100
     // (identical derivation to full_lifecycle_tests.move's realistic book).
     let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     cap.clob_admin_set_maker_fee(&mut book, 3);
 
     scenario.next_tx(maker_a());
-    let price = 1_000; // NOT a multiple of 184 -- forces real rounding below.
+    let price = 1_037; // NOT a multiple of 100 -- forces real rounding below.
     let size = 37;
     let escrow_amount = book.bid_escrow_amount(price, size);
-    assert!(escrow_amount == 202, 0); // ceil(1_000 * 37 / 184) = ceil(201.086...) = 202
+    assert!(escrow_amount == 384, 0); // ceil(1_037 * 37 / 100) = ceil(383.69) = 384
 
     let payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, _) =
-        book.place_limit_order_bid(price, size, payment, 1_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, size, 1_000_000, scenario.ctx());
     assert!(matched_base.burn_for_testing() == 0, 1); // empty book, nothing to match
     assert!(leftover_quote.burn_for_testing() == 0, 2); // payment was exactly the required escrow
     let ticket = ticket_opt.destroy_some();
@@ -532,11 +532,18 @@ fun cancel_order_with_zero_fills_and_nonzero_fee_refunds_full_escrow_under_reali
     // An ask's own escrow is Base, with no price-scale division involved --
     // exact by construction -- so this side's rounding-under-load comes
     // entirely from the (zero) fee-basis true-up, not from the escrow itself.
-    let price = 1_000; // still not a multiple of 184, for consistency with the bid-side test.
-    let size = 53;
+    let price = 1_037; // still not a multiple of 100, for consistency with the bid-side test.
+    // Size 53 (used before the no-explicit-`price`-argument redesign) can no
+    // longer derive back exactly `price == 1_037` at this `price_scale`
+    // (100): no `expected_quote_output` satisfies the ceiling formula's exact
+    // bounds for that pair (verified out-of-band). 52 is the nearest size
+    // that does (`expected_quote_output == 539`), with no other change to
+    // the scenario's intent.
+    let size = 52;
     let payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let expected_quote_output = test_utils::ask_expected_output_for_price(&book, price, size);
     let (ticket_opt, leftover_base, matched_quote, _) =
-        book.place_limit_order_ask(price, size, payment, 1_000_000, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output, 1_000_000, scenario.ctx());
     assert!(leftover_base.burn_for_testing() == 0, 0); // payment was exactly `size`
     assert!(matched_quote.burn_for_testing() == 0, 1); // empty book, nothing to match
     let ticket = ticket_opt.destroy_some();

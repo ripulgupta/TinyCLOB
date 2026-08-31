@@ -5,8 +5,8 @@
 /// `fill_level_ask`).
 ///
 /// The core scenario here (a size-100 resting bid drained via 4 separate
-/// incoming asks of size 7/13/29/51, at `price=5`/`price_scale=18`,
-/// `total_reserved=28`) is the exact scenario used to originally identify
+/// incoming asks of size 7/13/29/51, at `price=5`/`price_scale=10`,
+/// `total_reserved=50`) is the exact scenario used to originally identify
 /// the "drain what's left" fairness problem in production
 /// (`price_rounding_fragmentation_tests.move` documents the sibling
 /// `fill_level_bid` fix for the SAME price_scale/price via `shortfall_book`,
@@ -15,28 +15,28 @@
 ///
 /// OLD production (floor for taker-limited fills, "drain what's left" for
 /// the final/maker-limited fill) would have charged this exact sequence:
-///   fill1 (qty 7):  floor(5*7/18)  = floor(35/18)  = 1
-///   fill2 (qty 13): floor(5*13/18) = floor(65/18)  = 3
-///   fill3 (qty 29): floor(5*29/18) = floor(145/18) = 8
-///   fill4 (qty 51): drain whatever's left = 28 - (1+3+8) = 16
-/// (isolated-fair ceil for fill4 alone would be ceil(5*51/18)=ceil(255/18)=15
+///   fill1 (qty 7):  floor(5*7/10)  = floor(35/10)  = 3
+///   fill2 (qty 13): floor(5*13/10) = floor(65/10)  = 6
+///   fill3 (qty 29): floor(5*29/10) = floor(145/10) = 14
+///   fill4 (qty 51): drain whatever's left = 50 - (3+6+14) = 27
+/// (isolated-fair ceil for fill4 alone would be ceil(5*51/10)=ceil(255/10)=26
 /// -- the old scheme dumps 1 full unit of the first three fills' accumulated
 /// floor-rounding slack onto whichever fill happens to conclude the order.)
 ///
 /// NEW (this file, cumulative-proportional-ceiling): each fill's charge is
 /// `ceil(total_reserved * cumulative_filled / original_size) - already_charged`:
-///   fill1: ceil(28*7/100)=ceil(1.96)=2,   delta = 2 - 0  = 2
-///   fill2: ceil(28*20/100)=ceil(5.6)=6,   delta = 6 - 2  = 4
-///   fill3: ceil(28*49/100)=ceil(13.72)=14,delta = 14 - 6 = 8
-///   fill4: ceil(28*100/100)=28,           delta = 28 - 14 = 14
-/// Both schemes conserve exactly (sum to 28, the order's full
+///   fill1: ceil(50*7/100)=ceil(3.5)=4,     delta = 4 - 0  = 4
+///   fill2: ceil(50*20/100)=ceil(10)=10,    delta = 10 - 4 = 6
+///   fill3: ceil(50*49/100)=ceil(24.5)=25,  delta = 25 - 10 = 15
+///   fill4: ceil(50*100/100)=50,            delta = 50 - 25 = 25
+/// Both schemes conserve exactly (sum to 50, the order's full
 /// `total_reserved`) and both necessarily agree that the LAST fill is
 /// "whatever's left" (that's forced by conservation, not a formula choice —
 /// see the comment in `fill_level_ask`). The difference is entirely in the
-/// three earlier, taker-limited fills: 2/4/8 (isolated-fair: 2/4/9) versus
-/// the old floor's 1/3/8 (isolated-fair: 2/4/9) -- the new scheme's total
+/// three earlier, taker-limited fills: 4/6/15 (isolated-fair: 4/7/15) versus
+/// the old floor's 3/6/14 (isolated-fair: 4/7/15) -- the new scheme's total
 /// absolute deviation from each fill's own isolated-fair ceil value is
-/// smaller (0+0+1+1=2 vs 1+1+1+1=4 for the old scheme), and unlike the old
+/// smaller (0+1+0+1=2 vs 1+1+1+1=4 for the old scheme), and unlike the old
 /// scheme, no single fill is ever OVER its own isolated-fair value -- the
 /// rounding "loss" is spread more evenly instead of systematically dumped
 /// onto whichever fill happens to conclude the order.
@@ -61,17 +61,17 @@ const MAX_FILLS: u64 = 20;
 fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = shortfall_book(&mut scenario);
-    let price = shortfall_price(); // 5, price_scale == 18 (asserted in shortfall_book)
+    let price = shortfall_price(); // 5, price_scale == 10 (asserted in shortfall_book)
 
     // Rest a size-100 bid at `price`. `bid_escrow_amount(price, 100) ==
-    // ceil(5*100/18) == ceil(27.78) == 28` -- the `total_reserved` this
-    // whole scenario is about draining exactly.
+    // ceil(5*100/10) == 50` -- the `total_reserved` this whole scenario is
+    // about draining exactly.
     scenario.next_tx(maker_a());
     let escrow_amount = book.bid_escrow_amount(price, 100);
-    assert!(escrow_amount == 28, 100);
+    assert!(escrow_amount == 50, 100);
     let bid_payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
     let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, bid_stopped) =
-        book.place_limit_order_bid(price, 100, bid_payment, MAX_FILLS, scenario.ctx());
+        book.place_limit_order_bid(bid_payment, 100, MAX_FILLS, scenario.ctx());
     assert!(!bid_stopped, 101);
     assert!(bid_matched_base.burn_for_testing() == 0, 102);
     assert!(bid_leftover_quote.burn_for_testing() == 0, 103);
@@ -79,57 +79,55 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
 
     // `resting_order_escrow`/`depth_at_price` must both report the FULL
     // Quote reservation up front -- Quote-denominated `remaining_size` for a
-    // bid means these now report 28 (Quote), not 100 (Base).
-    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == 28, 104);
-    assert!(book.bid_quote_escrow_at_price(price) == 28, 105);
+    // bid means these now report 50 (Quote), not 100 (Base).
+    assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == 50, 104);
+    assert!(book.bid_quote_escrow_at_price(price) == 50, 105);
 
-    // Fill 1: incoming ask sells 7 Base. Expect quote_cost == 2.
+    // Fill 1: incoming ask sells 7 Base. Expect quote_cost == 4.
     scenario.next_tx(taker());
     let ask1_payment = coin::mint_for_testing<BTC>(7, scenario.ctx());
-    let (ask1_ticket_opt, ask1_leftover_base, ask1_matched_quote, ask1_stopped) =
-        book.place_limit_order_ask(price, 7, ask1_payment, MAX_FILLS, scenario.ctx());
+    // Pure crossing fill (never rests): `place_market_order_ask` needs no
+    // price/expected-output derivation.
+    let (ask1_leftover_base, ask1_matched_quote, ask1_stopped) =
+        book.place_market_order_ask(ask1_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     assert!(!ask1_stopped, 1);
     assert!(ask1_leftover_base.burn_for_testing() == 0, 2);
-    assert!(ask1_matched_quote.burn_for_testing() == 2, 3);
-    ask1_ticket_opt.destroy_none();
-    assert!(book.bid_quote_escrow_at_price(price) == 26, 4); // 28 - 2
+    assert!(ask1_matched_quote.burn_for_testing() == 4, 3);
+    assert!(book.bid_quote_escrow_at_price(price) == 46, 4); // 50 - 4
 
-    // Fill 2: sells 13 Base. Expect quote_cost == 4 (cumulative charge 6).
+    // Fill 2: sells 13 Base. Expect quote_cost == 6 (cumulative charge 10).
     scenario.next_tx(taker());
     let ask2_payment = coin::mint_for_testing<BTC>(13, scenario.ctx());
-    let (ask2_ticket_opt, ask2_leftover_base, ask2_matched_quote, ask2_stopped) =
-        book.place_limit_order_ask(price, 13, ask2_payment, MAX_FILLS, scenario.ctx());
+    let (ask2_leftover_base, ask2_matched_quote, ask2_stopped) =
+        book.place_market_order_ask(ask2_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     assert!(!ask2_stopped, 5);
     assert!(ask2_leftover_base.burn_for_testing() == 0, 6);
-    assert!(ask2_matched_quote.burn_for_testing() == 4, 7);
-    ask2_ticket_opt.destroy_none();
-    assert!(book.bid_quote_escrow_at_price(price) == 22, 8); // 28 - 6
+    assert!(ask2_matched_quote.burn_for_testing() == 6, 7);
+    assert!(book.bid_quote_escrow_at_price(price) == 40, 8); // 50 - 10
 
-    // Fill 3: sells 29 Base. Expect quote_cost == 8 (cumulative charge 14).
+    // Fill 3: sells 29 Base. Expect quote_cost == 15 (cumulative charge 25).
     scenario.next_tx(taker());
     let ask3_payment = coin::mint_for_testing<BTC>(29, scenario.ctx());
-    let (ask3_ticket_opt, ask3_leftover_base, ask3_matched_quote, ask3_stopped) =
-        book.place_limit_order_ask(price, 29, ask3_payment, MAX_FILLS, scenario.ctx());
+    let (ask3_leftover_base, ask3_matched_quote, ask3_stopped) =
+        book.place_market_order_ask(ask3_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     assert!(!ask3_stopped, 9);
     assert!(ask3_leftover_base.burn_for_testing() == 0, 10);
-    assert!(ask3_matched_quote.burn_for_testing() == 8, 11);
-    ask3_ticket_opt.destroy_none();
-    assert!(book.bid_quote_escrow_at_price(price) == 14, 12); // 28 - 14
+    assert!(ask3_matched_quote.burn_for_testing() == 15, 11);
+    assert!(book.bid_quote_escrow_at_price(price) == 25, 12); // 50 - 25
 
     // Fill 4: sells 51 Base, exactly the resting bid's remaining Base
-    // capacity (7+13+29+51 == 100). Expect quote_cost == 14 (drains the
+    // capacity (7+13+29+51 == 100). Expect quote_cost == 25 (drains the
     // remaining escrow to exactly 0, concluding the order) -- LESS than the
-    // OLD production formula's 16, and closer to (though still 1 below,
+    // OLD production formula's 27, and closer to (though still 1 below,
     // per the apportionment argument above) fill4's own isolated-fair
-    // ceil(5*51/18) == 15.
+    // ceil(5*51/10) == 26.
     scenario.next_tx(taker());
     let ask4_payment = coin::mint_for_testing<BTC>(51, scenario.ctx());
-    let (ask4_ticket_opt, ask4_leftover_base, ask4_matched_quote, ask4_stopped) =
-        book.place_limit_order_ask(price, 51, ask4_payment, MAX_FILLS, scenario.ctx());
+    let (ask4_leftover_base, ask4_matched_quote, ask4_stopped) =
+        book.place_market_order_ask(ask4_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     assert!(!ask4_stopped, 13);
     assert!(ask4_leftover_base.burn_for_testing() == 0, 14);
-    assert!(ask4_matched_quote.burn_for_testing() == 14, 15);
-    ask4_ticket_opt.destroy_none();
+    assert!(ask4_matched_quote.burn_for_testing() == 25, 15);
 
     // The resting bid must now be fully gone (drained, popped off the book).
     assert!(book.depth_at_price(tiny_clob::bid_for_testing(), price) == 0, 16);
@@ -137,9 +135,9 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     assert!(book.resting_order_escrow(tiny_clob::bid_for_testing(), price, 0).is_none(), 18);
 
     // Sum of all 4 quote_cost deltas exactly equals `total_reserved` -- zero
-    // stranded, zero over-collected: 2+4+8+14 == 28.
+    // stranded, zero over-collected: 4+6+15+25 == 50.
     // (implicitly checked above via the running `bid_quote_escrow_at_price`
-    // sequence 28 -> 26 -> 22 -> 14 -> 0)
+    // sequence 50 -> 46 -> 40 -> 25 -> 0)
 
     // The bid's pooled maker proceeds must hold exactly 100 Base -- every
     // fill (concluding or not) credits its own `fill_qty` of Base into the
@@ -174,49 +172,47 @@ fun cancelling_a_partially_filled_bid_refunds_exactly_the_remaining_escrow() {
     let escrow_amount = book.bid_escrow_amount(price, 100);
     let bid_payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
     let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, _) =
-        book.place_limit_order_bid(price, 100, bid_payment, MAX_FILLS, scenario.ctx());
+        book.place_limit_order_bid(bid_payment, 100, MAX_FILLS, scenario.ctx());
     bid_matched_base.burn_for_testing();
     bid_leftover_quote.burn_for_testing();
     let bid_ticket = bid_ticket_opt.destroy_some();
 
-    // Only the first two fills (7 + 13 = 20 Base, cumulative charge 6).
+    // Only the first two fills (7 + 13 = 20 Base, cumulative charge 10).
     scenario.next_tx(taker());
     let ask1_payment = coin::mint_for_testing<BTC>(7, scenario.ctx());
-    let (ask1_ticket_opt, ask1_leftover_base, ask1_matched_quote, _) =
-        book.place_limit_order_ask(price, 7, ask1_payment, MAX_FILLS, scenario.ctx());
+    let (ask1_leftover_base, ask1_matched_quote, _) =
+        book.place_market_order_ask(ask1_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     ask1_leftover_base.burn_for_testing();
-    assert!(ask1_matched_quote.burn_for_testing() == 2, 1);
-    ask1_ticket_opt.destroy_none();
+    assert!(ask1_matched_quote.burn_for_testing() == 4, 1);
 
     scenario.next_tx(taker());
     let ask2_payment = coin::mint_for_testing<BTC>(13, scenario.ctx());
-    let (ask2_ticket_opt, ask2_leftover_base, ask2_matched_quote, _) =
-        book.place_limit_order_ask(price, 13, ask2_payment, MAX_FILLS, scenario.ctx());
+    let (ask2_leftover_base, ask2_matched_quote, _) =
+        book.place_market_order_ask(ask2_payment, MAX_FILLS, 0, u64_max(), scenario.ctx());
     ask2_leftover_base.burn_for_testing();
-    assert!(ask2_matched_quote.burn_for_testing() == 4, 2);
-    ask2_ticket_opt.destroy_none();
+    assert!(ask2_matched_quote.burn_for_testing() == 6, 2);
 
-    assert!(book.bid_quote_escrow_at_price(price) == 22, 3); // 28 - 6
+    assert!(book.bid_quote_escrow_at_price(price) == 40, 3); // 50 - 10
 
-    // Cancel the remainder: must refund exactly 22 Quote escrow, PLUS the 20
+    // Cancel the remainder: must refund exactly 40 Quote escrow, PLUS the 20
     // Base (7 + 13) already pooled as proceeds from the two fills so far --
     // `cancel_order` pays out both the live escrow principal and any pooled
     // proceeds in one call (no maker fee configured on this book).
     scenario.next_tx(maker_a());
     let (cancel_base, cancel_quote) = book.cancel_order(bid_ticket, scenario.ctx());
     assert!(cancel_base.burn_for_testing() == 20, 4);
-    assert!(cancel_quote.burn_for_testing() == 22, 5);
+    assert!(cancel_quote.burn_for_testing() == 40, 5);
 
     unit_test::destroy(book);
     unit_test::destroy(cap);
     scenario.end();
 }
 
-/// Smoke test for the new `place_limit_order_bid_expected_output` entry
+/// Smoke test for the new `place_limit_order_bid` entry
 /// point: handing over a whole payment coin plus a desired Base output
 /// derives a price that never under-funds the resulting resting order.
 #[test]
-fun place_limit_order_bid_expected_output_smoke_test() {
+fun place_limit_order_bid_smoke_test() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let price = default_price();
@@ -224,7 +220,7 @@ fun place_limit_order_bid_expected_output_smoke_test() {
     let escrow_amount = book.bid_escrow_amount(price, size);
     let payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid_expected_output(payment, size, 20, scenario.ctx());
+        book.place_limit_order_bid(payment, size, 20, scenario.ctx());
     assert!(!stopped, 0);
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
@@ -235,17 +231,17 @@ fun place_limit_order_bid_expected_output_smoke_test() {
     scenario.end();
 }
 
-/// Smoke test for the new `place_limit_order_ask_expected_output` entry
+/// Smoke test for the new `place_limit_order_ask` entry
 /// point.
 #[test]
-fun place_limit_order_ask_expected_output_smoke_test() {
+fun place_limit_order_ask_smoke_test() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let size = default_size();
     let expected_quote_output = book.bid_escrow_amount(default_price(), size);
     let payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask_expected_output(payment, expected_quote_output, 20, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output, 20, scenario.ctx());
     assert!(!stopped, 0);
     leftover_base.burn_for_testing();
     matched_quote.burn_for_testing();

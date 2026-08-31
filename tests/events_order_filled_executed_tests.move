@@ -146,7 +146,7 @@ fun order_executed_fires_from_place_limit_order_bid_with_partial_rest() {
 
     let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OE_PRICE, OE_CROSS_SIZE), scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(OE_PRICE, OE_CROSS_SIZE, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, OE_CROSS_SIZE, 1_000_000_000, scenario.ctx());
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
@@ -179,8 +179,9 @@ fun order_executed_fires_from_place_limit_order_ask_with_partial_rest() {
     seed_resting_bid(&mut book, OE_PRICE, OE_REST_SIZE, scenario.ctx());
 
     let payment = coin::mint_for_testing<BTC>(OE_CROSS_SIZE, scenario.ctx());
+    let ask_expected_quote_output = book.bid_escrow_amount(OE_PRICE, OE_CROSS_SIZE);
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask(OE_PRICE, OE_CROSS_SIZE, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_ask(payment, ask_expected_quote_output, 1_000_000_000, scenario.ctx());
     leftover_base.burn_for_testing();
     matched_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
@@ -350,7 +351,7 @@ fun order_executed_entry_point_distinguishes_limit_bid_from_swap_bid_at_same_pri
     seed_resting_ask(&mut book, OE_PRICE, OE_SIZE, scenario.ctx());
     let payment_1 = coin::mint_for_testing<USDC>(book.bid_escrow_amount(OE_PRICE, OE_SIZE), scenario.ctx());
     let (ticket_opt_1, matched_base_1, leftover_quote_1, _stopped_1) =
-        book.place_limit_order_bid(OE_PRICE, OE_SIZE, payment_1, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment_1, OE_SIZE, 1_000_000_000, scenario.ctx());
     assert!(ticket_opt_1.is_none(), 0); // fully filled, nothing rests
     ticket_opt_1.destroy_none();
     matched_base_1.burn_for_testing();

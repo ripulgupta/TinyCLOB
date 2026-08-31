@@ -41,30 +41,49 @@ use sui::coin;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket};
 use tiny_clob::test_markers::{BTC, USDC};
-use tiny_clob::test_utils::{admin, maker_a, taker, realistic_decimals_book, destroy_book_and_cap, u64_max};
+use tiny_clob::test_utils::{Self, admin, maker_a, taker, realistic_decimals_book, destroy_book_and_cap, u64_max};
 
 // `realistic_decimals_book<BTC, USDC>(1, &mut scenario)` (base_decimals=8,
-// quote_decimals=6, precision=0, exponent=19) derives `price_scale == 184`
+// quote_decimals=6, precision=0, exponent=19) derives `price_scale == 100`
 // (see `full_lifecycle_tests.move`'s header comment for the full
-// derivation). `PRICE` is deliberately NOT a multiple of 184, so the floor
+// derivation). `PRICE` is deliberately NOT a multiple of 100, so the floor
 // term below performs genuine, nontrivial rounding on every fill instead of
 // dividing evenly.
-const PRICE: u64 = 184 * 497 + 1; // 91_449
+//
+// FRAGMENT SIZE (redesigned for the no-explicit-`price`-argument change):
+// `place_limit_order_ask` now derives its resting price from
+// `expected_quote_output`/`size`, and any legitimately-derivable nonzero
+// price satisfies `price * size >= price_scale` (`expected_quote_output >=
+// 1`). At this book's `price_scale == 100`, that means a resting ask can
+// never be constructed with a size smaller than 100 while still deriving
+// back exactly `PRICE` -- the ORIGINAL size-1-per-fragment fixture (`n`
+// separate 1-unit asks) is no longer constructible at all. `FRAGMENT_SIZE`
+// (101, not a multiple of `price_scale`, so each fragment's own fill still
+// genuinely floor-rounds) replaces the old implicit size-1 fragment, and
+// `TOTAL_SIZE` is `FRAGMENT_SIZE * FRAGMENT_COUNT` accordingly -- the
+// fragmentation story (`FRAGMENT_COUNT` separate maker-limited fills vs. one
+// consolidated fill) is otherwise unchanged, with every downstream quote
+// amount below recomputed for the new numbers.
+const PRICE: u64 = 100 * 497 + 1; // 49_701
+const FRAGMENT_SIZE: u64 = 101;
+const FRAGMENT_COUNT: u64 = 5;
+const TOTAL_SIZE: u64 = FRAGMENT_SIZE * FRAGMENT_COUNT; // 505
 const MAX_FILLS: u64 = 200;
 const BUDGET: u64 = 10_000_000;
 
-/// Places `n` separate 1-unit resting asks at `PRICE`, via `n` distinct
-/// `place_limit_order_ask` calls, returning their order tickets so the
-/// caller can clean them up. This is the "fragmented liquidity" fixture
-/// shared by both tests below: `n` maker orders of size 1 each, instead of
-/// one maker order of size `n`.
+/// Places `n` separate `FRAGMENT_SIZE`-unit resting asks at `PRICE`, via `n`
+/// distinct `place_limit_order_ask` calls, returning their order tickets so
+/// the caller can clean them up. This is the "fragmented liquidity" fixture
+/// shared by both tests below: `n` maker orders of size `FRAGMENT_SIZE`
+/// each, instead of one maker order of size `n * FRAGMENT_SIZE`.
 fun rest_n_fragmented_asks(book: &mut OrderBook<BTC, USDC>, n: u64, ctx: &mut TxContext): vector<OrderTicket> {
     let mut tickets = vector[];
     let mut i = 0;
     while (i < n) {
-        let payment = coin::mint_for_testing<BTC>(1, ctx);
+        let payment = coin::mint_for_testing<BTC>(FRAGMENT_SIZE, ctx);
+        let expected_quote_output = test_utils::ask_expected_output_for_price(book, PRICE, FRAGMENT_SIZE);
         let (ticket_opt, leftover_base, matched_quote, _stopped) =
-            book.place_limit_order_ask(PRICE, 1, payment, MAX_FILLS, ctx);
+            book.place_limit_order_ask(payment, expected_quote_output, MAX_FILLS, ctx);
         leftover_base.burn_for_testing();
         matched_quote.burn_for_testing();
         tickets.push_back(ticket_opt.destroy_some());
@@ -73,19 +92,21 @@ fun rest_n_fragmented_asks(book: &mut OrderBook<BTC, USDC>, n: u64, ctx: &mut Tx
     tickets
 }
 
-/// Former finding L-A, now fixed: buying the same 100 Base total costs a
-/// taker the SAME Quote whether the resting liquidity is one consolidated
-/// 100-unit ask or 100 separate fragmented 1-unit asks, because every fill
-/// below is maker-limited (fully drains its resting order) and
-/// maker-limited fills now floor instead of ceiling.
+/// Former finding L-A, now fixed: buying the same `TOTAL_SIZE` (505) Base
+/// total costs a taker the SAME Quote whether the resting liquidity is one
+/// consolidated 505-unit ask or `FRAGMENT_COUNT` (5) separate fragmented
+/// `FRAGMENT_SIZE`-unit (101) asks, because every fill below is
+/// maker-limited (fully drains its resting order) and maker-limited fills
+/// now floor instead of ceiling.
 ///
-/// Case A (one consolidated ask of size 100, a single maker-limited fill):
-///   quote_cost = max(floor(91_449 * 100 / 184), 1) = floor(9_144_900 / 184)
-///              = floor(49_700.543...) = 49_700
+/// Case A (one consolidated ask of size 505, a single maker-limited fill):
+///   quote_cost = max(floor(49_701 * 505 / 100), 1) = floor(25_099_005 / 100)
+///              = floor(250_990.05) = 250_990
 ///
-/// Case B (100 separate asks of size 1 each, 100 maker-limited fills):
-///   per-fill cost = max(floor(91_449 * 1 / 184), 1) = floor(497.005...) = 497
-///   total across 100 fills = 100 * 497 = 49_700
+/// Case B (5 separate asks of size 101 each, 5 maker-limited fills):
+///   per-fill cost = max(floor(49_701 * 101 / 100), 1) = floor(50_198.01)
+///                 = 50_198
+///   total across 5 fills = 5 * 50_198 = 250_990
 ///
 /// Identical Base delivered, identical Quote paid: fragmenting the maker's
 /// liquidity no longer costs the taker anything extra.
@@ -93,45 +114,47 @@ fun rest_n_fragmented_asks(book: &mut OrderBook<BTC, USDC>, n: u64, ctx: &mut Tx
 fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask() {
     let mut scenario = ts::begin(admin());
 
-    // Case A: one consolidated 100-unit ask.
+    // Case A: one consolidated 505-unit ask.
     let (mut book_a, cap_a) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     scenario.next_tx(maker_a());
-    let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
+    let ask_payment = coin::mint_for_testing<BTC>(TOTAL_SIZE, scenario.ctx());
+    let ask_expected_quote_output = test_utils::ask_expected_output_for_price(&book_a, PRICE, TOTAL_SIZE);
     let (ask_ticket_opt, ask_leftover_base, ask_matched_quote, _) =
-        book_a.place_limit_order_ask(PRICE, 100, ask_payment, MAX_FILLS, scenario.ctx());
+        book_a.place_limit_order_ask(ask_payment, ask_expected_quote_output, MAX_FILLS, scenario.ctx());
     ask_leftover_base.burn_for_testing();
     ask_matched_quote.burn_for_testing();
     let ask_ticket = ask_ticket_opt.destroy_some();
 
     scenario.next_tx(taker());
     let bid_payment_a = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_a, leftover_quote_a, stopped_a) = book_a.place_market_order_bid(bid_payment_a, MAX_FILLS, 0, 100, u64_max(), scenario.ctx(),
+    let (matched_base_a, leftover_quote_a, stopped_a) = book_a.place_market_order_bid(bid_payment_a, MAX_FILLS, 0, TOTAL_SIZE, u64_max(), scenario.ctx(),
     );
     assert!(!stopped_a, 0);
     let base_received_a = matched_base_a.burn_for_testing();
     let leftover_a = leftover_quote_a.burn_for_testing();
     let quote_spent_a = BUDGET - leftover_a;
-    assert!(base_received_a == 100, 1);
-    assert!(quote_spent_a == 49_700, 2);
+    assert!(base_received_a == TOTAL_SIZE, 1);
+    assert!(quote_spent_a == 250_990, 2);
 
     ask_ticket.destroy_ticket_unconditionally();
     destroy_book_and_cap(book_a, cap_a);
 
-    // Case B: 100 separate 1-unit asks at the identical price, fresh book.
+    // Case B: `FRAGMENT_COUNT` separate `FRAGMENT_SIZE`-unit asks at the
+    // identical price, fresh book.
     let (mut book_b, cap_b) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     scenario.next_tx(maker_a());
-    let mut ask_tickets_b = rest_n_fragmented_asks(&mut book_b, 100, scenario.ctx());
+    let mut ask_tickets_b = rest_n_fragmented_asks(&mut book_b, FRAGMENT_COUNT, scenario.ctx());
 
     scenario.next_tx(taker());
     let bid_payment_b = coin::mint_for_testing<USDC>(BUDGET, scenario.ctx());
-    let (matched_base_b, leftover_quote_b, stopped_b) = book_b.place_market_order_bid(bid_payment_b, MAX_FILLS, 0, 100, u64_max(), scenario.ctx(),
+    let (matched_base_b, leftover_quote_b, stopped_b) = book_b.place_market_order_bid(bid_payment_b, MAX_FILLS, 0, TOTAL_SIZE, u64_max(), scenario.ctx(),
     );
     assert!(!stopped_b, 3);
     let base_received_b = matched_base_b.burn_for_testing();
     let leftover_b = leftover_quote_b.burn_for_testing();
     let quote_spent_b = BUDGET - leftover_b;
-    assert!(base_received_b == 100, 4); // identical Base delivered to case A
-    assert!(quote_spent_b == 49_700, 5);
+    assert!(base_received_b == TOTAL_SIZE, 4); // identical Base delivered to case A
+    assert!(quote_spent_b == 250_990, 5);
 
     // The core of the fix: identical Base delivered, identical Quote paid,
     // regardless of how the maker's liquidity was fragmented.
@@ -153,38 +176,38 @@ fun fragmenting_asks_no_longer_costs_taker_more_quote_than_one_consolidated_ask(
 /// (all floor-rounded) never exceeds the single ceiling-rounded escrow
 /// figure.
 ///
-/// `escrow = bid_escrow_amount(book, PRICE, 100) = ceil(91_449 * 100 / 184)
-/// = 49_701` (unchanged formula/value -- `bid_escrow_amount` itself was not
-/// changed by this fix, only how fills consume it).
+/// `escrow = bid_escrow_amount(book, PRICE, TOTAL_SIZE) = ceil(49_701 * 505 /
+/// 100) = 250_991` (unchanged formula/value -- `bid_escrow_amount` itself
+/// was not changed by this fix, only how fills consume it).
 ///
-/// Against 100 separate 1-unit resting asks, each fill is maker-limited and
-/// now costs `max(floor(91_449 / 184), 1) = 497` (vs. the old ceiling-based
-/// 498). Cumulative cost after all 100 fills is `497 * 100 = 49_700 <=
-/// 49_701`, so all 100 units fill, leaving exactly `49_701 - 49_700 = 1`
-/// Quote atom of escrow leftover -- unlike before the fix, where the same
-/// escrow could only back 99 of the 100 requested units.
+/// Against `FRAGMENT_COUNT` (5) separate `FRAGMENT_SIZE`-unit (101) resting
+/// asks, each fill is maker-limited and now costs `max(floor(49_701 * 101 /
+/// 100), 1) = 50_198`. Cumulative cost after all 5 fills is `50_198 * 5 =
+/// 250_990 <= 250_991`, so all 505 units fill, leaving exactly `250_991 -
+/// 250_990 = 1` Quote atom of escrow leftover -- unlike before the fix,
+/// where the same escrow could underfill the requested size.
 #[test]
 fun limit_bid_no_longer_underfills_against_fragmented_book_with_exact_escrow() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
 
     scenario.next_tx(maker_a());
-    let mut ask_tickets = rest_n_fragmented_asks(&mut book, 100, scenario.ctx());
+    let mut ask_tickets = rest_n_fragmented_asks(&mut book, FRAGMENT_COUNT, scenario.ctx());
 
     scenario.next_tx(taker());
-    let escrow = book.bid_escrow_amount(PRICE, 100);
-    assert!(escrow == 49_701, 0);
+    let escrow = book.bid_escrow_amount(PRICE, TOTAL_SIZE);
+    assert!(escrow == 250_991, 0);
 
     let payment = coin::mint_for_testing<USDC>(escrow, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(PRICE, 100, payment, MAX_FILLS, scenario.ctx());
+        book.place_limit_order_bid(payment, TOTAL_SIZE, MAX_FILLS, scenario.ctx());
     assert!(!stopped, 1);
 
     let base_received = matched_base.burn_for_testing();
-    assert!(base_received == 100, 2); // now fills completely, unlike before the fix
+    assert!(base_received == TOTAL_SIZE, 2); // now fills completely, unlike before the fix
 
     let leftover = leftover_quote.burn_for_testing();
-    assert!(leftover == 1, 3); // 49_701 - (497 * 100) = 1 atom of dust, nothing stranded
+    assert!(leftover == 1, 3); // 250_991 - (50_198 * 5) = 1 atom of dust, nothing stranded
 
     // Fully filled, so no resting remainder -- the order never rests.
     if (ticket_opt.is_some()) {

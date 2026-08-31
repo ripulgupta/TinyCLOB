@@ -6,14 +6,21 @@
 /// so between them they also cover genuinely different `price_scale`/
 /// decimals combinations under one continuous story:
 ///   - `full_lifecycle_realistic_btc_usdc_decimals`: a BTC(8 decimals)/
-///     USDC(6 decimals)-realistic book (`price_scale` = 184), with a
+///     USDC(6 decimals)-realistic book (`price_scale` = 100), with a
 ///     taker/maker fee change mid-lifecycle to prove the already-resting
 ///     order's snapshotted maker fee doesn't retroactively change.
 ///   - `full_lifecycle_wal_sui_distinct_price_scale_shape`: a same-decimals
 ///     WAL/SUI (9/9 decimals) book with a deliberately different
-///     precision/exponent shape (`price_scale` = 1844), fee-free throughout,
-///     which instead proves that a force-drained resting order still pays
-///     out to a REASSIGNED owner rather than its original one.
+///     precision/exponent shape. `price_scale` is derived from
+///     `ceil(10^base_decimals * 10^precision / 10^quote_decimals)` (see
+///     `new_impl`'s doc comment), which doesn't depend on `exponent` at
+///     all -- so despite the different precision/exponent shape here, this
+///     book's `price_scale` (100) happens to coincide with the BTC/USDC
+///     book's above; the two books are still genuinely different
+///     decimals/precision/exponent combinations, exercised for their own
+///     sake, and this test instead proves that a force-drained resting
+///     order still pays out to a REASSIGNED owner rather than its original
+///     one.
 ///
 /// Every expected value below is derived by hand from the module's
 /// documented formulas (`bid_escrow_amount`/`scaled_ceil_mul_div` =
@@ -39,35 +46,41 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     let mut scenario = ts::begin(admin());
 
     // base_decimals=8, quote_decimals=6, precision=0, exponent=19:
-    // scale_hi = floor(u64::MAX * 10^8 / (10^6 * 10^19)) = floor(u64::MAX / 10^17)
-    //          = floor(18_446_744_073_709_551_615 / 100_000_000_000_000_000) = 184.
-    // scale_lo = ceil(10^0) = 1 <= 184, feasible -> price_scale = 184.
+    // scale_lo = ceil(10^8 * 10^0 / 10^6) = ceil(100) = 100 -- the smallest
+    // value guaranteeing resolution at least as fine as 10^0 (precision=0).
+    // (scale_hi = floor(u64::MAX * 10^8 / (10^6 * 10^19)) = 184, comfortably
+    // above scale_lo, so the feasibility check passes -> price_scale = 100.)
     // (see test_utils::realistic_decimals_book, shared with fee_redesign_tests.move)
     let (mut book, cap) = realistic_decimals_book<BTC, USDC>(37, &mut scenario);
-    assert!(book.price_scale() == 184, 0);
+    assert!(book.price_scale() == 100, 0);
 
     // --- Two makers rest on opposite sides, at different prices. Every
-    // --- price below is `184 * k` so every escrow/quote-cost divides out
+    // --- price below is `100 * k` so every escrow/quote-cost divides out
     // --- exactly; sizes are arbitrary-looking, non-round numbers.
-    let ask1_price = 184 * 623; // = 114_632
+    let ask1_price = 100 * 623; // = 62_300
     let ask1_size = 269;
     scenario.next_tx(maker_a());
     let ask1_payment = coin::mint_for_testing<BTC>(ask1_size, scenario.ctx());
+    // `ask1_price` is an exact multiple of `price_scale`, so
+    // `bid_escrow_amount` -- the exact fair quote yield at this price -- is
+    // also the `expected_quote_output` that derives this same price back
+    // exactly (no rounding involved either way).
+    let ask1_expected_quote_output = book.bid_escrow_amount(ask1_price, ask1_size);
     let (ask1_ticket_opt, ask1_leftover, ask1_matched, _) =
-        book.place_limit_order_ask(ask1_price, ask1_size, ask1_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(ask1_payment, ask1_expected_quote_output, 10, scenario.ctx());
     assert!(ask1_leftover.burn_for_testing() == 0, 1);
     assert!(ask1_matched.burn_for_testing() == 0, 2);
     let ask1_ticket = ask1_ticket_opt.destroy_some();
     let ask1_order_id = ask1_ticket.ticket_order_id();
 
-    let bid1_price = 184 * 601; // = 110_584
+    let bid1_price = 100 * 601; // = 60_100
     let bid1_size = 401;
     scenario.next_tx(maker_b());
     let bid1_escrow = book.bid_escrow_amount(bid1_price, bid1_size);
     assert!(bid1_escrow == 601 * 401, 3); // = 241_001, exact
     let bid1_payment = coin::mint_for_testing<USDC>(bid1_escrow, scenario.ctx());
     let (bid1_ticket_opt, bid1_matched, bid1_leftover, _) =
-        book.place_limit_order_bid(bid1_price, bid1_size, bid1_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid1_payment, bid1_size, 10, scenario.ctx());
     assert!(bid1_matched.burn_for_testing() == 0, 4);
     assert!(bid1_leftover.burn_for_testing() == 0, 5);
     let bid1_ticket = bid1_ticket_opt.destroy_some();
@@ -75,14 +88,14 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
 
     // A third maker rests a bid below the other two, at a still-lower
     // price, and is left untouched until the retire/drain finale.
-    let bid2_price = 184 * 550; // = 101_200
+    let bid2_price = 100 * 550; // = 55_000
     let bid2_size = 331;
     scenario.next_tx(maker_c());
     let bid2_escrow = book.bid_escrow_amount(bid2_price, bid2_size);
     assert!(bid2_escrow == 550 * 331, 6); // = 182_050, exact
     let bid2_payment = coin::mint_for_testing<USDC>(bid2_escrow, scenario.ctx());
     let (bid2_ticket_opt, bid2_matched, bid2_leftover, _) =
-        book.place_limit_order_bid(bid2_price, bid2_size, bid2_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid2_payment, bid2_size, 10, scenario.ctx());
     assert!(bid2_matched.burn_for_testing() == 0, 7);
     assert!(bid2_leftover.burn_for_testing() == 0, 8);
     let bid2_ticket = bid2_ticket_opt.destroy_some();
@@ -94,7 +107,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(cross1_budget == 623 * 113, 9); // = 70_399, exact
     let cross1_payment = coin::mint_for_testing<USDC>(cross1_budget, scenario.ctx());
     let (cross1_ticket_opt, cross1_matched, cross1_leftover, cross1_stopped) =
-        book.place_limit_order_bid(ask1_price, cross1_size, cross1_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(cross1_payment, cross1_size, 10, scenario.ctx());
     assert!(!cross1_stopped, 10);
     assert!(cross1_matched.burn_for_testing() == cross1_size, 11); // fee 0
     assert!(cross1_leftover.burn_for_testing() == 0, 12);
@@ -155,16 +168,16 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
 
     // --- A fresh bid from maker_a(), rested AFTER the fee change, so its ---
     // --- maker_fee_bps snapshot is the NEW rate (3), not 0.             ---
-    let bid3_price = 184 * 610; // = 112_240 (above bid2's 101_200, so it -- not
+    let bid3_price = 100 * 610; // = 61_000 (above bid2's 55_000, so it -- not
     // bid2 -- is top-of-book and gets crossed first below; below ask1's
-    // remaining 114_632 so it rests without auto-crossing that)
+    // remaining 62_300 so it rests without auto-crossing that)
     let bid3_size = 68;
     scenario.next_tx(maker_a());
     let bid3_escrow = book.bid_escrow_amount(bid3_price, bid3_size);
     assert!(bid3_escrow == 610 * 68, 25); // = 41_480, exact
     let bid3_payment = coin::mint_for_testing<USDC>(bid3_escrow, scenario.ctx());
     let (bid3_ticket_opt, bid3_matched, bid3_leftover, _) =
-        book.place_limit_order_bid(bid3_price, bid3_size, bid3_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid3_payment, bid3_size, 10, scenario.ctx());
     assert!(bid3_matched.burn_for_testing() == 0, 26);
     assert!(bid3_leftover.burn_for_testing() == 0, 27);
     let bid3_ticket = bid3_ticket_opt.destroy_some();
@@ -175,8 +188,10 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     scenario.next_tx(taker());
     let cross4_size = 68;
     let cross4_payment = coin::mint_for_testing<BTC>(cross4_size, scenario.ctx());
+    // Same exact-multiple-of-`price_scale` reasoning as `ask1` above.
+    let cross4_expected_quote_output = book.bid_escrow_amount(bid3_price, cross4_size);
     let (cross4_ticket_opt, cross4_leftover, cross4_matched, cross4_stopped) =
-        book.place_limit_order_ask(bid3_price, cross4_size, cross4_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(cross4_payment, cross4_expected_quote_output, 10, scenario.ctx());
     assert!(!cross4_stopped, 28);
     assert!(cross4_ticket_opt.is_none(), 29);
     cross4_ticket_opt.destroy_none();
@@ -256,35 +271,39 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
 
     // base_decimals=9, quote_decimals=9 (same-decimals, unlike the BTC/USDC
     // book above), precision=2, exponent=16:
-    // scale_hi = floor(u64::MAX * 10^9 / (10^9 * 10^16)) = floor(u64::MAX / 10^16)
-    //          = floor(18_446_744_073_709_551_615 / 10_000_000_000_000_000) = 1_844.
-    // scale_lo = ceil(10^2) = 100 <= 1_844, feasible -> price_scale = 1_844
-    // -- a deliberately different precision/exponent shape (and price_scale
-    // magnitude) than the BTC/USDC book above, not just a different pair.
-    let (mut book, cap) = tiny_clob::new<WAL, SUI>(41, 9, 9, 2, 16, 1_844 * 211, scenario.ctx());
-    assert!(book.price_scale() == 1_844, 0);
+    // scale_lo = ceil(10^9 * 10^2 / 10^9) = 100 -- the smallest value
+    // guaranteeing resolution at least as fine as 10^-2, and (since
+    // `scale_lo` doesn't depend on `exponent` at all) numerically the same
+    // as the BTC/USDC book's `price_scale` above despite the different
+    // decimals/precision/exponent shape.
+    // (scale_hi = floor(u64::MAX * 10^9 / (10^9 * 10^16)) = 1_844,
+    // comfortably above scale_lo, so the feasibility check passes ->
+    // price_scale = 100.)
+    let (mut book, cap) = tiny_clob::new<WAL, SUI>(41, 9, 9, 2, 16, 100 * 211, scenario.ctx());
+    assert!(book.price_scale() == 100, 0);
 
     // No fee changes in this scenario -- taker/maker fees stay 0 throughout,
     // so every quote amount below is exact with no fee arithmetic to track.
-    let ask_price = 1_844 * 307; // = 566_108
+    let ask_price = 100 * 307; // = 30_700
     let ask_size = 173;
     scenario.next_tx(maker_b());
     let ask_payment = coin::mint_for_testing<WAL>(ask_size, scenario.ctx());
+    let ask_expected_quote_output = book.bid_escrow_amount(ask_price, ask_size);
     let (ask_ticket_opt, ask_leftover, ask_matched, _) =
-        book.place_limit_order_ask(ask_price, ask_size, ask_payment, 10, scenario.ctx());
+        book.place_limit_order_ask(ask_payment, ask_expected_quote_output, 10, scenario.ctx());
     assert!(ask_leftover.burn_for_testing() == 0, 1);
     assert!(ask_matched.burn_for_testing() == 0, 2);
     let ask_ticket = ask_ticket_opt.destroy_some();
     let ask_order_id = ask_ticket.ticket_order_id();
 
-    let bid_price = 1_844 * 289; // = 532_916
+    let bid_price = 100 * 289; // = 28_900
     let bid_size = 97;
     scenario.next_tx(maker_c());
     let bid_escrow = book.bid_escrow_amount(bid_price, bid_size);
     assert!(bid_escrow == 289 * 97, 3); // = 28_033, exact
     let bid_payment = coin::mint_for_testing<SUI>(bid_escrow, scenario.ctx());
     let (bid_ticket_opt, bid_matched, bid_leftover, _) =
-        book.place_limit_order_bid(bid_price, bid_size, bid_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(bid_payment, bid_size, 10, scenario.ctx());
     assert!(bid_matched.burn_for_testing() == 0, 4);
     assert!(bid_leftover.burn_for_testing() == 0, 5);
     let bid_ticket = bid_ticket_opt.destroy_some();
@@ -296,7 +315,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     assert!(cross1_budget == 307 * 59, 6); // = 18_113, exact
     let cross1_payment = coin::mint_for_testing<SUI>(cross1_budget, scenario.ctx());
     let (cross1_ticket_opt, cross1_matched, cross1_leftover, _) =
-        book.place_limit_order_bid(ask_price, cross1_size, cross1_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(cross1_payment, cross1_size, 10, scenario.ctx());
     assert!(cross1_matched.burn_for_testing() == cross1_size, 7);
     assert!(cross1_leftover.burn_for_testing() == 0, 8);
     assert!(cross1_ticket_opt.is_none(), 9);

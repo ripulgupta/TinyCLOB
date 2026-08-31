@@ -52,7 +52,7 @@ fun generate_one_fee_bearing_fill(
     let quote_cost = book.bid_escrow_amount(FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE);
     let payment = coin::mint_for_testing<USDC>(quote_cost, scenario.ctx());
     let (bid_ticket_opt, matched_base, leftover_quote, _) =
-        book.place_limit_order_bid(FINALIZE_FEES_PRICE, FINALIZE_FEES_SIZE, payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, FINALIZE_FEES_SIZE, 1_000_000_000, scenario.ctx());
     bid_ticket_opt.destroy_none();
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();

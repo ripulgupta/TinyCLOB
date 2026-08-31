@@ -30,13 +30,13 @@ use tiny_clob::test_utils::{
 const FEE_TEST_TAKER_FEE_BPS: u64 = 7;
 const FEE_TEST_MAKER_FEE_BPS: u64 = 3;
 // A realistic BTC(8 decimals)/USDC(6 decimals) book (`realistic_decimals_book`)
-// derives `price_scale == 184` (see `full_lifecycle_tests.move`'s header
+// derives `price_scale == 100` (see `full_lifecycle_tests.move`'s header
 // comment for the full derivation). `FEE_TEST_PRICE` is deliberately NOT a
-// multiple of 184, so `quote_cost = bid_escrow_amount(book, price, size) =
-// ceil(price * size / 184)` requires genuine ceiling rounding -- unlike the
+// multiple of 100, so `quote_cost = bid_escrow_amount(book, price, size) =
+// ceil(price * size / 100)` requires genuine ceiling rounding -- unlike the
 // `new_book()` fixture (`price_scale == 1`), where `quote_cost == price *
 // size` exactly and rounding never actually happens.
-const FEE_TEST_PRICE: u64 = 1_000;
+const FEE_TEST_PRICE: u64 = 1_037;
 const FEE_TEST_RESTING_SIZE: u64 = 500;
 const FEE_TEST_TAKER_SIZE: u64 = 337;
 const FEE_TEST_MAX_FILLS: u64 = 1_000_000_000;
@@ -86,12 +86,12 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     book.insert_resting_order_for_testing(false, FEE_TEST_PRICE, ask, scenario.ctx());
 
     // Taker fully filled by the larger resting ask, so fill_qty ==
-    // FEE_TEST_TAKER_SIZE. On this book, `price_scale == 184` and
-    // `FEE_TEST_PRICE = 1_000` is deliberately not a multiple of it, so
+    // FEE_TEST_TAKER_SIZE. On this book, `price_scale == 100` and
+    // `FEE_TEST_PRICE = 1_037` is deliberately not a multiple of it, so
     // `quote_cost` itself requires genuine ceiling rounding (unlike
     // `new_book()`, where `quote_cost == price * fill_qty` exactly):
-    //   quote_cost = ceil(price * fill_qty / 184) = ceil(1_000 * 337 / 184)
-    //              = ceil(1_831.52...) = 1_832
+    //   quote_cost = ceil(price * fill_qty / 100) = ceil(1_037 * 337 / 100)
+    //              = ceil(3_494.69) = 3_495
     //   taker_fee_base = ceil(fill_qty * taker_bps / 10_000)
     //                  = ceil(337 * 7 / 10_000) = ceil(0.2359) = 1
     //   matched_base   = fill_qty - taker_fee_base = 337 - 1 = 336
@@ -108,7 +108,7 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     // `resting_maker_order_defers_fee_until_conclusion` below for that
     // transfer actually happening.
     let expected_quote_cost = book.bid_escrow_amount(FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE);
-    assert!(expected_quote_cost == 1_832, 100);
+    assert!(expected_quote_cost == 3_495, 100);
     let expected_taker_fee_base = 1;
     let expected_matched_base = FEE_TEST_TAKER_SIZE - expected_taker_fee_base;
 
@@ -157,14 +157,14 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // and `fill_level_ask`'s own comment in `tiny_clob.move`), this is the
     // order's FIRST fill (`cumulative_before = 0`), so the general formula
     // collapses to a plain single-fill ceiling:
-    //   total_reserved = bid_escrow_amount(book, 1_000, 500)
-    //                   = ceil(500_000 / 184) = 2_718
+    //   total_reserved = bid_escrow_amount(book, 1_037, 500)
+    //                   = ceil(518_500 / 100) = 5_185
     //   target_charge  = ceil(total_reserved * fill_qty / original_size)
-    //                   = ceil(2_718 * 337 / 500) = ceil(1_831.932) = 1_832
-    //   quote_cost     = target_charge - already_charged (0) = 1_832
+    //                   = ceil(5_185 * 337 / 500) = ceil(3_494.69) = 3_495
+    //   quote_cost     = target_charge - already_charged (0) = 3_495
     //   taker_fee_quote = ceil(quote_cost * taker_bps / 10_000)
-    //                   = ceil(1_832 * 7 / 10_000) = ceil(1.2824) = 2
-    //   matched_quote   = quote_cost - taker_fee_quote = 1_832 - 2 = 1_830
+    //                   = ceil(3_495 * 7 / 10_000) = ceil(2.4465) = 3
+    //   matched_quote   = quote_cost - taker_fee_quote = 3_495 - 3 = 3_492
     //   maker_fee_base = ceil(fill_qty * maker_bps / 10_000)
     //                  = ceil(337 * 3 / 10_000) = ceil(0.1011) = 1
     //   remaining_escrow = escrow_base - fill_qty = 0 (exact full fill)
@@ -173,13 +173,13 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
     // aside in the resting bid's `fee_reserve_base` -- it never concludes
     // here (500 > 337), so it's never actually collected.
     //
-    // `expected_quote_cost` (1_832) now EQUALS `bid_escrow_amount`'s own
+    // `expected_quote_cost` (3_495) now EQUALS `bid_escrow_amount`'s own
     // ceiling formula for this single, first fill -- unlike the OLD
-    // production scheme's clamped-floor value (1_831, a verified
-    // under-collection relative to the fair isolated-ceil value the review
-    // confirmed this new scheme now delivers instead).
-    let expected_quote_cost = 1_832;
-    let expected_taker_fee_quote = 2;
+    // production scheme's clamped-floor value (a verified under-collection
+    // relative to the fair isolated-ceil value the review confirmed this new
+    // scheme now delivers instead).
+    let expected_quote_cost = 3_495;
+    let expected_taker_fee_quote = 3;
     let expected_matched_quote = expected_quote_cost - expected_taker_fee_quote;
 
     let payment = coin::mint_for_testing<BTC>(FEE_TEST_TAKER_SIZE, scenario.ctx());

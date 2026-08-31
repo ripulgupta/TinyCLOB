@@ -25,7 +25,7 @@ fun place_limit_order_bid_rests_and_emits_orderplaced() {
     let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
     let payment = coin::mint_for_testing<USDC>(escrow_amount, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
-        book.place_limit_order_bid(default_price(), default_size(), payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_bid(payment, default_size(), 1_000_000_000, scenario.ctx());
 
     assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == 0, 1);
@@ -60,8 +60,9 @@ fun place_limit_order_ask_rests_and_emits_orderplaced() {
     let book_id = book.id_for_testing();
 
     let payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
+    let expected_quote_output = book.bid_escrow_amount(default_price(), default_size());
     let (ticket_opt, leftover_base, matched_quote, stopped) =
-        book.place_limit_order_ask(default_price(), default_size(), payment, 1_000_000_000, scenario.ctx());
+        book.place_limit_order_ask(payment, expected_quote_output, 1_000_000_000, scenario.ctx());
 
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1);

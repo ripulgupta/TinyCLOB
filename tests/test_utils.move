@@ -47,18 +47,18 @@ public(package) fun default_price(): u64 { DEFAULT_PRICE }
 public(package) fun default_size(): u64 { DEFAULT_SIZE }
 
 /// A realistic BTC(8 decimals)/USDC(6 decimals)-shaped book (`price_scale =
-/// 184`; see `full_lifecycle_tests.move`'s header comment for the full
+/// 100`; see `full_lifecycle_tests.move`'s header comment for the full
 /// derivation), generalized over `Base`/`Quote` so any pair sharing this
 /// decimals/precision/exponent shape can reuse it, instead of each test
 /// duplicating the inline `tiny_clob::new` call and its derivation comment.
 /// Unlike `new_book` (`price_scale == 1`, no rounding to account for), this
 /// book requires genuine ceiling rounding in `bid_escrow_amount`/
-/// `scaled_ceil_mul_div` for any price that isn't an exact multiple of 184.
+/// `scaled_ceil_mul_div` for any price that isn't an exact multiple of 100.
 public(package) fun realistic_decimals_book<Base, Quote>(
     min_size: u64,
     scenario: &mut ts::Scenario,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
-    tiny_clob::new<Base, Quote>(min_size, 8, 6, 0, 19, 184 * 497, scenario.ctx())
+    tiny_clob::new<Base, Quote>(min_size, 8, 6, 0, 19, 100 * 497, scenario.ctx())
 }
 
 public(package) fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
@@ -68,6 +68,82 @@ public(package) fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>
 public(package) fun destroy_book_and_cap(book: OrderBook<BTC, USDC>, cap: ClobAdminCap) {
     unit_test::destroy(book);
     unit_test::destroy(cap);
+}
+
+/// `place_limit_order_bid` no longer takes an explicit `price` — it derives
+/// `price = floor(payment.value() * price_scale / expected_base_output)`
+/// internally. This helper inverts that: given the `price`/`size` a test
+/// wants a resting bid to end up at, it returns the `payment` value that,
+/// passed alongside `expected_base_output = size`, makes the new function
+/// derive back exactly `price`.
+///
+/// The natural candidate is `bid_escrow_amount(price, size) ==
+/// ceil(price * size / price_scale)` (the same minimal escrow the old
+/// explicit-price call used to require) -- but `floor(escrow * price_scale /
+/// size)` does not always equal `price` back: it depends on the relative
+/// magnitude of `size` vs `price_scale` (see the module-level doc comment on
+/// `place_limit_order_bid` for the identity this relies on). Since `escrow`
+/// is the *smallest* payment satisfying the lower bound the new function's
+/// derivation needs, if it doesn't round-trip back to `price`, no larger
+/// payment can either (a larger payment only derives a `price` >= this one).
+/// Aborts if no such payment exists for this exact `(price, size)` pair --
+/// callers hitting this need a different `(price, size)` combination, since
+/// this exact one is no longer constructible without picking raw `price`
+/// directly, which is exactly what this redesign disallows.
+public(package) fun bid_payment_for_price<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    price: u64,
+    size: u64,
+): u64 {
+    let price_scale = book.price_scale();
+    let payment = book.bid_escrow_amount(price, size);
+    let derived_price = ((payment as u128) * (price_scale as u128)) / (size as u128);
+    assert!(derived_price == (price as u128), 0);
+    payment
+}
+
+/// Mirrors `bid_payment_for_price` for the ask side: `place_limit_order_ask`
+/// derives `price = ceil(expected_quote_output * price_scale / size)` where
+/// `size = payment.value()`. This returns the `expected_quote_output` that
+/// makes that derivation land back on exactly `price` for a payment of value
+/// `size`.
+///
+/// NOTE: unlike the bid side, the natural first guess of `expected_quote_output
+/// == ceil(price * size / price_scale)` (the same shape as
+/// `bid_escrow_amount`) does NOT generally round-trip back to `price` here --
+/// verified false in general (e.g. `price = 5, size = 3, price_scale = 10`
+/// derives back `7`, not `5`). The correct candidate is instead the
+/// *largest* `expected_quote_output` for which the derivation is still
+/// `<= price`, namely `floor(price * size / price_scale)`: this is checked
+/// against the ceiling formula's exact bounds
+/// (`(price - 1) * size < expected_quote_output * price_scale <= price *
+/// size`) before being returned. Aborts if no `expected_quote_output` exists
+/// that reproduces `price` exactly for this `(price, size)` pair -- same
+/// caveat as `bid_payment_for_price`.
+public(package) fun ask_expected_output_for_price<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    price: u64,
+    size: u64,
+): u64 {
+    // `price == 0` is a trivial, always-reproducible special case
+    // (`expected_quote_output == 0` derives `ceil(0 * price_scale / size) ==
+    // 0` exactly) -- handled separately to avoid an underflow on `price - 1`
+    // below, since callers legitimately use this to construct the
+    // `EZeroPrice`-abort fixture.
+    if (price == 0) { return 0 };
+    let price_scale = book.price_scale();
+    let price_u128 = price as u128;
+    let size_u128 = size as u128;
+    let price_scale_u128 = price_scale as u128;
+    let expected_quote_output = (price_u128 * size_u128) / price_scale_u128;
+    // Must satisfy (price - 1) * size < expected_quote_output * price_scale
+    // <= price * size -- the exact bounds `ceil` needs to land back on `price`.
+    assert!(expected_quote_output * price_scale_u128 <= price_u128 * size_u128, 1);
+    assert!(
+        expected_quote_output * price_scale_u128 > (price_u128 - 1) * size_u128,
+        2,
+    );
+    expected_quote_output as u64
 }
 
 /// Rests a bid via `place_limit_order_bid`, discarding the matched/leftover
@@ -80,9 +156,9 @@ public(package) fun rest_bid(
     max_fills: u64,
     ctx: &mut TxContext,
 ): OrderTicket {
-    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(price, size), ctx);
+    let payment = coin::mint_for_testing<USDC>(bid_payment_for_price(book, price, size), ctx);
     let (ticket_opt, matched_base, leftover_quote, _) =
-        book.place_limit_order_bid(price, size, payment, max_fills, ctx);
+        book.place_limit_order_bid(payment, size, max_fills, ctx);
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     ticket_opt.destroy_some()
@@ -96,9 +172,10 @@ public(package) fun rest_ask(
     max_fills: u64,
     ctx: &mut TxContext,
 ): OrderTicket {
+    let expected_quote_output = ask_expected_output_for_price(book, price, size);
     let payment = coin::mint_for_testing<BTC>(size, ctx);
     let (ticket_opt, leftover_base, matched_quote, _) =
-        book.place_limit_order_ask(price, size, payment, max_fills, ctx);
+        book.place_limit_order_ask(payment, expected_quote_output, max_fills, ctx);
     leftover_base.burn_for_testing();
     matched_quote.burn_for_testing();
     ticket_opt.destroy_some()
@@ -107,8 +184,10 @@ public(package) fun rest_ask(
 // === Regression: resting-remainder escrow rounding shortfall fixture ===
 //
 // Book: base_decimals=0, quote_decimals=0, precision=1, exponent=18 =>
-// price_scale = floor(u64::MAX / 10^18) = 18 exactly. See the topic file
-// using this fixture for the full worked-out rounding-shortfall scenario.
+// price_scale = ceil(10^0 * 10^1 / 10^0) = 10 exactly (the smallest value
+// guaranteeing resolution at least as fine as 10^-1 — see `new_impl`'s doc
+// comment). See the topic file using this fixture for the full worked-out
+// rounding-shortfall scenario.
 //
 // `SHORTFALL_PRICE_SCALE` is used only inside `shortfall_book` itself (to
 // assert the derived `price_scale` matches what the doc comment above
@@ -117,7 +196,7 @@ public(package) fun rest_ask(
 // that's not quite accurate: it IS referenced, once, right here. Since
 // `shortfall_book` moves here in its entirety, this constant just moves with
 // it rather than being deleted.
-const SHORTFALL_PRICE_SCALE: u64 = 18;
+const SHORTFALL_PRICE_SCALE: u64 = 10;
 const SHORTFALL_PRICE: u64 = 5;
 
 public(package) fun shortfall_price(): u64 { SHORTFALL_PRICE }
@@ -155,13 +234,25 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     let scale = book.price_scale();
     assert!(scale == expected_scale, 0);
 
+    // `size` must be at least `price_scale` for `place_limit_order_bid`'s new
+    // derive-from-payment API to be able to round-trip back to an exact,
+    // hand-picked `price`: with `size == price_scale`, `bid_escrow_amount`'s
+    // ceiling division is always exact (`escrow == price`, no rounding), so
+    // `floor(escrow * price_scale / size) == price` always holds regardless
+    // of `price`. This replaces the old fixed `MIN_SIZE`/`1_000` sizes (which
+    // predate the "no explicit `price` argument" redesign and can no longer
+    // be used unmodified for the large-`price_scale` books this helper
+    // covers -- e.g. `price_scale == 1_000_000` with `size == 100` cannot
+    // reconstruct a small `price` like `1` at all). The extremes/adjacent-tick
+    // behavior under test is unaffected by the specific size chosen.
+    let size = if (MIN_SIZE > scale) { MIN_SIZE } else { scale };
+
     // (b) Extreme minimum representable raw price: rests, checks depth,
     // cancels, verifies exact escrow refund.
-    let size = MIN_SIZE;
     let min_escrow = book.bid_escrow_amount(p_min, size);
-    let min_payment = coin::mint_for_testing<Quote>(min_escrow, scenario.ctx());
+    let min_payment = coin::mint_for_testing<Quote>(bid_payment_for_price(&book, p_min, size), scenario.ctx());
     let (min_ticket_opt, min_matched, min_leftover, min_stopped) =
-        book.place_limit_order_bid(p_min, size, min_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(min_payment, size, 10, scenario.ctx());
     assert!(!min_stopped, 1);
     assert!(min_matched.burn_for_testing() == 0, 2);
     assert!(min_leftover.burn_for_testing() == 0, 3);
@@ -174,9 +265,9 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
 
     // (c) Extreme maximum representable raw price: same checks.
     let max_escrow = book.bid_escrow_amount(p_max, size);
-    let max_payment = coin::mint_for_testing<Quote>(max_escrow, scenario.ctx());
+    let max_payment = coin::mint_for_testing<Quote>(bid_payment_for_price(&book, p_max, size), scenario.ctx());
     let (max_ticket_opt, max_matched, max_leftover, max_stopped) =
-        book.place_limit_order_bid(p_max, size, max_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(max_payment, size, 10, scenario.ctx());
     assert!(!max_stopped, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
     assert!(max_leftover.burn_for_testing() == 0, 9);
@@ -186,21 +277,24 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(max_q.burn_for_testing() == max_escrow, 12);
 
     // (d) Two adjacent raw price ticks at a realistic fair-value level: both
-    // rest as genuinely distinct price levels.
-    let mid_size = 1_000;
+    // rest as genuinely distinct price levels. Reuses the same
+    // round-trip-safe `size` as (b)/(c) above (was `1_000` previously; see
+    // the comment on `size` above for why that no longer works unmodified
+    // for every `price_scale` this helper is exercised against).
+    let mid_size = size;
     let mid_escrow = book.bid_escrow_amount(p_mid, mid_size);
-    let mid_payment = coin::mint_for_testing<Quote>(mid_escrow, scenario.ctx());
+    let mid_payment = coin::mint_for_testing<Quote>(bid_payment_for_price(&book, p_mid, mid_size), scenario.ctx());
     let (mid_ticket_opt, mid_matched, mid_leftover, mid_stopped) =
-        book.place_limit_order_bid(p_mid, mid_size, mid_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(mid_payment, mid_size, 10, scenario.ctx());
     assert!(!mid_stopped, 13);
     assert!(mid_matched.burn_for_testing() == 0, 14);
     assert!(mid_leftover.burn_for_testing() == 0, 15);
 
     let p_mid_next = p_mid + 1;
     let mid_next_escrow = book.bid_escrow_amount(p_mid_next, mid_size);
-    let mid_next_payment = coin::mint_for_testing<Quote>(mid_next_escrow, scenario.ctx());
+    let mid_next_payment = coin::mint_for_testing<Quote>(bid_payment_for_price(&book, p_mid_next, mid_size), scenario.ctx());
     let (mid_next_ticket_opt, mid_next_matched, mid_next_leftover, mid_next_stopped) =
-        book.place_limit_order_bid(p_mid_next, mid_size, mid_next_payment, 10, scenario.ctx());
+        book.place_limit_order_bid(mid_next_payment, mid_size, 10, scenario.ctx());
     assert!(!mid_next_stopped, 16);
     assert!(mid_next_matched.burn_for_testing() == 0, 17);
     assert!(mid_next_leftover.burn_for_testing() == 0, 18);
