@@ -12,7 +12,7 @@ use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -194,7 +194,9 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     // alive: it is now required to claim. The bid is fully filled and
     // removed from the book, so claim_proceeds auto-destroys the ticket and
     // hands back option::none().
-    let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
+    // The bid is fully filled below, so there is no remaining escrow leg to
+    // assert against; bid_escrow_amount is not computed here since it would
+    // be unused.
     let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
 
     scenario.next_tx(other());
@@ -235,7 +237,9 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     let (mut book, cap) = new_book(&mut scenario);
     let book_id = book.book_id();
 
-    let escrow_amount = book.bid_escrow_amount(default_price(), default_size());
+    // The bid is fully filled below, so there is no remaining escrow leg to
+    // assert against; bid_escrow_amount is not computed here since it would
+    // be unused.
     let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
     unit_test::destroy(bid_ticket);
@@ -427,7 +431,7 @@ fun update_resting_order_not_found_is_a_noop() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 4, location = tiny_clob)] // tiny_clob::EWrongClobAdminCap
 fun push_proceeds_rejects_wrong_cap() {
     let mut scenario = ts::begin(admin());
     let (mut book1, _cap1) = new_book(&mut scenario);
@@ -1223,6 +1227,213 @@ fun pause_never_blocks_cancel_claim_update_or_admin_recovery_paths() {
     // The book is still paused throughout — confirms none of the five paths
     // above went through some code path that accidentally unpaused it.
     assert!(book.is_paused(), 11);
+
+    unit_test::destroy(returned_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Ticket possession, not the recorded `owner` field, is the real
+// authority for claiming proceeds ===
+//
+// `update_resting_order`'s pooled-proceeds owner sync (see Fix 3 above) only
+// runs while the order it targets is still resting — this is now documented
+// on `update_resting_order`'s own doc comment in `sources/tiny_clob.move`.
+// Once an order has concluded (fully filled, `cancel_order`,
+// `clob_admin_cancel_order`, or `clob_admin_drain_step`) but still has a
+// pooled, unclaimed proceeds entry, a further `update_resting_order` call
+// returns `false` and leaves that entry's recorded `owner` exactly as it
+// last was synced — stale relative to whatever reassignment was attempted.
+// The pooled amount is never stranded or misdirected either way: it remains
+// fully claimable via `push_proceeds`/`drain_proceeds` (pays the
+// last-recorded `owner`) or via `claim_proceeds` through the `OrderTicket`
+// (pays whoever holds the ticket, regardless of the recorded `owner`).
+// These tests confirm both payout paths and, most importantly (the fourth
+// test below), that ticket possession is the actual claim authority even
+// with no force-cancellation involved at all — the recorded `owner` field is
+// merely what `push_proceeds`/`drain_proceeds` happen to pay, not a
+// capability in itself.
+
+#[test]
+fun update_resting_order_stale_after_force_cancel_push_proceeds_pays_last_synced_owner() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    // maker_a() rests an ask big enough to be partially filled, leaving it
+    // still resting, and pooling proceeds (Quote) under maker_a().
+    let size = 200;
+    let fill_size = 100;
+    scenario.next_tx(maker_a());
+    let ask_ticket = rest_ask(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = ask_ticket.ticket_order_id();
+    let side = ask_ticket.ticket_side();
+    let price = ask_ticket.ticket_price();
+
+    scenario.next_tx(taker());
+    let budget = book.bid_escrow_amount(default_price(), fill_size);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_payment, _) =
+        book.place_market_order_bid(bid_payment, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
+    matched_base.burn_for_testing();
+    leftover_payment.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // Reassign to maker_b() while still resting — sync succeeds, proceeds
+    // now recorded under maker_b().
+    scenario.next_tx(maker_a());
+    assert!(book.update_resting_order(&ask_ticket, maker_b()), 1);
+
+    // Force-cancel the still-resting remainder: the order is gone from the
+    // book, but the pooled proceeds entry survives untouched.
+    scenario.next_tx(admin());
+    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+    assert!(book.proceeds_contains_for_testing(order_id), 2);
+
+    // A further reassignment attempt correctly reports not-found (the order
+    // is no longer resting) and must NOT touch the pooled proceeds' recorded
+    // owner.
+    assert!(!book.update_resting_order(&ask_ticket, maker_c()), 3);
+    unit_test::destroy(ask_ticket);
+
+    // push_proceeds pays maker_b() — the last address actually synced while
+    // the order was still resting — not maker_c(), the target of the failed
+    // post-conclusion reassignment attempt.
+    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 4);
+    let (ev_claimant, _, ev_base, ev_quote) =
+        claimed_events[0].proceeds_claimed_fields_for_testing();
+    assert!(ev_claimant == maker_b(), 5);
+    assert!(ev_base == 0, 6);
+    assert!(ev_quote == budget, 7);
+    assert!(!book.proceeds_contains_for_testing(order_id), 8);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_cancel() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let book_id = book.book_id();
+
+    // Same setup as above through the force-cancel step: maker_a() rests an
+    // ask, a partial fill pools proceeds under maker_a(), a still-resting
+    // reassignment syncs them to maker_b(), then the remainder is
+    // force-cancelled — leaving a pooled entry recorded against maker_b()
+    // that update_resting_order can no longer touch.
+    let size = 200;
+    let fill_size = 100;
+    scenario.next_tx(maker_a());
+    let ask_ticket = rest_ask(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = ask_ticket.ticket_order_id();
+    let side = ask_ticket.ticket_side();
+    let price = ask_ticket.ticket_price();
+
+    scenario.next_tx(taker());
+    let budget = book.bid_escrow_amount(default_price(), fill_size);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_payment, _) =
+        book.place_market_order_bid(bid_payment, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
+    matched_base.burn_for_testing();
+    leftover_payment.burn_for_testing();
+
+    scenario.next_tx(maker_a());
+    assert!(book.update_resting_order(&ask_ticket, maker_b()), 0);
+
+    scenario.next_tx(admin());
+    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+    assert!(book.proceeds_contains_for_testing(order_id), 1);
+
+    // An unrelated address holding the ticket claims via claim_proceeds —
+    // it, not maker_b() (the recorded owner), receives the full pooled
+    // amount. Ticket possession, not the recorded owner field, is what
+    // actually authorizes payout via this path.
+    scenario.next_tx(other());
+    let (claim_base, claim_quote, returned_ticket_opt) =
+        book.claim_proceeds(ask_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == 0, 2);
+    assert!(claim_quote.burn_for_testing() == budget, 3);
+    // The order is no longer resting (force-cancelled above), so the ticket
+    // is auto-destroyed and nothing more can ever be claimed through it.
+    assert!(returned_ticket_opt.is_none(), 4);
+    returned_ticket_opt.destroy_none();
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 5);
+    let (ev_claimant, ev_book_id, ev_base, ev_quote) =
+        claimed_events[0].proceeds_claimed_fields_for_testing();
+    assert!(ev_claimant == other(), 6);
+    assert!(ev_book_id == book_id, 7);
+    assert!(ev_base == 0, 8);
+    assert!(ev_quote == budget, 9);
+
+    // The pooled entry is now gone: a subsequent push_proceeds pays nobody
+    // (claim_maker_balance returns zero balances for a missing entry, so no
+    // transfer and no event fire).
+    assert!(!book.proceeds_contains_for_testing(order_id), 10);
+    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 1, 11);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun claim_proceeds_via_ticket_pays_holder_over_synced_owner_with_no_force_cancel() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let book_id = book.book_id();
+
+    // The cleanest demonstration: no force-cancellation anywhere in this
+    // test. maker_a() rests an ask big enough to be partially filled,
+    // leaving it still resting, and pooling proceeds (Quote) under
+    // maker_a().
+    let size = 200;
+    let fill_size = 100;
+    scenario.next_tx(maker_a());
+    let ask_ticket = rest_ask(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = ask_ticket.ticket_order_id();
+
+    scenario.next_tx(taker());
+    let budget = book.bid_escrow_amount(default_price(), fill_size);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_payment, _) =
+        book.place_market_order_bid(bid_payment, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
+    matched_base.burn_for_testing();
+    leftover_payment.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // maker_a() reassigns the still-resting order to maker_b() — sync
+    // succeeds (`true`), and the pooled proceeds entry's recorded owner
+    // moves to maker_b() immediately, per Fix 3 above.
+    scenario.next_tx(maker_a());
+    assert!(book.update_resting_order(&ask_ticket, maker_b()), 1);
+
+    // But maker_a() KEEPS the ticket and claims through it directly. Despite
+    // the recorded owner now being maker_b(), the payout — and the
+    // ProceedsClaimed event's claimant — go to maker_a(), the ticket holder,
+    // proving ticket possession (not the recorded `owner` field) is the real
+    // claim authority, exactly as it always was for a still-resting order.
+    let (claim_base, claim_quote, returned_ticket_opt) =
+        book.claim_proceeds(ask_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == 0, 2);
+    assert!(claim_quote.burn_for_testing() == budget, 3);
+    // The remaining 100 of the original 200 is still resting, so the ticket
+    // remains live and reusable.
+    assert!(returned_ticket_opt.is_some(), 4);
+    let returned_ticket = returned_ticket_opt.destroy_some();
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 5);
+    let (ev_claimant, ev_book_id, ev_base, ev_quote) =
+        claimed_events[0].proceeds_claimed_fields_for_testing();
+    assert!(ev_claimant == maker_a(), 6);
+    assert!(ev_book_id == book_id, 7);
+    assert!(ev_base == 0, 8);
+    assert!(ev_quote == budget, 9);
+    assert!(!book.proceeds_contains_for_testing(order_id), 10);
 
     unit_test::destroy(returned_ticket);
     destroy_book_and_cap(book, cap);

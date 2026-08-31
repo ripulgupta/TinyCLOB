@@ -57,8 +57,10 @@ fun generate_one_fee_bearing_fill(
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
 
-    let taker_fee_base = (FINALIZE_FEES_SIZE * taker_fee_bps) / 10_000;
-    let maker_fee_quote = (quote_cost * maker_fee_bps) / 10_000;
+    let taker_fee_base =
+        (((FINALIZE_FEES_SIZE as u128) * (taker_fee_bps as u128) + 10_000 - 1) / 10_000) as u64;
+    let maker_fee_quote =
+        (((quote_cost as u128) * (maker_fee_bps as u128) + 10_000 - 1) / 10_000) as u64;
     (taker_fee_base, maker_fee_quote)
 }
 
@@ -226,6 +228,90 @@ fun version_already_current_emits_no_upgrade_event() {
     scenario.end();
 }
 
+// The version-guard auto-upgrade path above is only ever exercised via
+// `clob_admin_pause_book`. `assert_book_version` runs at the top of every
+// version-guarded function, `cancel_order` included, so it auto-upgrades
+// exactly the same way there — this test pins that down through a
+// completely different call path (an ordinary trader-facing function, not
+// an admin one).
+#[test]
+fun version_auto_upgrades_through_cancel_order() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let book_id = book.book_id();
+
+    let ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    book.set_book_version_for_testing(0);
+
+    let (refund_base, refund_quote) = book.cancel_order(ticket, scenario.ctx());
+    refund_base.burn_for_testing();
+    refund_quote.burn_for_testing();
+    assert!(book.book_version() == 1, 0);
+
+    let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
+    assert!(upgraded_events.length() == 1, 1);
+    let (ev_book_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
+    assert!(ev_book_id == book_id, 2);
+    assert!(ev_from == 0, 3);
+    assert!(ev_to == 1, 4);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// `version_guard_pause_aborts_on_future_version` above is the only test
+// exercising the ENewVersionMismatch abort path, and only through
+// `clob_admin_pause_book`. This pins the same abort down through a
+// completely different, non-admin function.
+#[test]
+#[expected_failure(abort_code = 5, location = tiny_clob)] // tiny_clob::ENewVersionMismatch
+fun version_guard_cancel_order_aborts_on_future_version() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    book.set_book_version_for_testing(999);
+
+    let (refund_base, refund_quote) = book.cancel_order(ticket, scenario.ctx());
+    refund_base.burn_for_testing();
+    refund_quote.burn_for_testing();
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Documented limitation: a book whose stored `version` is ahead of this
+// --- package's `CURRENT_VERSION` has no escape hatch. `assert_book_version`
+// --- aborts with `ENewVersionMismatch` on *every* version-guarded entry
+// --- point once `book.version > CURRENT_VERSION`, and that includes
+// --- `clob_admin_retire` — the very first step of the retire -> drain ->
+// --- finalize teardown sequence. So once a book's version somehow ends up
+// --- ahead of the running package build, it can never even begin being
+// --- torn down: any resting orders, pooled proceeds, or accumulated fees on
+// --- it are permanently stuck, with no admin recovery path whatsoever.
+// --- This is a real, current limitation of `assert_book_version`'s design
+// --- (not something these tests assert should be fixed) — pinned down here
+// --- the same way other documented limitations in this codebase are
+// --- test-pinned. `version_guard_cancel_order_aborts_on_future_version`
+// --- above already shows an ordinary trader operation is blocked the same
+// --- way; this test shows the teardown path is blocked too, at its very
+// --- first step.
+#[test]
+#[expected_failure(abort_code = 5, location = tiny_clob)] // tiny_clob::ENewVersionMismatch
+fun future_version_book_blocks_retire_teardown_path_too() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_book_version_for_testing(999);
+
+    // Even the very first step of the retire -> drain -> finalize teardown
+    // sequence is blocked — there is no way to ever retire, drain, or
+    // finalize a book stuck at a future version.
+    cap.clob_admin_retire(&mut book);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 #[test]
 fun fee_setters_bounds_and_events() {
     let mut scenario = ts::begin(admin());
@@ -253,7 +339,7 @@ fun fee_setters_bounds_and_events() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 6, location = tiny_clob)] // tiny_clob::ENotRetiring
 fun drain_step_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
@@ -263,7 +349,7 @@ fun drain_step_before_retire_aborts() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 6, location = tiny_clob)] // tiny_clob::ENotRetiring
 fun finalize_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
@@ -304,6 +390,72 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
     let escrow = balance::create_for_testing<USDC>(price * size);
     let order = order::new<BTC, USDC>(order_id, other(), size, option::none(), option::some(escrow), 0);
     book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
+
+    cap.clob_admin_retire(&mut book);
+    let deleted_id = cap.clob_admin_finalize(book);
+    sui::test_utils::destroy(deleted_id);
+    scenario.end();
+}
+
+// `finalize_while_nonempty_aborts_not_fully_drained` above only exercises a
+// nonempty bids side. The precondition assert also checks `book.asks`, so
+// this pins down the ask-side-nonempty variant: no bids, no pooled
+// proceeds, zero fees — only a resting ask remains.
+#[test]
+#[expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
+fun finalize_while_only_asks_nonempty_aborts_not_fully_drained() {
+    let price = 50_000;
+    let size = 100;
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let order_id = book.next_order_id();
+    let escrow = balance::create_for_testing<BTC>(size);
+    let order = order::new<BTC, USDC>(order_id, other(), size, option::some(escrow), option::none(), 0);
+    book.insert_resting_order_for_testing(false, price, order, scenario.ctx());
+
+    cap.clob_admin_retire(&mut book);
+    let deleted_id = cap.clob_admin_finalize(book);
+    sui::test_utils::destroy(deleted_id);
+    scenario.end();
+}
+
+// Pins down the pooled-proceeds-nonempty variant of the same precondition
+// assert: no resting bids or asks (the ask below fully fills and is
+// removed from the tree), zero fees (this book's default fee rates are
+// both 0) — only a pooled proceeds entry for the filled maker remains.
+#[test]
+#[expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
+fun finalize_while_only_proceeds_nonempty_aborts_not_fully_drained() {
+    let price = 50_000;
+    let size = 100;
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let ask_ticket = rest_ask(&mut book, price, size, 1_000_000_000, scenario.ctx());
+    let order_id = ask_ticket.ticket_order_id();
+    unit_test::destroy(ask_ticket);
+
+    // This bid crosses the resting ask above at the same price/size, so it
+    // fully fills and the ask is removed from the tree entirely, leaving
+    // only a pooled proceeds entry for it behind.
+    let quote_cost = book.bid_escrow_amount(price, size);
+    let payment = coin::mint_for_testing<USDC>(quote_cost, scenario.ctx());
+    let (bid_ticket_opt, matched_base, leftover_quote, _) =
+        book.place_limit_order_bid(payment, size, 1_000_000_000, scenario.ctx());
+    bid_ticket_opt.destroy_none();
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
+
+    // The resting ask must genuinely be gone from the tree (not merely
+    // never-rested) for this test to isolate the proceeds-only arm of
+    // finalize's emptiness check -- `bids_size_for_testing()` can't prove
+    // this (no bid ever rested here), so check the ask side directly.
+    assert!(book.best_ask().is_none(), 100);
+    assert!(book.proceeds_contains_for_testing(order_id), 101);
+    let (fee_base, fee_quote) = book.fee_accumulator_balances();
+    assert!(fee_base == 0, 102);
+    assert!(fee_quote == 0, 103);
 
     cap.clob_admin_retire(&mut book);
     let deleted_id = cap.clob_admin_finalize(book);
@@ -474,6 +626,156 @@ fun finalize_succeeds_after_fees_claimed() {
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 60);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 61);
 
+    scenario.end();
+}
+
+// --- Regression: claim-fees / drain-step ordering around a partially-filled
+// --- resting order (see `clob_admin_drain_step`'s and `clob_admin_finalize`'s
+// --- doc comments in `sources/tiny_clob.move`). Force-cancelling a
+// --- partially-filled resting order via `clob_admin_drain_step` settles its
+// --- maker-fee reserve into `book.fee_accumulator`, same as any other order
+// --- conclusion. So if `clob_admin_claim_fees` is called BEFORE every drain
+// --- step has run, a later step can re-credit the accumulator after it was
+// --- already claimed down to zero, and `clob_admin_finalize` then aborts
+// --- with `ENotFullyDrained` — recoverable by simply claiming fees again.
+// --- The three tests below pin down: the reintroduced-reserve abort, its
+// --- recovery via a second claim, and the trivially-safe claim-after-drain
+// --- ordering.
+
+const CLAIM_DRAIN_ORDER_PRICE: u64 = 50_000;
+const CLAIM_DRAIN_ORDER_SIZE: u64 = 200;
+const CLAIM_DRAIN_ORDER_FILL: u64 = 100;
+
+/// Rests an ask (maker side, fee-rate snapshot taken at rest time) and
+/// partially fills it, leaving a genuine resting remainder whose maker-fee
+/// reserve has not yet been released into `book.fee_accumulator` — that
+/// only happens once the remainder is later drained or fully filled.
+fun rest_and_partially_fill_ask(
+    scenario: &mut ts::Scenario,
+    book: &mut OrderBook<BTC, USDC>,
+): u64 {
+    scenario.next_tx(maker_a());
+    let ticket = rest_ask(book, CLAIM_DRAIN_ORDER_PRICE, CLAIM_DRAIN_ORDER_SIZE, 1_000_000_000, scenario.ctx());
+    let order_id = ticket.ticket_order_id();
+    unit_test::destroy(ticket);
+
+    scenario.next_tx(taker());
+    let quote_cost = book.bid_escrow_amount(CLAIM_DRAIN_ORDER_PRICE, CLAIM_DRAIN_ORDER_FILL);
+    let payment = coin::mint_for_testing<USDC>(quote_cost, scenario.ctx());
+    let (base_out, leftover, _) = book.place_market_order_bid(
+        payment, 1_000_000_000, 0, CLAIM_DRAIN_ORDER_FILL, quote_cost, scenario.ctx(),
+    );
+    base_out.burn_for_testing();
+    leftover.burn_for_testing();
+
+    assert!(book.resting_order_escrow(tiny_clob::ask(), CLAIM_DRAIN_ORDER_PRICE, order_id).is_some(), 100);
+    assert!(book.proceeds_contains_for_testing(order_id), 101);
+    order_id
+}
+
+#[test]
+fun finalize_recovers_after_reclaiming_fees_post_drain() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+
+    rest_and_partially_fill_ask(&mut scenario, &mut book);
+
+    // Taker fee on the 100 filled Base at 10 bps, ceiling-rounded:
+    // ceil(100 * 10 / 10_000) = 1. The maker-fee reserve on the matched
+    // Quote leg stays parked on the still-resting order itself until it is
+    // drained, so the accumulator is (1, 0) here, not yet (1, 2_500).
+    let (base_before, quote_before) = book.fee_accumulator_balances();
+    assert!(base_before == 1, 0);
+    assert!(quote_before == 0, 1);
+
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == 1, 2);
+    assert!(quote_coin.burn_for_testing() == 0, 3);
+    let (base_after_claim, quote_after_claim) = book.fee_accumulator_balances();
+    assert!(base_after_claim == 0, 4);
+    assert!(quote_after_claim == 0, 5);
+
+    cap.clob_admin_retire(&mut book);
+    // Force-cancels the still-resting 100-remaining ask, settling its
+    // maker-fee reserve — ceil(50_000 * 100 * 5 / 10_000) = 2_500 — into
+    // the accumulator, which is therefore nonzero again right after this.
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
+    let (base_after_drain, quote_after_drain) = book.fee_accumulator_balances();
+    assert!(base_after_drain == 0, 6);
+    assert!(quote_after_drain == 2_500, 7);
+
+    // Reclaiming after the drain empties the accumulator again, unblocking
+    // `clob_admin_finalize`.
+    let (base_coin2, quote_coin2) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin2.burn_for_testing() == 0, 8);
+    assert!(quote_coin2.burn_for_testing() == 2_500, 9);
+    let (base_final, quote_final) = book.fee_accumulator_balances();
+    assert!(base_final == 0, 10);
+    assert!(quote_final == 0, 11);
+
+    let deleted_id = cap.clob_admin_finalize(book);
+    sui::test_utils::destroy(deleted_id);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
+fun finalize_aborts_when_fees_claimed_before_drain_reintroduces_reserve() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+
+    rest_and_partially_fill_ask(&mut scenario, &mut book);
+
+    // Claim once, up front, before the resting remainder is ever drained.
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    base_coin.burn_for_testing();
+    quote_coin.burn_for_testing();
+
+    cap.clob_admin_retire(&mut book);
+    // Drains the still-resting order, which re-credits the maker-fee
+    // reserve (2_500 Quote) into the accumulator this claim already
+    // thought was empty.
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
+    let (fee_base, fee_quote) = book.fee_accumulator_balances();
+    assert!(fee_base == 0, 0);
+    assert!(fee_quote == 2_500, 1);
+
+    // The accumulator is nonzero again — this aborts with ENotFullyDrained.
+    let deleted_id = cap.clob_admin_finalize(book);
+    sui::test_utils::destroy(deleted_id);
+    scenario.end();
+}
+
+#[test]
+fun finalize_succeeds_when_fees_claimed_after_all_drain_steps() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+
+    rest_and_partially_fill_ask(&mut scenario, &mut book);
+
+    cap.clob_admin_retire(&mut book);
+    // Drain first, then claim: the recommended ordering from
+    // `clob_admin_finalize`'s doc comment.
+    cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
+    let (fee_base, fee_quote) = book.fee_accumulator_balances();
+    assert!(fee_base == 1, 0);
+    assert!(fee_quote == 2_500, 1);
+
+    let (base_coin, quote_coin) = cap.clob_admin_claim_fees(&mut book, scenario.ctx());
+    assert!(base_coin.burn_for_testing() == 1, 2);
+    assert!(quote_coin.burn_for_testing() == 2_500, 3);
+    let (fee_base_after, fee_quote_after) = book.fee_accumulator_balances();
+    assert!(fee_base_after == 0, 4);
+    assert!(fee_quote_after == 0, 5);
+
+    let deleted_id = cap.clob_admin_finalize(book);
+    sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
 
@@ -687,7 +989,7 @@ fun claim_fees_zero_balance_emits_no_event() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 4, location = tiny_clob)] // tiny_clob::EWrongClobAdminCap
 fun claim_fees_rejects_wrong_cap() {
     let mut scenario = ts::begin(admin());
     let (mut book1, _cap1) = new_book(&mut scenario);
@@ -807,6 +1109,21 @@ fun drain_step_rejects_wrong_cap() {
     // book1 was never retired — the cap check must fire before ENotRetiring
     // is ever consulted.
     cap2.clob_admin_drain_step(&mut book1, 10, scenario.ctx());
+    sui::test_utils::destroy(book1);
+    sui::test_utils::destroy(_cap1);
+    destroy_book_and_cap(book2, cap2);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 4, location = tiny_clob)] // tiny_clob::EWrongClobAdminCap
+fun retire_rejects_wrong_cap() {
+    let mut scenario = ts::begin(admin());
+    let (mut book1, _cap1) = new_book(&mut scenario);
+    let (book2, cap2) = new_book(&mut scenario);
+    // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap
+    // before book1's paused/retiring flags are ever touched.
+    cap2.clob_admin_retire(&mut book1);
     sui::test_utils::destroy(book1);
     sui::test_utils::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);

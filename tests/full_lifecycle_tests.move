@@ -71,7 +71,6 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(ask1_leftover.burn_for_testing() == 0, 1);
     assert!(ask1_matched.burn_for_testing() == 0, 2);
     let ask1_ticket = ask1_ticket_opt.destroy_some();
-    let ask1_order_id = ask1_ticket.ticket_order_id();
 
     let bid1_price = 100 * 601; // = 60_100
     let bid1_size = 401;

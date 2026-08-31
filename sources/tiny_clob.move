@@ -1091,6 +1091,15 @@ public struct OrderBookDeleted has copy, drop {
     quote: TypeName,
 }
 
+/// First step of the deletion lifecycle. The correct operational sequence
+/// to guarantee `clob_admin_finalize` succeeds on the first attempt is:
+/// `clob_admin_retire` -> all `clob_admin_drain_step` calls (draining every
+/// resting order and pooled-proceeds entry) -> `clob_admin_claim_fees`
+/// LAST -> `clob_admin_finalize`. Claiming fees any earlier in that
+/// sequence is not wrong, but a later `clob_admin_drain_step` can re-credit
+/// the fee accumulator (see that function's doc comment), so an earlier
+/// claim may need to be repeated afterward — see `clob_admin_finalize`'s
+/// doc comment for what happens if it isn't.
 public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
@@ -1112,6 +1121,20 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
 /// previous safe per-call margin against that cap (up to 2 events per
 /// drained order now, versus 1 before), so an admin relying on a
 /// previously-safe `max_items` value should reassess it accordingly.
+///
+/// Force-cancelling a partially-filled resting order routes that order's
+/// maker-fee reserve into `book.fee_accumulator` through the very same
+/// `conclude_order_fee` conclusion path every other order conclusion uses
+/// (fill-drain, `cancel_order`, `clob_admin_cancel_order`) — this function
+/// is not special-cased to skip it. Consequently, if `clob_admin_claim_fees`
+/// is called before every `clob_admin_drain_step` call has finished, a
+/// later drain step on a still-resting, previously-partially-filled order
+/// can re-credit a nonzero amount into the accumulator after that claim
+/// already emptied it. This is not a fund-loss bug and not a permanent
+/// trap — `clob_admin_claim_fees` has no `retiring` gate, so calling it
+/// again after all drain steps complete (and before `clob_admin_finalize`)
+/// resolves it cleanly. See `clob_admin_finalize`'s doc comment for the
+/// full recommended ordering.
 public fun clob_admin_drain_step<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -1239,6 +1262,20 @@ fun drain_proceeds<Base, Quote>(
 /// return value for indexing/bookkeeping gets the book's authoritative
 /// identity, unlike `event_id`, which is caller-controllable at
 /// construction time and must never be trusted for that purpose.
+///
+/// The emptiness check below includes the fee accumulator
+/// (`fee_base == 0 && fee_quote == 0`), not just resting orders and pooled
+/// proceeds. The correct operational sequence to guarantee this function
+/// succeeds on the first attempt is: `clob_admin_retire` -> drain every
+/// resting order and pooled-proceeds entry (`clob_admin_drain_step`,
+/// repeated as needed) -> `clob_admin_claim_fees` LAST -> this function.
+/// If fees are instead claimed earlier in that sequence, a later
+/// `clob_admin_drain_step` can re-credit the accumulator (force-cancelling
+/// a partially-filled resting order settles its maker-fee reserve into
+/// `book.fee_accumulator`, same as any other order conclusion — see that
+/// function's doc comment), and this function will abort with
+/// `ENotFullyDrained` rather than silently failing, until
+/// `clob_admin_claim_fees` is called again.
 public fun clob_admin_finalize<Base, Quote>(
     cap: ClobAdminCap,
     mut book: OrderBook<Base, Quote>,
@@ -1558,12 +1595,12 @@ fun fill_level_bid<Base, Quote>(
         let level = book.asks.borrow_mut(leaf_ptr);
         loop {
             if (*remaining_size == 0) break;
+            if (level.level_is_empty()) break;
             if (*fills_consumed == max_fills) {
                 budget_exhausted = true;
                 hit_max_fills = true;
                 break
             };
-            if (level.level_is_empty()) break;
             let head_key = level.level_front_order_id().destroy_some();
             *fills_consumed = *fills_consumed + 1;
             let maker_remaining = level.level_borrow_order(head_key).remaining_size();
@@ -1754,12 +1791,12 @@ fun fill_level_ask<Base, Quote>(
         let level = book.bids.borrow_mut(leaf_ptr);
         loop {
             if (*remaining_size == 0) break;
+            if (level.level_is_empty()) break;
             if (*fills_consumed == max_fills) {
                 stop = true;
                 hit_max_fills = true;
                 break
             };
-            if (level.level_is_empty()) break;
             let head_key = level.level_front_order_id().destroy_some();
             *fills_consumed = *fills_consumed + 1;
             // `maker_remaining` here is the resting bid's remaining BASE
@@ -2668,17 +2705,45 @@ public struct OrderOwnerUpdated has copy, drop {
 /// it with the same care as `push_proceeds`. Proceeds are pooled per
 /// `order_id` in a single maker-table ledger entry, and `credit_maker_table`
 /// re-stamps that entry's payout `owner` on every credit, not just the
-/// first. This function also immediately and unconditionally syncs the
-/// `owner` of any already-pooled `MakerBalance` entry for this `order_id`
-/// (via `sync_maker_balance_owner`) at the moment of reassignment — not
-/// merely on a future fill. That means this function's reassignment reaches
-/// the order's *entire* currently-pooled unclaimed proceeds balance for that
-/// `order_id` — both proceeds already credited before the reassignment and
-/// any credited afterward — immediately, whether or not the order is ever
-/// filled again: `push_proceeds` / `drain_proceeds` always pay whoever is
-/// currently stamped as owner, which this function keeps current. This is
-/// intentional, since it remains the ticket holder's own choice about their
-/// own order's funds.
+/// first. Whenever this function finds the order still resting (the only
+/// case that returns `true`), it also immediately and unconditionally syncs
+/// the `owner` of any already-pooled `MakerBalance` entry for this
+/// `order_id` (via `sync_maker_balance_owner`) at the moment of
+/// reassignment — not merely on a future fill. That means, for a still-
+/// resting order, this function's reassignment reaches the order's *entire*
+/// currently-pooled unclaimed proceeds balance for that `order_id` — both
+/// proceeds already credited before the reassignment and any credited
+/// afterward — immediately, whether or not the order is ever filled again:
+/// `push_proceeds` / `drain_proceeds` always pay whoever is currently
+/// stamped as owner, which this function keeps current in that case. This
+/// is intentional, since it remains the ticket holder's own choice about
+/// their own order's funds.
+///
+/// Known limitation, accepted as documented rather than fixed: the pooled-
+/// proceeds sync above only runs when the order is found still resting.
+/// If the order has already concluded by the time this is called — fully
+/// filled and drained, `cancel_order`ed, force-cancelled via
+/// `clob_admin_cancel_order`, or removed by `clob_admin_drain_step` — but a
+/// pooled, unclaimed `MakerBalance` entry for its `order_id` still exists,
+/// this function returns `false` (no resting order found) and does *not*
+/// touch that entry's recorded owner at all; it stays at whatever it was
+/// last synced to (or the original placing owner, if never reassigned).
+/// This does not strand the funds: that pooled amount remains fully
+/// claimable either way, via `push_proceeds`/`drain_proceeds` (which pay
+/// the last-recorded owner) or via `claim_proceeds` through the order's own
+/// `OrderTicket` (which pays the ticket holder/caller regardless of the
+/// recorded owner — see `claim_proceeds`'s own doc comment for that
+/// ticket-possession authority model), whichever happens first. Nor is it a
+/// fund-misdirection risk — `push_proceeds`/`drain_proceeds` can only ever
+/// pay the recorded owner, never a caller-supplied address. There is also a
+/// secondary asymmetry worth noting here: `cancel_order` sweeps and pays
+/// out any pooled proceeds as part of the same call — to the caller
+/// (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
+/// while `clob_admin_cancel_order` deliberately does not — it refunds only the
+/// order's escrow principal and leaves any pooled proceeds entry untouched
+/// (so that an admin force-cancel can never redirect a maker's proceeds),
+/// recoverable afterward only via `push_proceeds`/`drain_proceeds`/
+/// `claim_proceeds`.
 ///
 /// Note: a bare `transfer::public_transfer` of the `OrderTicket` object
 /// itself (bypassing this function) cannot be observed or synced by any

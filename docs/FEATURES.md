@@ -527,12 +527,25 @@ public fun update_resting_order<Base, Quote>(
 
 Reassigns the resting order's payout destination to `new_owner`. Takes
 `ticket` by reference, so the caller retains it. Returns `true` if the order
-was found and updated, `false` if not (a no-op; not an abort). Authority
-follows ticket possession, exactly like `cancel_order`. Immediately syncs
+was found *still resting* and updated, `false` if not (a no-op; not an
+abort). Authority follows ticket possession, exactly like `cancel_order`.
+Only when the order is found still resting does this also immediately sync
 the payout address of the order's currently-pooled unclaimed proceeds (if
 any), not just future fills — this affects both proceeds already credited
 before the call and any credited afterward. Aborts with `EWrongBook` if
 `ticket` was not minted by `book`.
+
+If the order has already concluded by the time this is called (fully
+filled and drained, `cancel_order`ed, force-cancelled via
+`clob_admin_cancel_order`, or removed by `clob_admin_drain_step`) but a
+pooled, unclaimed proceeds entry for its order id still exists, this
+function returns `false` and does **not** touch that entry's recorded
+owner — it stays whatever it was last synced to. This does not strand
+anything: the pooled amount is still fully claimable, either via
+`push_proceeds`/`drain_proceeds` (paying the last-recorded owner) or via
+`claim_proceeds` through the order's own `OrderTicket` (paying the ticket
+holder/caller regardless of the recorded owner — see `claim_proceeds`
+above), whichever happens first.
 
 Emits `OrderOwnerUpdated { order_id, order_book_id, old_owner, new_owner }`
 whenever the order is found and reassigned — including when `new_owner`
@@ -770,6 +783,14 @@ against that cap (up to 2 events per drained order now, versus 1 before) —
 an admin relying on a previously-safe `max_items` value should reassess it
 accordingly.
 
+Force-cancelling a partially-filled resting order routes its maker-fee
+reserve into `book.fee_accumulator` through the same conclusion path
+(`MakerFeeSettled`) every other order conclusion uses — this function does
+not skip it. As a result, a `clob_admin_claim_fees` call made before every
+`clob_admin_drain_step` call has finished may need to be repeated
+afterward, since a later drain step can re-credit the accumulator with a
+nonzero amount. See below for the recommended ordering.
+
 ```
 public fun clob_admin_finalize<Base, Quote>(cap: ClobAdminCap, book: OrderBook<Base, Quote>): ID
 ```
@@ -783,6 +804,15 @@ balance on both legs — i.e. `clob_admin_drain_step` and
 `OrderBookDeleted { order_book_id, base: TypeName, quote: TypeName }` (using
 the book's `Base`/`Quote` type names) and `ClobAdminCapDiscarded { cap_id,
 for_book }`. Returns the book's true, unforgeable object id.
+
+**Recommended ordering.** To guarantee this function succeeds on the first
+attempt: `clob_admin_retire` -> all `clob_admin_drain_step` calls (drain
+every resting order and pooled-proceeds entry) -> `clob_admin_claim_fees`
+LAST -> `clob_admin_finalize`. Claiming fees earlier in the sequence is not
+wrong, but if a later `clob_admin_drain_step` re-credits the accumulator
+(per the note above) after an earlier claim already emptied it, this
+function aborts with `ENotFullyDrained` — not a silent failure — until
+`clob_admin_claim_fees` is called again.
 
 ## 11. Version guard
 
@@ -1042,6 +1072,17 @@ maker fee is actually paid in).
 - `clob_admin_cancel_order` and `clob_admin_finalize`'s emptiness checks are
   independent of any pooled proceeds for the removed/remaining orders —
   proceeds are refunded/paid separately from escrow.
+- `update_resting_order`'s pooled-proceeds owner sync only fires when it
+  finds the order still resting; if the order has already concluded
+  (fill-drained, `cancel_order`ed, `clob_admin_cancel_order`ed, or
+  `clob_admin_drain_step`-removed) but a pooled, unclaimed proceeds entry
+  for it still exists, the call returns `false` and leaves that entry's
+  recorded owner untouched. Relatedly, `cancel_order` sweeps and pays out
+  any pooled proceeds as part of the same call — to the caller
+  (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
+  while `clob_admin_cancel_order` deliberately does not — it refunds only the
+  escrow principal, leaving pooled proceeds recoverable afterward only via
+  `push_proceeds`/`drain_proceeds`/`claim_proceeds`.
 - `push_proceeds`'s payout destination is always the recorded `owner` for
   that order id, never caller-suppliable, even by the admin.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has
@@ -1057,3 +1098,9 @@ maker fee is actually paid in).
   was placed.
 - Every fee computation rounds up: any nonzero receive amount at a nonzero
   fee rate always pays at least 1 atomic unit of fee.
+- Calling `clob_admin_claim_fees` before all `clob_admin_drain_step` calls
+  finish is not wrong, but a later drain step can re-credit the fee
+  accumulator (force-cancelling a partially-filled resting order settles
+  its maker-fee reserve the same as any other order conclusion), so the
+  claim may need to be repeated afterward; the safe ordering is retire ->
+  drain everything -> claim fees last -> finalize.

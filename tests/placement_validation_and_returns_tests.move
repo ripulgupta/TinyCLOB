@@ -58,13 +58,21 @@ fun place_limit_order_bid_ask_happy_path_fills_and_rests() {
 }
 
 #[test]
-#[expected_failure]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
 fun place_limit_order_zero_price_aborts() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     // `payment` of 1 against `PLACEMENT_SIZE` derives `price ==
     // floor(1 * 1 / PLACEMENT_SIZE) == 0` -- the same `EZeroPrice` abort as
-    // passing `price == 0` directly used to trigger.
+    // passing `price == 0` directly used to trigger, but via genuine
+    // floor-rounding of a nonzero payment (not a trivially-zero payment).
+    // This is meaningfully distinct from `place_limit_order_bid_zero_price_
+    // aborts` below, which drives the derivation with `payment == 0`
+    // directly (via `rest_bid(book, 0, ...)`, since `bid_escrow_amount(0,
+    // size) == 0`): that only proves `0` maps to `0`, not that the guard is
+    // on the *derived* price rather than on `payment == 0` specifically.
+    // This test proves the latter: even a nonzero payment (1) that merely
+    // rounds down to a zero derived price is caught the same way.
     let payment = coin::mint_for_testing<USDC>(1, scenario.ctx());
     let (ticket_opt, mb, ml, _) = book.place_limit_order_bid(payment, PLACEMENT_SIZE, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
@@ -93,6 +101,34 @@ fun place_limit_order_size_validation_aborts() {
     let payment = coin::mint_for_testing<USDC>(size * 100, scenario.ctx());
     let (ticket_opt, mb, ml, _) =
         book.place_limit_order_bid(payment, size, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(mb);
+    unit_test::destroy(ml);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
+fun place_limit_order_ask_size_validation_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    // Mirrors `place_limit_order_size_validation_aborts` above (the bid-side
+    // test), for the ask side. `size == payment.value() == min_size() - 1` is
+    // genuinely below `new_book`'s `min_size` (100), so `validate_size` is
+    // the only check this fixture can possibly fail. `expected_quote_output`
+    // is chosen as `100 * size` so the derived `price ==
+    // ceil(expected_quote_output * price_scale / size) == 100` (this book's
+    // `price_scale == 1`) is comfortably nonzero and well within the book's
+    // declared `[1, 10^19]` range -- so `EZeroPrice` cannot also fire here,
+    // and an `abort_code`-asserted failure unambiguously proves
+    // `ESizeBelowMinSize` is what aborts (deleting the `validate_size` call
+    // in `place_limit_order_ask` would make this test fail, not stay green).
+    let size = min_size() - 1;
+    let payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let expected_quote_output = size * 100;
+    let (ticket_opt, mb, ml, _) =
+        book.place_limit_order_ask(payment, expected_quote_output, 10, scenario.ctx());
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
@@ -311,7 +347,7 @@ fun place_market_order_ask_returns_false_when_fully_filled_within_max_fills() {
 }
 
 #[test]
-fun cancel_and_claim_never_block_on_pause_or_retiring() {
+fun cancel_order_never_blocks_on_pause() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -323,23 +359,82 @@ fun cancel_and_claim_never_block_on_pause_or_retiring() {
     assert!(cancel_base.burn_for_testing() == 0, 0);
     assert!(cancel_quote.burn_for_testing() == book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 1);
 
-    // claim_proceeds also succeeds while retiring.
-    // The order was never resting for this order_id, so use a synthetic
-    // ticket (bypassing the placement path, which isn't needed here) — the
-    // claim finds nothing pooled, and since order_id 999 was never actually
-    // resting, claim_proceeds auto-destroys the ticket and returns
-    // option::none().
-    cap.clob_admin_retire(&mut book);
-    let book_id = book.book_id();
-    let dummy_ticket =
-        tiny_clob::new_ticket_for_testing(999, book_id, tiny_clob::bid(), PLACEMENT_PRICE);
-    let (claim_base, claim_quote, returned_ticket_opt) =
-        book.claim_proceeds(dummy_ticket, scenario.ctx());
-    assert!(claim_base.burn_for_testing() == 0, 2);
-    assert!(claim_quote.burn_for_testing() == 0, 3);
-    assert!(returned_ticket_opt.is_none(), 4);
-    returned_ticket_opt.destroy_none();
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
 
+// `pause_never_blocks_cancel_claim_update_or_admin_recovery_paths` (in
+// `cancellation_and_proceeds_tests.move`) already exercises `cancel_order`
+// and `claim_proceeds` end-to-end against a merely-paused book. A retiring
+// book is a strictly *stronger* condition than a paused one --
+// `clob_admin_retire` sets both `paused = true` and `retiring = true`, and
+// there is no way to be retiring without also being paused (see
+// `sources/tiny_clob.move`'s doc comment on the `retiring` field). Reading
+// both `cancel_order` and `claim_proceeds`'s bodies confirms neither checks
+// `is_paused` NOR `retiring` at all -- the only guard either runs is
+// `assert_book_version` -- so a retiring book exercises the *exact same*
+// code path in these two functions as a merely-paused one. This test still
+// verifies that explicitly, end-to-end, against a genuinely retiring book
+// with real resting orders (not a synthetic zero-value ticket that can't
+// fail regardless of correctness): one order is cancelled for a real,
+// nonzero escrow refund, and a second order's real, nonzero pooled proceeds
+// (from an actual prior partial fill) are claimed successfully.
+#[test]
+fun retiring_never_blocks_cancel_order_or_claim_proceeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    // `proceeds_ticket` rests first (and thus is first in FIFO priority at
+    // this price), so the market ask below fills it -- not `cancel_ticket`,
+    // which is only rested afterward.
+    let proceeds_size = PLACEMENT_SIZE * 2;
+    let proceeds_fill_size = PLACEMENT_SIZE;
+    let proceeds_ticket = rest_bid(&mut book, PLACEMENT_PRICE, proceeds_size, 10, scenario.ctx());
+    let proceeds_order_id = proceeds_ticket.ticket_order_id();
+
+    // Partially fill `proceeds_ticket` while the book is still live, so
+    // there is a genuine, nonzero pooled proceeds balance to claim later.
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(proceeds_fill_size, scenario.ctx());
+    let (leftover_base, matched_quote, _) =
+        book.place_market_order_ask(ask_payment, 10, 0, proceeds_fill_size, scenario.ctx());
+    leftover_base.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(proceeds_order_id), 0);
+
+    scenario.next_tx(admin());
+    let cancel_escrow = book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE);
+    let cancel_ticket = rest_bid(&mut book, PLACEMENT_PRICE, PLACEMENT_SIZE, 10, scenario.ctx());
+
+    // Retire the book: this is genuinely stronger than merely pausing it.
+    scenario.next_tx(admin());
+    cap.clob_admin_retire(&mut book);
+    assert!(book.is_paused(), 1);
+    assert!(book.is_book_retiring(), 2);
+
+    // `cancel_order` on a real resting order still succeeds while retiring,
+    // refunding real, nonzero escrow.
+    let (cancel_base, cancel_quote) = book.cancel_order(cancel_ticket, scenario.ctx());
+    assert!(cancel_base.burn_for_testing() == 0, 3);
+    assert!(cancel_quote.burn_for_testing() == cancel_escrow, 4);
+
+    // `claim_proceeds` on a real, nonzero pooled-proceeds entry still
+    // succeeds while retiring, and returns the still-live ticket (the order
+    // has `PLACEMENT_SIZE` left resting out of the original `proceeds_size`).
+    let (claim_base, claim_quote, returned_ticket_opt) =
+        book.claim_proceeds(proceeds_ticket, scenario.ctx());
+    assert!(claim_base.burn_for_testing() == proceeds_fill_size, 5);
+    assert!(claim_quote.burn_for_testing() == 0, 6);
+    assert!(!book.proceeds_contains_for_testing(proceeds_order_id), 7);
+    assert!(returned_ticket_opt.is_some(), 8);
+    let returned_ticket = returned_ticket_opt.destroy_some();
+
+    // The book is still retiring (and paused) throughout — confirms neither
+    // path above accidentally reversed either flag.
+    assert!(book.is_paused(), 9);
+    assert!(book.is_book_retiring(), 10);
+
+    unit_test::destroy(returned_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -430,32 +525,33 @@ fun place_limit_order_bid_truncated_by_max_fills_returns_none() {
     scenario.end();
 }
 
-/// PIN DOWN: `fill_level_bid`'s inner loop checks `fills_consumed ==
-/// max_fills` BEFORE checking `level_is_empty()` (see
-/// `sources/tiny_clob.move`, `fill_level_bid`). Concretely: on the fill that
-/// exactly drains the last resting order the level had, `fills_consumed` is
-/// incremented to equal `max_fills` and the loop's `max_fills` check is
-/// re-evaluated (and fires) on the *next* iteration, before the also-true
-/// `level_is_empty()` check ever gets a chance to run. So when `max_fills`
-/// exactly equals the number of resting orders present, the sweep reports
-/// `stopped_on_max_fills_while_crossing = true` even though the level was
+/// PIN DOWN: `fill_level_bid`'s inner loop now checks `level_is_empty()`
+/// BEFORE checking `fills_consumed == max_fills` (see
+/// `sources/tiny_clob.move`, `fill_level_bid`). This fixes a prior ordering
+/// bug where the `max_fills` check ran first: on the fill that exactly
+/// drained the last resting order the level had, `fills_consumed` was
+/// incremented to equal `max_fills`, and the loop's `max_fills` check fired
+/// on the *next* iteration before the also-true `level_is_empty()` check
+/// ever got a chance to run. That produced a false-positive
+/// `stopped_on_max_fills_while_crossing = true` whenever `max_fills` exactly
+/// equalled the number of resting orders present, even though the level was
 /// completely, naturally drained -- there was no counterparty depth left to
-/// truncate against. `is_empty_now` is still recomputed unconditionally
-/// after the loop, so the level IS correctly removed and `depth_at_price`
-/// still correctly reads 0 regardless of this ordering quirk.
+/// truncate against.
 ///
-/// This has a real, user-visible consequence on the bid side:
+/// With the fix, `level_is_empty()` is checked first, so a fill that exactly
+/// drains the level's last order correctly reports `stopped = false`: the
+/// sweep only ran out of counterparty depth, it was never capped short of
+/// it. This has a real, user-visible consequence on the bid side:
 /// `place_limit_order_bid`'s `should_rest` is
 /// `actual_resting_size > 0 && !stopped_on_max_fills_while_crossing`, so a
 /// taker whose own requested size exceeds what those exactly-`max_fills`
-/// resting orders could supply gets `should_rest = false` purely because of
-/// this ordering quirk -- its own leftover does NOT rest, even though the
-/// book at that price is now fully, genuinely empty (not because more
-/// counterparty depth was withheld by the `max_fills` cap). This test pins
-/// down the current, exact behavior at that boundary so a future accidental
-/// change to the check ordering becomes visible, not to argue this is wrong.
+/// resting orders could supply now correctly gets `should_rest = true` --
+/// its own leftover legitimately rests, mirroring the "one more than
+/// needed" companion test right below. This test pins down the new, correct
+/// behavior at that boundary so a future accidental change to the check
+/// ordering becomes visible.
 #[test]
-fun place_limit_order_bid_max_fills_exact_match_reports_stopped_despite_fully_draining_level() {
+fun place_limit_order_bid_max_fills_exact_match_does_not_falsely_report_stopped() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     // Exactly 3 resting asks at one price level.
@@ -471,25 +567,32 @@ fun place_limit_order_bid_max_fills_exact_match_reports_stopped_despite_fully_dr
     let (ticket_opt, matched_base, leftover_quote, stopped) =
         book.place_limit_order_bid(payment, 400, 3, scenario.ctx());
 
-    // Actual behavior at the exact-match boundary: `stopped` comes back
-    // `true`, even though all 300 base of genuine counterparty depth was
-    // consumed and nothing was actually left un-swept in the book.
-    assert!(stopped, 0);
+    // Corrected behavior at the exact-match boundary: `stopped` comes back
+    // `false` -- all 300 base of genuine counterparty depth was consumed and
+    // nothing was actually left un-swept in the book, so this genuinely
+    // wasn't a max_fills truncation.
+    assert!(!stopped, 0);
     assert!(matched_base.burn_for_testing() == 300, 1);
-    assert!(leftover_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 2);
-    // Consequence: the taker's own 100 leftover does NOT rest, solely
-    // because `stopped_on_max_fills_while_crossing` is true.
-    assert!(ticket_opt.is_none(), 3);
-    ticket_opt.destroy_none();
-    // But the level was genuinely, fully drained: depth is 0 regardless.
+    assert!(leftover_quote.burn_for_testing() == 0, 2);
+    // Consequence: the taker's own 100 leftover legitimately rests as a real
+    // order.
+    assert!(ticket_opt.is_some(), 3);
+    let ticket = ticket_opt.destroy_some();
+    // The level was genuinely, fully drained.
     assert!(book.depth_at_price(tiny_clob::ask(), OPT_PRICE) == 0, 4);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
-    assert!(event_stopped, 5);
+    assert!(!event_stopped, 5);
     assert!(unmatched_size == 100, 6);
-    assert!(rested_size == 0, 7);
+    assert!(rested_size == 100, 7);
+
+    // The resting order's escrow is exactly the leftover 100's worth of
+    // quote, and can be cancelled cleanly.
+    let (cb, cq) = book.cancel_order(ticket, scenario.ctx());
+    assert!(cb.burn_for_testing() == 0, 8);
+    assert!(cq.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 9);
 
     unit_test::destroy(ask_a);
     unit_test::destroy(ask_b);
@@ -503,8 +606,9 @@ fun place_limit_order_bid_max_fills_exact_match_reports_stopped_despite_fully_dr
 /// naturally ends via `level_is_empty()` on the loop's next check -- before
 /// `fills_consumed` (which only reaches 3) could ever equal `max_fills` (4).
 /// So `stopped_on_max_fills_while_crossing` correctly comes back `false`
-/// here, and the taker's own leftover legitimately rests. This is the exact
-/// contrast to the boundary pinned down above.
+/// here too, and the taker's own leftover legitimately rests -- the same
+/// corrected outcome as the exact-match boundary pinned down above, just
+/// reached without ever coming close to the `max_fills` cap.
 #[test]
 fun place_limit_order_bid_max_fills_one_more_than_needed_does_not_report_stopped() {
     let mut scenario = ts::begin(admin());
@@ -652,6 +756,65 @@ fun place_limit_order_ask_partial_fill_rests_returns_some_and_ticket_is_usable()
     scenario.end();
 }
 
+/// Ask-side mirror of
+/// `place_limit_order_bid_max_fills_exact_match_does_not_falsely_report_stopped`:
+/// with exactly 3 resting bids of size 100 each and `max_fills` set to
+/// exactly 3, the fill that drains the last resting bid also brings
+/// `fills_consumed` to `max_fills`. Since `fill_level_ask` now checks
+/// `level_is_empty()` before `fills_consumed == max_fills`, this correctly
+/// reports `stopped = false` -- the sweep ran out of genuine counterparty
+/// depth, it was never capped short of it -- and the taker's own 100-base
+/// leftover legitimately rests as a new ask.
+#[test]
+fun place_limit_order_ask_max_fills_exact_match_does_not_falsely_report_stopped() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    // Exactly 3 resting bids at one price level.
+    let bid_a = rest_bid(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let bid_b = rest_bid(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+    let bid_c = rest_bid(&mut book, OPT_PRICE, 100, 1_000_000_000, scenario.ctx());
+
+    scenario.next_tx(taker());
+    // Taker wants to sell 400 base: strictly more than the 300 those 3
+    // resting bids can absorb. max_fills == 3, exactly the number of
+    // resting orders.
+    let payment = coin::mint_for_testing<BTC>(400, scenario.ctx());
+    let expected_quote_output_300 = book.bid_escrow_amount(OPT_PRICE, 300);
+    let (ticket_opt, leftover_base, matched_quote, stopped) =
+        book.place_limit_order_ask(payment, expected_quote_output_300, 3, scenario.ctx());
+
+    // Corrected behavior at the exact-match boundary: `stopped` comes back
+    // `false` -- all 300 base of genuine counterparty depth was consumed and
+    // nothing was left un-swept in the book.
+    assert!(!stopped, 0);
+    assert!(leftover_base.burn_for_testing() == 0, 1);
+    assert!(matched_quote.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 300), 2);
+    // The taker's own 100-base leftover legitimately rests as a new ask.
+    assert!(ticket_opt.is_some(), 3);
+    let ticket = ticket_opt.destroy_some();
+    // The bid side was genuinely, fully drained.
+    assert!(book.depth_at_price(tiny_clob::bid(), OPT_PRICE) == 0, 4);
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(!event_stopped, 5);
+    assert!(unmatched_size == 100, 6);
+    assert!(rested_size == 100, 7);
+
+    // The resting order's escrow is exactly the leftover 100 base, and can
+    // be cancelled cleanly.
+    let (cb, cq) = book.cancel_order(ticket, scenario.ctx());
+    assert!(cb.burn_for_testing() == 100, 8);
+    assert!(cq.burn_for_testing() == 0, 9);
+
+    unit_test::destroy(bid_a);
+    unit_test::destroy(bid_b);
+    unit_test::destroy(bid_c);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 /// REGRESSION: with a nonzero taker fee, a fully-filled bid's `matched_base`
 /// is net of a ceiling-rounded fee, so `size - coin::value(&matched_base)`
 /// is nonzero even though the order does NOT rest. A caller naively deriving
@@ -704,6 +867,72 @@ fun place_limit_order_ask_zero_price_aborts() {
     let (mut book, cap) = new_book(&mut scenario);
     let ticket = rest_ask(&mut book, 0, min_size(), 10, scenario.ctx());
     unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// =====================================================================
+// `ESizeBelowMinSize` on `place_market_order_ask`: `size ==
+// min(payment.value(), max_base_in)` genuinely nonzero but below `min_size`
+// must abort, distinguishing this from the already-covered `size == 0`
+// no-op skip case (`place_market_order_ask_max_base_in_zero_is_real_cap_and_
+// no_ops` in `quote_native_bid_fairness_tests.move`). `validate_size` runs
+// unconditionally whenever `size != 0`, before any matching, so no resting
+// book depth is needed to isolate this abort.
+// =====================================================================
+
+#[test]
+#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
+fun place_market_order_ask_size_below_min_size_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    // `max_base_in == min_size() - 1` with a `payment` at least that large
+    // makes `size == min(payment.value(), max_base_in) == min_size() - 1 ==
+    // 99` -- genuinely nonzero (so the `size == 0` skip in
+    // `place_market_order_ask` does not apply) yet strictly below `min_size`
+    // (100), so `validate_size` is the only thing this fixture can abort on.
+    let max_base_in = min_size() - 1;
+    let payment = coin::mint_for_testing<BTC>(max_base_in, scenario.ctx());
+    let (leftover_base, matched_quote, _) =
+        book.place_market_order_ask(payment, 10, 0, max_base_in, scenario.ctx());
+    unit_test::destroy(leftover_base);
+    unit_test::destroy(matched_quote);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// =====================================================================
+// `place_market_order_bid` deliberately has NO `min_size` check at all
+// (unlike the limit-order and market-ask paths above) -- see its doc comment
+// in `sources/tiny_clob.move`: a market bid never rests an order, so it can
+// never create sub-`min_size` dust on the book, and `validate_size`'s entire
+// purpose is bounding what can rest. This test demonstrates that absence
+// directly, rather than merely not testing for it: buying a sub-`min_size`
+// amount of Base via `place_market_order_bid` must succeed cleanly.
+// =====================================================================
+
+#[test]
+fun place_market_order_bid_below_min_size_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let price = default_price();
+    // Resting ask depth (100) comfortably covers the sub-min_size buy below.
+    let ask_ticket = rest_ask(&mut book, price, default_size(), 20, scenario.ctx());
+
+    scenario.next_tx(taker());
+    // Strictly below `min_size` (100) but > 0 -- if `place_market_order_bid`
+    // had a `validate_size`/`min_size` guard (it deliberately does not),
+    // this fixture would be exactly the case that guard would reject.
+    let buy_size = min_size() - 1;
+    let budget = book.bid_escrow_amount(price, buy_size);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_quote, stopped) =
+        book.place_market_order_bid(bid_payment, 20, 0, buy_size, u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    assert!(matched_base.burn_for_testing() == buy_size, 1);
+    assert!(leftover_quote.burn_for_testing() == 0, 2);
+
+    unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

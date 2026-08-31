@@ -34,8 +34,9 @@ fun new_infeasible_precision_exponent_aborts() {
 /// prices up to 10^19 true quote-per-base units. With this book's derived
 /// `price_scale` (100), `price = scale * 79_000` decodes to a true price of
 /// $7,900,000 per BTC (not $79,000 — `price / price_scale` = 79,000, but the
-/// true price also carries the `10^(quote_decimals - base_decimals)` =
-/// `10^-2` factor, so the true price is `79_000 / 10^-2` = 7,900,000),
+/// true price also carries the `10^(base_decimals - quote_decimals)` =
+/// `10^2` factor that it's multiplied by, so the true price is
+/// `79_000 * 10^2` = 7,900,000),
 /// which this book's raw (unscaled) `u64` `price` representation cannot
 /// express in its natural orientation at all. Places an order at that
 /// price, confirms it rests, and confirms `bid_escrow_amount` computes the
@@ -270,7 +271,7 @@ fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
     scenario.next_tx(taker());
     let budget: u64 = 400_000_000_000; // 4e11 quote atoms
     let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(payment, 10, 0, ASK_SIZE, u64_max(), scenario.ctx(),
+    let (matched_base, leftover_payment, stopped) = book.place_market_order_bid(payment, 10, 0, u64_max(), u64_max(), scenario.ctx(),
     );
     // The resting ask only has `ASK_SIZE` base atoms available, so the fill
     // is capped by natural_fill_qty (`ASK_SIZE`), not by an abort.
@@ -360,13 +361,14 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
 }
 
 // === Regression: `price_scale = scale_lo` snaps derived prices to a full
-// declared tick, unlike the old near-`u64::MAX` `scale_hi` ===
+// declared tick, unlike the old, larger `scale_hi` ===
 //
 // A BTC(8 decimals)/USDC(6 decimals) book with `precision=0` declares only
 // whole-dollar true-price resolution, so its raw `price_scale` is now the
-// SMALLEST value achieving that (`ceil(10^8 / 10^6) = 100`), not the OLD
-// near-`u64::MAX` `scale_hi` value (184 -- see
-// `btc_usdc_realistic_price_scale_end_to_end` above for that derivation).
+// SMALLEST value achieving that: `scale_lo = ceil(10^base_decimals *
+// 10^precision / 10^quote_decimals) = ceil(10^8 * 10^0 / 10^6) = 100`, not
+// the OLD `scale_hi = floor(u64::MAX * 10^8 / (10^6 * 10^19)) = 184` value
+// that the pre-fix formula would have picked instead.
 // Since this book's `base_decimals - quote_decimals = 2` exactly cancels
 // `price_scale = 100`, a raw `price` here numerically equals its own true
 // dollar price.
@@ -425,7 +427,11 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     let (ask_ticket_opt, ask_leftover_base, ask_matched_quote, ask_stopped) =
         book.place_limit_order_ask(ask_payment, expected_quote_output, 10, scenario.ctx());
     assert!(!ask_stopped, 6);
-    assert!(ask_matched_quote.burn_for_testing() == 0, 7); // no resting bid to cross
+    // A bid IS still resting on the book at this point (rested above at
+    // price 7_900; `destroy_orphaned_ticket` only discarded the ticket, not
+    // the underlying order), but the ask's price (7_901) ends up above the
+    // resting bid's price (7_900), so this call doesn't cross it.
+    assert!(ask_matched_quote.burn_for_testing() == 0, 7);
     let ask_ticket = ask_ticket_opt.destroy_some();
     // Snapped UP to the whole-dollar tick 7_901, not left at a
     // sub-declared-precision value like 7_900.6 or down at 7_900.
@@ -500,5 +506,268 @@ fun place_limit_order_ask_price_overflow_aborts() {
     ticket_opt.destroy_none();
 
     destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Coverage-audit gap closures (round 2) ===
+//
+// Gaps 1-6 below close specific missing-coverage items identified by a later
+// audit: `set_last_price`'s declared-range reject side, `place_limit_order_ask`'s
+// declared-range reject side, `bid_escrow_amount(book, 0, size) == 0`, the
+// `min_size` boundary on a `price_scale > 1` book, the exact
+// `EPriceRangeInfeasible` boundary (`scale_lo == scale_hi`), and
+// `new_with_event_id_override`'s price-scale-derivation equivalence with
+// plain `new`.
+
+// --- Gap 1: `set_last_price` declared-range REJECT side ---
+//
+// USDC(6)/BTC(8), precision=1, exponent=0 -- the same shape used by
+// `usdc_btc_reversed_pair_price_just_below_min_aborts`/`_just_above_max_aborts`
+// above: `price_scale = ceil(10^6 * 10^1 / 10^8) = 1`, `p_min = 10`,
+// `p_max = 100` (both derived the same way as those tests' doc comments).
+// Neither book below has any resting order (`best_bid`/`best_ask` are both
+// `None`), so `set_last_price`'s later best-bid/best-ask bound checks never
+// engage -- confirmed explicitly below -- and these tests exercise only the
+// declared-range check (which, per the source, runs unconditionally before
+// the best-bid/best-ask checks regardless).
+#[test]
+#[expected_failure(abort_code = 21, location = tiny_clob)] // EPriceBelowDeclaredMin
+fun set_last_price_below_declared_min_aborts() {
+    let mut scenario = ts::begin(admin());
+    let p_min: u64 = 10;
+    let p_mid: u64 = 50;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
+    book.set_last_price(p_min - 1, scenario.ctx());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 22, location = tiny_clob)] // EPriceAboveDeclaredMax
+fun set_last_price_above_declared_max_aborts() {
+    let mut scenario = ts::begin(admin());
+    let p_max: u64 = 100;
+    let p_mid: u64 = 50;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
+    book.set_last_price(p_max + 1, scenario.ctx());
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// --- Gap 2: `place_limit_order_ask` declared-range REJECT side ---
+//
+// Same USDC(6)/BTC(8), precision=1, exponent=0 book shape as Gap 1 above
+// (`price_scale = 1`, `p_min = 10`, `p_max = 100`). Mirrors the existing
+// bid-side reject tests (`usdc_btc_reversed_pair_price_just_below_min_aborts`/
+// `_just_above_max_aborts`), but through `place_limit_order_ask` -- using
+// `test_utils::ask_expected_output_for_price` to derive an
+// `expected_quote_output` that round-trips back to exactly the target
+// out-of-range price, same as `usdc_btc_reversed_pair_ask_side_price_extremes`
+// does for the (in-range) accept side.
+#[test]
+#[expected_failure(abort_code = 21, location = tiny_clob)] // EPriceBelowDeclaredMin
+fun place_limit_order_ask_price_just_below_min_aborts() {
+    let mut scenario = ts::begin(admin());
+    let p_min: u64 = 10;
+    let p_mid: u64 = 50;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let size = min_size();
+    // expected_quote_output = floor((p_min - 1) * size / price_scale) =
+    // floor(9 * 100 / 1) = 900; `place_limit_order_ask` re-derives
+    // `price = ceil(900 * 1 / 100) = 9`, one below `p_min`.
+    let expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_min - 1, size);
+    let payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
+    let (ticket_opt, leftover_base, matched_quote, _) =
+        book.place_limit_order_ask(payment, expected_quote_output, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(leftover_base);
+    unit_test::destroy(matched_quote);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 22, location = tiny_clob)] // EPriceAboveDeclaredMax
+fun place_limit_order_ask_price_just_above_max_aborts() {
+    let mut scenario = ts::begin(admin());
+    let p_max: u64 = 100;
+    let p_mid: u64 = 50;
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let size = min_size();
+    // expected_quote_output = floor((p_max + 1) * size / price_scale) =
+    // floor(101 * 100 / 1) = 10_100; re-derived price =
+    // ceil(10_100 * 1 / 100) = 101, one above `p_max`.
+    let expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_max + 1, size);
+    let payment = coin::mint_for_testing<USDC>(size, scenario.ctx());
+    let (ticket_opt, leftover_base, matched_quote, _) =
+        book.place_limit_order_ask(payment, expected_quote_output, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(leftover_base);
+    unit_test::destroy(matched_quote);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// --- Gap 3: `bid_escrow_amount(book, 0, size) == 0` ---
+#[test]
+fun bid_escrow_amount_zero_price_is_zero() {
+    let mut scenario = ts::begin(admin());
+    let (book, cap) = new_book(&mut scenario);
+    assert!(book.bid_escrow_amount(0, 12_345) == 0, 0);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Gap 4: `min_size` boundary on a `price_scale > 1` book ---
+//
+// `realistic_decimals_book` (base=8, quote=6, precision=0, exponent=19) has
+// `price_scale = 100` -- unlike every existing min_size-boundary test, which
+// uses `new_book` (`price_scale == 1`, no rounding to account for).
+// `REALISTIC_MIN_SIZE` (200, not the shared `min_size()` constant) is used
+// purely so both boundary values (200, 199) stay comfortably nonzero.
+// `REALISTIC_BID_ASK_PRICE` is this book's own `initial_last_price`
+// (`100 * 497`, see `realistic_decimals_book`'s definition), guaranteed to
+// already be within the declared range and to round-trip exactly through
+// `bid_payment_for_price`/`ask_expected_output_for_price` at this size, since
+// `49_700 * 200` is an exact multiple of `price_scale` (100).
+const REALISTIC_MIN_SIZE: u64 = 200;
+const REALISTIC_BID_ASK_PRICE: u64 = 49_700;
+
+#[test]
+fun realistic_decimals_book_bid_at_exact_min_size_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) =
+        test_utils::realistic_decimals_book<BTC, USDC>(REALISTIC_MIN_SIZE, &mut scenario);
+    assert!(book.price_scale() == 100, 0);
+    let size = REALISTIC_MIN_SIZE;
+    let payment_value = test_utils::bid_payment_for_price(&book, REALISTIC_BID_ASK_PRICE, size);
+    let payment = coin::mint_for_testing<USDC>(payment_value, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, size, 10, scenario.ctx());
+    assert!(!stopped, 1);
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
+    let ticket = ticket_opt.destroy_some();
+    book.destroy_orphaned_ticket(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
+fun realistic_decimals_book_bid_below_min_size_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) =
+        test_utils::realistic_decimals_book<BTC, USDC>(REALISTIC_MIN_SIZE, &mut scenario);
+    // `validate_size` runs before `price` is derived, so an arbitrary
+    // payment value is fine -- the abort fires before it's ever used.
+    let payment = coin::mint_for_testing<USDC>(1, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, _) =
+        book.place_limit_order_bid(payment, REALISTIC_MIN_SIZE - 1, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(matched_base);
+    unit_test::destroy(leftover_quote);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+#[test]
+fun realistic_decimals_book_ask_at_exact_min_size_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) =
+        test_utils::realistic_decimals_book<BTC, USDC>(REALISTIC_MIN_SIZE, &mut scenario);
+    let size = REALISTIC_MIN_SIZE;
+    let expected_quote_output =
+        test_utils::ask_expected_output_for_price(&book, REALISTIC_BID_ASK_PRICE, size);
+    let payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let (ticket_opt, leftover_base, matched_quote, stopped) =
+        book.place_limit_order_ask(payment, expected_quote_output, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    leftover_base.burn_for_testing();
+    matched_quote.burn_for_testing();
+    let ticket = ticket_opt.destroy_some();
+    book.destroy_orphaned_ticket(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
+fun realistic_decimals_book_ask_below_min_size_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) =
+        test_utils::realistic_decimals_book<BTC, USDC>(REALISTIC_MIN_SIZE, &mut scenario);
+    // An ask's `size` is `payment.value()` itself, so a sub-min_size payment
+    // is enough to trip `validate_size` regardless of `expected_quote_output`.
+    let payment = coin::mint_for_testing<BTC>(REALISTIC_MIN_SIZE - 1, scenario.ctx());
+    let (ticket_opt, leftover_base, matched_quote, _) =
+        book.place_limit_order_ask(payment, 0, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(leftover_base);
+    unit_test::destroy(matched_quote);
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
+    scenario.end();
+}
+
+// --- Gap 5: exact `EPriceRangeInfeasible` boundary (`scale_lo == scale_hi`) ---
+//
+// base_decimals=0, quote_decimals=1, precision=0, exponent=18:
+//   scale_lo = ceil(10^0 * 10^0 / 10^1) = ceil(1/10) = 1
+//   scale_hi = floor(u64::MAX * 10^0 / (10^1 * 10^18)) = floor(u64::MAX / 10^19)
+//            = floor(18_446_744_073_709_551_615 / 10_000_000_000_000_000_000)
+//            = 1
+// scale_lo == scale_hi == 1 EXACTLY -- this is the tightest possible feasible
+// margin (`scale_lo <= scale_hi` holds with zero slack), so `new` must still
+// succeed (not abort `EPriceRangeInfeasible`) and must derive
+// `price_scale == 1`.
+//
+// Declared true-price range at this `price_scale`: from
+// `assert_price_in_declared_range`, `price >= ceil(scale * 10^quote_dec /
+// (10^base_dec * 10^prec)) = ceil(1 * 10 / (1 * 1)) = 10` and
+// `price <= floor(10^exponent * scale * 10^quote_dec / 10^base_dec) =
+// floor(10^18 * 1 * 10 / 1) = 10^19` -- `initial_last_price = 10` (the
+// minimum) is used below.
+#[test]
+fun price_range_infeasibility_boundary_scale_lo_equals_scale_hi_accepts() {
+    let mut scenario = ts::begin(admin());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 1, 0, 18, 10, scenario.ctx());
+    assert!(book.price_scale() == 1, 0);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Gap 6: `new_with_event_id_override` doesn't change price-scale derivation ---
+//
+// Constructs one book via `new` and one via `new_with_event_id_override`,
+// identical `min_size`/decimals/precision/exponent/initial_last_price
+// (reusing the BTC/SUI decimal-pair shape from
+// `btc_sui_pair_price_extremes_and_adjacent_ticks` above), and confirms their
+// `price_scale()` values are identical -- the override changes only event
+// stamping, never price-scale/declared-range derivation.
+#[test]
+fun new_with_event_id_override_matches_new_price_scale() {
+    let mut scenario = ts::begin(admin());
+    let (plain_book, plain_cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, 337_140, scenario.ctx());
+
+    let wrapper_uid = object::new(scenario.ctx());
+    let (override_book, override_cap) = tiny_clob::new_with_event_id_override<BTC, SUI>(
+        min_size(), 8, 9, 0, 6, 337_140, &wrapper_uid, scenario.ctx(),
+    );
+
+    assert!(plain_book.price_scale() == override_book.price_scale(), 0);
+
+    sui::test_utils::destroy(plain_book);
+    sui::test_utils::destroy(plain_cap);
+    sui::test_utils::destroy(override_book);
+    sui::test_utils::destroy(override_cap);
+    wrapper_uid.delete();
     scenario.end();
 }

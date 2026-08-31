@@ -30,14 +30,17 @@
 ///   fill3: ceil(50*49/100)=ceil(24.5)=25,  delta = 25 - 10 = 15
 ///   fill4: ceil(50*100/100)=50,            delta = 50 - 25 = 25
 /// Both schemes conserve exactly (sum to 50, the order's full
-/// `total_reserved`) and both necessarily agree that the LAST fill is
-/// "whatever's left" (that's forced by conservation, not a formula choice —
-/// see the comment in `fill_level_ask`). The difference is entirely in the
-/// three earlier, taker-limited fills: 4/6/15 (isolated-fair: 4/7/15) versus
-/// the old floor's 3/6/14 (isolated-fair: 4/7/15) -- the new scheme's total
-/// absolute deviation from each fill's own isolated-fair ceil value is
-/// smaller (0+1+0+1=2 vs 1+1+1+1=4 for the old scheme), and unlike the old
-/// scheme, no single fill is ever OVER its own isolated-fair value -- the
+/// `total_reserved`) and both compute their LAST fill the same way --
+/// `total_reserved` minus the sum of the earlier fills, forced by
+/// conservation, not a formula choice (see the comment in `fill_level_ask`).
+/// But since the earlier three fills' own values differ between the two
+/// schemes -- 4/6/15 here vs. the old floor's 3/6/14 -- their residual
+/// LAST-fill value differs too, as a downstream consequence: 25 here vs.
+/// 27 for the old scheme (isolated-fair ceil for fill4 alone is 26).
+/// Comparing all four fills against their own isolated-fair ceil values
+/// (4/7/15/26): the new scheme's total absolute deviation is smaller
+/// (0+1+0+1=2 vs 1+1+1+1=4 for the old scheme), and unlike the old scheme,
+/// no single fill here is ever OVER its own isolated-fair value -- the
 /// rounding "loss" is spread more evenly instead of systematically dumped
 /// onto whichever fill happens to conclude the order.
 #[test_only]
@@ -55,7 +58,7 @@ const MAX_FILLS: u64 = 20;
 /// Exercises the full scenario end-to-end through the real placement entry
 /// points (`place_limit_order_bid`/`place_limit_order_ask`), checking every
 /// fill's actual Quote payout against the hand-derived cumulative-ceiling
-/// values above, and confirming exact conservation (100 Base delivered, 28
+/// values above, and confirming exact conservation (100 Base delivered, 50
 /// Quote drained to zero, order concludes on the 4th fill).
 #[test]
 fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {

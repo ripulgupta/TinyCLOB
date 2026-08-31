@@ -402,6 +402,247 @@ fun clob_admin_drain_step_maker_fee_settled_events_carry_correct_per_order_amoun
     scenario.end();
 }
 
+// Same 4-order fixture as
+// `clob_admin_drain_step_maker_fee_settled_events_carry_correct_per_order_amounts`
+// above, but this time checking a different property: not that each
+// individual `MakerFeeSettled.amount` is independently plausible, but that
+// the events COLLECTIVELY reconcile with the actual state change --
+// `conclude_order_fee` (see `sources/tiny_clob.move`) splits exactly
+// `correct_total_fee` out of the order's held-aside `fee_reserve` and
+// `join`s it straight into `book.fee_accumulator`'s same-currency leg,
+// alongside emitting `MakerFeeSettled` with that same `correct_total_fee` as
+// `amount` -- so for a whole multi-order drain, summing every
+// `MakerFeeSettled.amount` on one currency leg must equal exactly that
+// leg's `fee_accumulator_balances` delta across the call. A bug that emitted
+// a plausible-looking `amount` without actually moving that amount into the
+// accumulator (or moved a different amount than it reported) would sail
+// through the per-order test above but be caught here.
+//
+// A(bid), B(bid), C(bid) settle in Base (a bid's maker fee reserve is
+// Base-denominated -- see `order::new`'s bid branch and
+// `fill_level_ask`/`fold_maker_fee_slack`'s `fee_reserve_base` handling);
+// D(ask) settles in Quote. Expected per-order amounts are hand-computed
+// identically to the sibling test above:
+//   - A: ceil(150 * 5 / 10_000) = 1.
+//   - B: ceil(0 * 5 / 10_000) = 0.
+//   - C: ceil(0 * 5 / 10_000) = 0.
+//   - D: ceil(5_013_700 * 5 / 10_000) = 2_507.
+// So the expected Base-leg accumulator delta is 1 + 0 + 0 = 1, and the
+// expected Quote-leg accumulator delta is 2_507.
+#[test]
+fun clob_admin_drain_step_maker_fee_settled_events_sum_matches_accumulator_delta() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let maker_fee_bps = 5; // MAX_MAKER_FEE_BPS
+    cap.clob_admin_set_maker_fee(&mut book, maker_fee_bps);
+
+    let price_bid = default_price();
+    let size_a = 1_000;
+    let size_b = 1_000;
+    let size_c = 1_000;
+    scenario.next_tx(maker_a());
+    let ticket_a = rest_bid(&mut book, price_bid, size_a, 10, scenario.ctx());
+    scenario.next_tx(maker_b());
+    let ticket_b = rest_bid(&mut book, price_bid, size_b, 10, scenario.ctx());
+    scenario.next_tx(maker_c());
+    let ticket_c = rest_bid(&mut book, price_bid, size_c, 10, scenario.ctx());
+
+    let price_ask = default_price() + 137;
+    let size_d = 1_000;
+    scenario.next_tx(other());
+    let ticket_d = rest_ask(&mut book, price_ask, size_d, 10, scenario.ctx());
+
+    // Partially fill A only (max_fills = 1 caps the sweep to the FIFO-head
+    // bid), same as the sibling test above.
+    scenario.next_tx(taker());
+    let fill_a_amount = 150;
+    let ask_payment = coin::mint_for_testing<BTC>(fill_a_amount, scenario.ctx());
+    let (leftover_base, matched_quote, _) =
+        book.place_market_order_ask(ask_payment, 1, 0, fill_a_amount, scenario.ctx());
+    leftover_base.burn_for_testing();
+    matched_quote.burn_for_testing();
+
+    // Partially fill D only (max_fills = 1, D is the book's only ask).
+    let fill_d_amount = 100;
+    let fill_d_quote_cost = price_ask * fill_d_amount; // 50_137 * 100 = 5_013_700
+    let bid_payment = coin::mint_for_testing<USDC>(fill_d_quote_cost, scenario.ctx());
+    let (matched_base, leftover_quote, _) =
+        book.place_market_order_bid(bid_payment, 1, 0, fill_d_amount, fill_d_quote_cost, scenario.ctx());
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
+
+    let (fee_base_before, fee_quote_before) = book.fee_accumulator_balances();
+
+    scenario.next_tx(admin());
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+
+    let (fee_base_after, fee_quote_after) = book.fee_accumulator_balances();
+
+    let order_id_a = ticket_a.ticket_order_id();
+    let order_id_b = ticket_b.ticket_order_id();
+    let order_id_c = ticket_c.ticket_order_id();
+    let order_id_d = ticket_d.ticket_order_id();
+
+    let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
+    assert!(settled.length() == 4, 0);
+
+    // Bind each event to its expected order by `order_id`, not by
+    // positional index -- so the A/B/C -> Base, D -> Quote currency
+    // grouping doesn't silently rest on an unasserted assumption about
+    // drain order.
+    let mut ev_amount_a = 0;
+    let mut ev_amount_b = 0;
+    let mut ev_amount_c = 0;
+    let mut ev_amount_d = 0;
+    let mut i = 0;
+    while (i < settled.length()) {
+        let (ev_order_id, _, _, ev_amount) = settled[i].maker_fee_settled_fields_for_testing();
+        if (ev_order_id == order_id_a) { ev_amount_a = ev_amount }
+        else if (ev_order_id == order_id_b) { ev_amount_b = ev_amount }
+        else if (ev_order_id == order_id_c) { ev_amount_c = ev_amount }
+        else if (ev_order_id == order_id_d) { ev_amount_d = ev_amount }
+        else { assert!(false, 99) }; // unexpected order_id
+        i = i + 1;
+    };
+
+    // Individual amounts, not just the sum: B and C never filled, so their
+    // correct settled amount is exactly 0 each -- (0, 1, 0) would satisfy
+    // only a sum-of-3 check but not this.
+    assert!(ev_amount_a == 1, 5);
+    assert!(ev_amount_b == 0, 6);
+    assert!(ev_amount_c == 0, 7);
+    assert!(ev_amount_d == 2_507, 8);
+
+    let base_sum = ev_amount_a + ev_amount_b + ev_amount_c;
+    let quote_sum = ev_amount_d;
+    assert!(base_sum == 1, 1);
+    assert!(quote_sum == 2_507, 2);
+
+    // The actual reconciliation: the summed event amounts on each currency
+    // leg must equal exactly that leg's real accumulator delta -- not just
+    // look individually plausible.
+    assert!(fee_base_after - fee_base_before == base_sum, 3);
+    assert!(fee_quote_after - fee_quote_before == quote_sum, 4);
+
+    unit_test::destroy(ticket_a);
+    unit_test::destroy(ticket_b);
+    unit_test::destroy(ticket_c);
+    unit_test::destroy(ticket_d);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === `push_proceeds` on an already-claimed entry ===
+
+// Distinct from `push_proceeds_with_no_pooled_entry_is_silent_noop` in
+// `construction_and_admin_tests.move` (an order_id for which no pooled
+// entry was EVER created): here the order genuinely earns pooled proceeds
+// via a real partial fill, those proceeds are claimed once via
+// `push_proceeds` (removing the entry -- see `claim_maker_balance`), and
+// `push_proceeds` is then called AGAIN on the same, now-empty order_id.
+// `claim_maker_balance` returns zero balances for a missing entry, so the
+// second call must be an equally silent no-op: no abort, no second
+// `ProceedsClaimed` event, and (checked concretely, not just via event
+// absence) no second payment actually reaching the claimant.
+#[test]
+fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let size = 300;
+    let fill_size = 100;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    // Partially fill so the order earns a real, nonzero pooled Base credit.
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) =
+        book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx());
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // First push_proceeds: genuinely claims the pooled credit.
+    scenario.next_tx(admin());
+    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    assert!(!book.proceeds_contains_for_testing(order_id), 1);
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 2);
+    let (ev_claimant, _, ev_base, ev_quote) = claimed_events[0].proceeds_claimed_fields_for_testing();
+    assert!(ev_claimant == admin(), 3); // rest_bid's caller here (no next_tx before it)
+    assert!(ev_base == fill_size, 4);
+    assert!(ev_quote == 0, 5);
+
+    // Second push_proceeds on the same, now-empty order_id, still in the
+    // same transaction: a genuine no-op must NOT add a second event to the
+    // event log accumulated so far this tx (`event::events_by_type` is
+    // scoped per-transaction in this test framework -- it resets across
+    // `scenario.next_tx`, but accumulates within one, exactly like the
+    // multi-call drain tests elsewhere in this file), so the count must stay
+    // at 1, not grow to 2.
+    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 1, 6);
+
+    // Confirm exactly ONE payment ever reached the claimant -- not a silent
+    // second transfer that merely skipped the event. take_from_address
+    // consumes the single Coin<BTC> object created by the first (real) push;
+    // if the second push had transferred anything at all, a second object
+    // would still be sitting in admin()'s inventory afterward.
+    scenario.next_tx(admin());
+    let paid_base = scenario.take_from_address<coin::Coin<BTC>>(admin());
+    assert!(paid_base.value() == fill_size, 7);
+    paid_base.burn_for_testing();
+    assert!(!ts::has_most_recent_for_address<coin::Coin<BTC>>(admin()), 8);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === `destroy_ticket_unconditionally` mid-drain ===
+
+// Distinct from both `destroy_ticket_unconditionally_disposes_with_real_escrow_and_proceeds_still_attached`
+// (order still resting) and `destroy_ticket_unconditionally_disposes_ticket_after_book_finalized`
+// (book already deleted) in `cancellation_and_proceeds_tests.move`: this is
+// the middle case -- the book has been retired and a drain step has already
+// force-cancelled this specific order OUT of the book (it no longer rests
+// anywhere), but the book itself has NOT been finalized/deleted yet. The
+// ticket needs neither the order to still exist (it doesn't self-serve via
+// the book at all) nor the book to still exist (same reason) -- confirming
+// this succeeds with no abort exercises that the function's two
+// independences hold separately, not just in combination.
+#[test]
+fun destroy_ticket_unconditionally_disposes_ticket_after_mid_drain_force_cancel() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    // Retire, then force-cancel the resting order via a drain step -- this
+    // removes it from the book (and refunds its escrow) without finalizing
+    // (deleting) the book itself.
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+
+    // The order is genuinely gone from the book, but the book object is
+    // still alive: both halves of the "still alive, but order already gone"
+    // premise hold before the disposal call below.
+    assert!(book.bids_size_for_testing() == 0, 0);
+    assert!(!book.proceeds_contains_for_testing(order_id), 1);
+    let cancelled = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled.length() == 1, 2);
+
+    bid_ticket.destroy_ticket_unconditionally(); // must not abort
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 // === Multi-call `max_items` carry-over across bids/asks/proceeds ===
 
 // Every prior `clob_admin_drain_step` test in this file uses a `max_items`

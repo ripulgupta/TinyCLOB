@@ -1327,6 +1327,100 @@ fun insert_max_u64_and_sign_bit_boundary_key_together() {
     teardown(scenario, tree);
 }
 
+// === remove_genuinely_mixed_order_recomputes_min_max_every_step ===
+
+/// The removal-order tests above are all either min-first, max-first, or
+/// "arbitrary order but only checked at the very end"
+/// (`insert_many_distinct_prices_grows_tree_depth`'s odd/even removal, and
+/// the middle-key removal in `remove_non_extreme_leaf_leaves_min_max_unchanged`
+/// above, both check only a couple of snapshots). This test instead: inserts
+/// 16 distinct pseudo-random keys (via `gen_distinct_keys`, this file's
+/// existing LCG-based generator — used elsewhere in this file, e.g.
+/// `order_independence_full_drain_across_orderings_and_entry_points`), then
+/// removes them one at a time in a genuinely mixed order that cycles through
+/// the CURRENT min, then the CURRENT middle, then the CURRENT max of
+/// whatever keys are still live — recomputed fresh after every removal, so
+/// neither the "middle" nor the "max" target is a fixed pre-computed index
+/// into the original key set. This forces `remove`'s
+/// `descend_extreme(sibling_ptr, ...)` min/max-recomputation path to run
+/// repeatedly against a variety of shrinking tree shapes, not just the two
+/// trivial already-sorted removal orders every other test in this file uses.
+///
+/// After EVERY removal (not just at the end), asserts: `size()` decremented
+/// by exactly one, `find()` returns `none` for the just-removed key, `find()`
+/// (and the key it resolves to) is still correct for every remaining key, and
+/// `min_leaf`/`max_leaf` still match an independently maintained sorted
+/// in-memory model (`remaining`) of the keys still live in the tree.
+#[test]
+fun remove_genuinely_mixed_order_recomputes_min_max_every_step() {
+    let (mut scenario, mut tree) = setup();
+
+    let keys = gen_distinct_keys(16, 314159, 20_000_000);
+    let mut i = 0;
+    while (i < keys.length()) {
+        tree.insert(keys[i], mock(i));
+        i = i + 1;
+    };
+    assert!(tree.size() == keys.length(), 0);
+
+    // In-memory sorted model of the keys still live in the tree — kept
+    // sorted throughout since removal is always by index, never a re-sort.
+    let mut remaining = sorted(&keys);
+
+    let mut step = 0;
+    while (remaining.length() > 0) {
+        let n = remaining.length();
+        // Cycle: current min -> current middle -> current max -> repeat,
+        // against whatever keys are still live at this step (not a static
+        // permutation of the original key set).
+        let pick_idx = if (step % 3 == 0) {
+            0
+        } else if (step % 3 == 1) {
+            n / 2
+        } else {
+            n - 1
+        };
+        let target_key = remaining.remove(pick_idx);
+
+        let ptr = tree.find(target_key).destroy_some();
+        let _v = tree.remove(ptr);
+
+        // size() decremented correctly.
+        assert!(tree.size() == remaining.length(), step);
+
+        // The just-removed key is gone.
+        assert!(tree.find(target_key).is_none(), 100 + step);
+
+        // Every remaining key is still findable, resolving to itself.
+        let mut j = 0;
+        while (j < remaining.length()) {
+            let rk = remaining[j];
+            let fp = tree.find(rk);
+            assert!(fp.is_some(), 200 + step);
+            assert!(tree.key(fp.destroy_some()) == rk, 300 + step);
+            j = j + 1;
+        };
+
+        // min_leaf/max_leaf still match the in-memory sorted model. Min and
+        // max codes are spaced far enough apart (1000 vs 2000) that no two
+        // steps can ever collide, unlike the earlier `500 + step`/
+        // `501 + step` pairing, which aliased at adjacent steps.
+        if (remaining.length() == 0) {
+            assert!(tree.min_leaf().is_none(), 1000 + step);
+            assert!(tree.max_leaf().is_none(), 2000 + step);
+        } else {
+            let expected_min = remaining[0];
+            let expected_max = remaining[remaining.length() - 1];
+            assert!(tree.key(tree.min_leaf().destroy_some()) == expected_min, 1000 + step);
+            assert!(tree.key(tree.max_leaf().destroy_some()) == expected_max, 2000 + step);
+        };
+
+        step = step + 1;
+    };
+
+    teardown(scenario, tree);
+}
+
 // === test helpers ===
 
 fun setup(): (ts::Scenario, PriceTree<MockLevel>) {
@@ -1370,14 +1464,12 @@ fun sorted(v: &vector<u64>): vector<u64> {
 fun prng_keys(n: u64, seed: u64): vector<u64> {
     let mut out: vector<u64> = vector[];
     let mut x = seed;
-    let mut i = 0;
-    while (i < n) {
+    while (out.length() < n) {
         x = x ^ (x << 13);
         x = x ^ (x >> 7);
         x = x ^ (x << 17);
         let k = x % 1_000_000;
         if (!out.contains(&k)) { out.push_back(k); };
-        i = i + 1;
     };
     out
 }

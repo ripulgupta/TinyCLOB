@@ -13,6 +13,7 @@ use tiny_clob::test_utils::{
     Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
     default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
     rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    realistic_decimals_book,
 };
 
 
@@ -484,6 +485,194 @@ fun set_last_price_succeeds_from_non_admin_sender_without_admin_cap() {
     book.set_last_price(777, scenario.ctx()); // no cap argument exists on this function at all
     assert!(book.last_price() == 777, 0);
 
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// === Price-band interaction with derived-price tick-snapping ===
+//
+// Every price-band test above uses `new_book` (`price_scale == 1`), where a
+// bid/ask's `payment`/`expected_output` ratio always decodes to an exact
+// integer raw price -- `place_limit_order_bid`'s `floor` and
+// `place_limit_order_ask`'s `ceil` derivation never actually round anything.
+// On a `price_scale > 1` book (`realistic_decimals_book`, `price_scale ==
+// 100`), a caller's exact ratio can imply a fractional true raw price that
+// then snaps to a whole tick -- and the band check (added by one redesign)
+// runs against that *snapped* `price`, not the caller's original ratio (the
+// derive-price-from-payment redesign). The tests below hand-derive
+// `payment`/`expected_base_output` (bid) and `expected_quote_output`/`size`
+// (ask) pairs directly from the floor/ceil formulas in
+// `place_limit_order_bid`/`_ask` (`sources/tiny_clob.move`) to exercise
+// exactly this interaction -- `bid_payment_for_price`/
+// `ask_expected_output_for_price` require an exact round-trip and cannot
+// produce a deliberately-fractional ratio.
+//
+// Fixture used throughout: `last_price == 1000`, `price_band_factor ==
+// Some(2)` => raw-price band `[500, 2000]` -- the same numeric style as
+// `new_book`'s price-band tests above, now on a book where `price_scale ==
+// 100` makes fractional true-price ratios possible.
+
+/// Bid ratio `payment / expected_base_output * price_scale == 501.5` (exact:
+/// `payment = 5015`, `expected_base_output = 1000`, `price_scale = 100` =>
+/// `5015 * 100 / 1000 = 501.5`) floors to raw price `501` -- one tick below
+/// the exact ratio, but comfortably WITHIN the band (`501 * factor(2) =
+/// 1002 >= last_price`, `501 <= 2000`), not at either edge. This is the
+/// "ordinary" mid-band tick-snap case, distinct from the boundary-exact
+/// case covered by `bid_fractional_ratio_floor_just_inside_band_low_edge_succeeds`
+/// below (which lands exactly on the band's low edge, not merely inside it).
+#[test]
+fun bid_fractional_ratio_floors_to_price_mid_band_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+    // band: [1000/2, 1000*2] = [500, 2000] (raw price units; price_scale == 100)
+
+    let payment = coin::mint_for_testing<USDC>(5015, scenario.ctx()); // 5015*100/1000 = 501.5 -> floors to 501
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 1000, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    assert!(matched_base.burn_for_testing() == 0, 1); // nothing to cross against
+    leftover_quote.burn_for_testing();
+    let ticket = ticket_opt.destroy_some();
+    assert!(ticket.ticket_price() == 501, 2);
+
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Two bid ratios straddling the band's low edge by fractional amounts that
+/// both floor toward it:
+/// - `payment = 5005`, `expected_base_output = 1000` => exact ratio `500.5`,
+///   floors to `500` -- still exactly the band's low edge, succeeds.
+/// - `payment = 4999`, `expected_base_output = 1000` => exact ratio `499.9`,
+///   floors to `499` -- now genuinely below the `[500, 2000]` band, aborts
+///   `EPriceBelowBand`. Confirms it's the band check firing (`499 * 2 = 998
+///   < 1000`), not the declared-range check (`499 >= 1`, well within this
+///   book's declared range) or `EZeroPrice` (`499 != 0`).
+#[test]
+fun bid_fractional_ratio_floor_just_inside_band_low_edge_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+
+    let payment = coin::mint_for_testing<USDC>(5005, scenario.ctx()); // 5005*100/1000 = 500.5 -> floors to 500
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 1000, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    matched_base.burn_for_testing();
+    leftover_quote.burn_for_testing();
+    let ticket = ticket_opt.destroy_some();
+    assert!(ticket.ticket_price() == 500, 1);
+
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 23, location = tiny_clob)] // EPriceBelowBand
+fun bid_fractional_ratio_floor_pushes_just_outside_band_low_edge_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+
+    let payment = coin::mint_for_testing<USDC>(4999, scenario.ctx()); // 4999*100/1000 = 499.9 -> floors to 499
+    let (ticket_opt, matched_base, leftover_quote, _stopped) =
+        book.place_limit_order_bid(payment, 1000, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(matched_base);
+    unit_test::destroy(leftover_quote);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Mirrors the bid pair above for the ask side, at the band's HIGH edge:
+/// `place_limit_order_ask` derives `price = ceil(expected_quote_output *
+/// price_scale / size)`.
+/// - `expected_quote_output = 19991`, `size = 1000` => exact ratio `1999.1`,
+///   ceils to `2000` -- exactly the band's high edge, succeeds.
+/// - `expected_quote_output = 20001`, `size = 1000` => exact ratio
+///   `2000.1`, ceils to `2001` -- now genuinely above the `[500, 2000]`
+///   band, aborts `EPriceAboveBand`.
+#[test]
+fun ask_fractional_ratio_ceil_just_inside_band_high_edge_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+    // band: [500, 2000]
+
+    let payment = coin::mint_for_testing<BTC>(1000, scenario.ctx());
+    // 19991*100/1000 = 1999.1 -> ceils to 2000
+    let (ticket_opt, leftover_base, matched_quote, stopped) =
+        book.place_limit_order_ask(payment, 19991, 10, scenario.ctx());
+    assert!(!stopped, 0);
+    leftover_base.burn_for_testing();
+    matched_quote.burn_for_testing();
+    let ticket = ticket_opt.destroy_some();
+    assert!(ticket.ticket_price() == 2000, 1);
+
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 24, location = tiny_clob)] // EPriceAboveBand
+fun ask_fractional_ratio_ceil_pushes_just_outside_band_high_edge_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+
+    let payment = coin::mint_for_testing<BTC>(1000, scenario.ctx());
+    // 20001*100/1000 = 2000.1 -> ceils to 2001
+    let (ticket_opt, leftover_base, matched_quote, _stopped) =
+        book.place_limit_order_ask(payment, 20001, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(leftover_base);
+    unit_test::destroy(matched_quote);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Check-ordering pin: on a band-active `realistic_decimals_book` (`last_price
+/// == 1000`, `factor == 2`, band `[500, 2000]`), a bid ratio whose floor
+/// derivation rounds all the way down to raw price `0`
+/// (`payment = 5`, `expected_base_output = 1000` => `5*100/1000 = 0.5`,
+/// floors to `0`) must abort `EZeroPrice`, NOT `EPriceBelowBand` -- even
+/// though `0` is also well below the active band (`0 * 2 = 0 < 1000`).
+/// `place_limit_order_bid`'s actual check order (see `sources/tiny_clob.move`)
+/// asserts `price != 0` (`EZeroPrice`) and the declared-range bounds BEFORE
+/// ever consulting `price_band_factor`. If a future change accidentally
+/// moved the band check earlier, this fixture would flip from aborting
+/// `EZeroPrice` (14) to `EPriceBelowBand` (23) and this test would catch it.
+#[test]
+#[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice, not EPriceBelowBand
+fun band_active_zero_price_derivation_aborts_zero_price_before_band_check() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 100);
+    // band: [500, 2000] -- genuinely active, and a price of 0 would also
+    // fail EPriceBelowBand if the band check ran first.
+
+    let payment = coin::mint_for_testing<USDC>(5, scenario.ctx()); // 5*100/1000 = 0.5 -> floors to 0
+    let (ticket_opt, matched_base, leftover_quote, _stopped) =
+        book.place_limit_order_bid(payment, 1000, 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(matched_base);
+    unit_test::destroy(leftover_quote);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

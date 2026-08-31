@@ -156,13 +156,13 @@ fun partial_cross_then_rest_full_drain_across_multiple_fills_is_zero_dust() {
 // A FRESH resting bid (never partially crossed at placement, so
 // `total_reserved` exactly equals the once-reserved `bid_escrow_amount`)
 // must still telescope to an exact lifetime total under the new
-// proportional-floor accumulator, across an odd partition into several
+// proportional-ceiling accumulator, across an odd partition into several
 // separate fills/transactions -- matching the fix design's claim that the
 // final outcome for this (common) case is unaffected, even though
 // intermediate per-fill amounts may differ slightly from the old
 // delta-of-cumulative-ceilings scheme.
 #[test]
-fun fresh_order_lifetime_total_still_exact_under_proportional_floor() {
+fun fresh_order_lifetime_total_still_exact_under_proportional_ceiling() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = shortfall_book(&mut scenario);
 
@@ -219,9 +219,13 @@ fun fresh_order_lifetime_total_still_exact_under_proportional_floor() {
 // already received for free -- extracting real value for zero payment.
 //
 // `fill_level_ask` now charges each fill a proportional CEILING of
-// `total_reserved`, clamped at `total_reserved` itself (the clamp is
-// defensive/redundant: `ceil(total_reserved * original_size / original_size)
-// == total_reserved` exactly at full fill). This guarantees any fill with
+// `total_reserved` via the telescoping `target_charge - already_charged`
+// formula (see `fill_level_ask` in `tiny_clob.move`): `target_charge =
+// ceil(total_reserved * cumulative_after / original_size)`. There is no
+// separate clamp to `total_reserved` -- at full drain (`cumulative_after ==
+// original_size`) the formula naturally lands on `total_reserved` exactly,
+// since `ceil(total_reserved * original_size / original_size) ==
+// total_reserved`. This guarantees any fill with
 // `cumulative_filled >= 1` charges `cumulative_charged >= 1`, so
 // `quote_charged_so_far` becomes nonzero after any real fill -- a maker
 // cancelling afterward forfeits at least 1 quote atom of escrow, closing the
@@ -306,19 +310,8 @@ fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
     scenario.end();
 }
 
-// === Regression: fill_level_ask's taker-limited clamp (rounding-direction
-// fix, findings L-A/L-B) never aborts once a maker's escrow is exhausted ===
-//
-// The taker-limited branch of `fill_level_ask` now computes
-// `quote_cost = min(max(floor(price * fill_qty / price_scale), 1),
-// escrow_quote_value(&maker_order))`. The `escrow_quote_value` clamp is
-// mandatory: a resting bid's `total_reserved` is a fixed, placement-time
-// ceiling-rounded reservation, and once every fill's floor-rounded share has
-// consumed it down to 0 the maker can still have real remaining size left
-// (floor rounding, unlike the old per-fill ceiling, does not guarantee every
-// fill claws back at least 1 atom) -- an unclamped floor/ceiling term could
-// then demand more Quote than the order has left and abort
-// `split_escrow_quote`.
+// === Regression: fill_level_ask's escrow charge never aborts once a
+// maker's escrow is exhausted ===
 //
 // REDESIGNED for the telescoping cumulative-proportional-ceiling
 // escrow-charging scheme (see `order::Order.original_size`'s doc comment and

@@ -16,13 +16,13 @@
 /// the fill's boundary is genuinely set by the taker's own remaining
 /// size/budget rather than by fully draining a maker:
 ///
-/// - `fill_level_bid` (bid taker vs. resting asks): maker-limited now floors
-///   (`max(floor(price * fill_qty / price_scale), 1)`); taker-limited is
-///   unchanged (ceiling).
-/// - `fill_level_ask` (ask taker vs. resting bids): maker-limited now simply
-///   drains `escrow_quote_value(&maker_order)`; taker-limited is
-///   `min(max(floor(price * fill_qty / price_scale), 1),
-///   escrow_quote_value(&maker_order))`.
+/// `fill_level_bid` (bid taker vs. resting asks) is the only one of the two
+/// exercised by the tests below (they rest asks and cross them with bids):
+/// maker-limited now floors (`max(floor(price * fill_qty / price_scale),
+/// 1)`); taker-limited is unchanged (ceiling). (The mirror-image
+/// `fill_level_ask`, for an ask taker vs. resting bids, now charges a
+/// telescoping cumulative-proportional ceiling -- see `fill_level_ask` in
+/// `tiny_clob.move` -- but is not exercised by this file.)
 ///
 /// Every fill in both tests below is maker-limited (each fragmented resting
 /// order is sized 1 and always fully drained by a single fill), so both now

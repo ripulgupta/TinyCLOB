@@ -381,9 +381,11 @@ const RD_BID_SIZE: u64 = 2;
 const RD_BID_ESCROW: u64 = 21;
 
 #[test]
-fun order_filled_maker_bid_still_resting_bounded_by_telescoping_ceiling() {
-    // maker-bid, still resting: quote_amount is the telescoping proportional-
-    // ceiling charge for this fill, bounded by the order's remaining escrow.
+fun order_filled_maker_bid_still_resting_uses_telescoping_ceiling_delta() {
+    // maker-bid, still resting: quote_amount is the telescoping cumulative-
+    // proportional-ceiling DELTA for this fill (target_charge minus
+    // already_charged, per `fill_level_ask`'s doc comment), not a fresh
+    // per-fill ceiling recomputation.
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
 
