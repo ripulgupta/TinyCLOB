@@ -879,6 +879,73 @@ public fun resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64) {
     (e.escrow, e.remaining_size)
 }
 
+/// The recorded `owner` address of the resting order at `(side, price, order_id)`
+/// — i.e. the address `clob_admin_cancel_order`/`drain_side` will pay if this
+/// order is force-cancelled/drained, and (once pooled) the address
+/// `drain_proceeds`/`push_proceeds` will pay for its proceeds. This is NOT
+/// necessarily the current `OrderTicket` holder: it is whoever `ctx.sender()`
+/// was at placement time, only updated afterward by an explicit
+/// `update_resting_order` call. An integrator whose ticket custody can change
+/// hands (e.g. a wrapper holding tickets internally while a keeper address
+/// places orders) should call `update_resting_order` on every custody change,
+/// and can use this getter beforehand to verify the recorded address is
+/// actually in sync with the intended current beneficiary. `None` if the
+/// order is not resting (mirrors `resting_order_escrow`'s not-found handling).
+public fun resting_order_owner<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    side: bool,
+    price: u64,
+    order_id: u64,
+): Option<address> {
+    let tree: &PriceTree<PriceLevel<Base, Quote>> = if (side) &book.bids else &book.asks;
+    let found = tree.find(price);
+    if (found.is_none()) {
+        return option::none()
+    };
+    let leaf_ptr = found.destroy_some();
+    let level = tree.borrow(leaf_ptr);
+    if (!level.level_contains_order(order_id)) {
+        return option::none()
+    };
+    let order = level.level_borrow_order(order_id);
+    option::some(order.owner())
+}
+
+/// `resting_order_owner` for the order this ticket was minted for. Aborts
+/// with `EWrongBook` if `ticket` was not minted by `book`.
+public fun resting_order_owner_by_ticket<Base, Quote>(
+    book: &OrderBook<Base, Quote>,
+    ticket: &OrderTicket,
+): Option<address> {
+    assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
+    resting_order_owner(book, ticket.side, ticket.price, ticket.order_id)
+}
+
+/// The recorded `owner` address of the pooled proceeds entry for `order_id`,
+/// if one exists — i.e. the address `drain_proceeds`/`push_proceeds` will pay
+/// out to. Same staleness caveat as `resting_order_owner`: this is whoever was
+/// last stamped via `credit_maker_table`/`update_resting_order`'s
+/// `sync_maker_balance_owner` call, not necessarily the current `OrderTicket`
+/// holder. `None` if no pooled entry exists for `order_id` (nothing to claim,
+/// or already claimed/drained).
+public fun proceeds_owner<Base, Quote>(book: &OrderBook<Base, Quote>, order_id: u64): Option<address> {
+    if (book.proceeds.contains(order_id)) {
+        option::some(book.proceeds.borrow(order_id).owner)
+    } else {
+        option::none()
+    }
+}
+
+/// `proceeds_owner` for the order this ticket was minted for. Aborts with
+/// `EWrongBook` if `ticket` was not minted by `book` — proceeds are pooled
+/// per `order_id` within a single book, and `order_id` values are not unique
+/// across books, so without this check a ticket minted by a different book
+/// could collide with an unrelated pooled entry in this one.
+public fun proceeds_owner_by_ticket<Base, Quote>(book: &OrderBook<Base, Quote>, ticket: &OrderTicket): Option<address> {
+    assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
+    proceeds_owner(book, ticket.order_id)
+}
+
 // === ClobAdminCap gate ===
 
 fun assert_clob_admin<Base, Quote>(cap: &ClobAdminCap, book: &OrderBook<Base, Quote>) {
@@ -1198,6 +1265,14 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
 /// time resolves it, and `clob_admin_finalize` itself now sweeps whatever
 /// is left in the accumulator automatically, so no re-claim is required
 /// before finalizing. See `clob_admin_finalize`'s doc comment.
+///
+/// This drains each remaining resting order's escrow to, and each pooled
+/// proceeds entry's balance to, its recorded `owner` address (not necessarily
+/// the current `OrderTicket` holder — see `update_resting_order`'s doc
+/// comment). An integrator that needs to confirm ahead of time where a given
+/// order's drain will pay out can check `resting_order_owner`/
+/// `resting_order_owner_by_ticket` and `proceeds_owner`/
+/// `proceeds_owner_by_ticket` beforehand.
 public fun clob_admin_drain_step<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -2902,6 +2977,23 @@ public struct OrderOwnerUpdated has copy, drop {
 /// remain a best-effort payout to the last address recorded via
 /// `update_resting_order`, not a guarantee of payment to the ticket's true
 /// current holder if custody changed by other means.
+///
+/// This function is the MANDATORY hand-off primitive whenever `OrderTicket`
+/// custody changes hands outside of a bare object transfer this module can't
+/// see — e.g. a wrapper/vault that places orders via a keeper address while
+/// holding the ticket internally, and later moves that ticket (and the
+/// beneficial ownership it represents) to a new custodian. Skipping this call
+/// on such a change leaves the ledger's recorded `owner` stale: a later
+/// `clob_admin_cancel_order`/`drain_side` (escrow principal) or
+/// `drain_proceeds`/`push_proceeds` (pooled proceeds) will pay the OLD,
+/// stale address instead of the current beneficiary, and this module has no
+/// way to detect or flag that drift on its own — see the note above about a
+/// bare ticket transfer being invisible to on-chain code. Use
+/// `resting_order_owner`/`resting_order_owner_by_ticket` and
+/// `proceeds_owner`/`proceeds_owner_by_ticket` beforehand to verify the
+/// recorded address is actually in sync with the intended current
+/// beneficiary before relying on any of those bulk/admin paths to route
+/// correctly.
 public fun update_resting_order<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     ticket: &mut OrderTicket,
@@ -3026,7 +3118,9 @@ public fun claim_proceeds<Base, Quote>(
 /// never redirect funds elsewhere. Only usable as part of the retirement/
 /// drain sequence, same as `drain_proceeds` — requires `book.retiring`, so a
 /// live book's makers can only reach their pooled proceeds through
-/// `claim_proceeds` themselves.
+/// `claim_proceeds` themselves. An integrator that needs to confirm ahead of
+/// time where this payout will go can check `proceeds_owner`/
+/// `proceeds_owner_by_ticket`.
 public fun push_proceeds<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,

@@ -701,6 +701,185 @@ fun resting_ask_escrow_base_tracks_remaining_size_exactly_across_fills() {
 
 // === Additional coverage: independently-verified gaps from the design review ===
 
+// === `resting_order_owner` / `resting_order_owner_by_ticket` ===
+
+#[test]
+fun resting_order_owner_fresh_bid_and_ask_and_wrong_lookup() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let bid_order_id = bid_ticket.ticket_order_id();
+
+    let owner_opt = book.resting_order_owner(true, default_price(), bid_order_id);
+    assert!(owner_opt.is_some(), 0);
+    assert!(owner_opt.destroy_some() == maker_a(), 1);
+
+    // Same result via the ticket-based wrapper.
+    let owner_opt_via_ticket = book.resting_order_owner_by_ticket(&bid_ticket);
+    assert!(owner_opt_via_ticket.is_some(), 2);
+    assert!(owner_opt_via_ticket.destroy_some() == maker_a(), 3);
+
+    // Wrong side / wrong price / wrong order_id all read back None, mirroring
+    // resting_order_escrow_wrong_lookup_is_none.
+    assert!(book.resting_order_owner(false, default_price(), bid_order_id).is_none(), 4);
+    assert!(book.resting_order_owner(true, default_price() + 1, bid_order_id).is_none(), 5);
+    assert!(book.resting_order_owner(true, default_price(), bid_order_id + 1).is_none(), 6);
+
+    scenario.next_tx(maker_b());
+    let ask_price = default_price() + 1; // above best bid, so it just rests.
+    let ask_ticket = rest_ask(&mut book, ask_price, default_size(), 10, scenario.ctx());
+    let ask_order_id = ask_ticket.ticket_order_id();
+
+    let ask_owner_opt = book.resting_order_owner(false, ask_price, ask_order_id);
+    assert!(ask_owner_opt.is_some(), 7);
+    assert!(ask_owner_opt.destroy_some() == maker_b(), 8);
+
+    unit_test::destroy(bid_ticket);
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun resting_order_owner_none_after_full_fill_and_cancel() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let size = 200;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 10, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    assert!(book.resting_order_owner(true, default_price(), order_id).is_some(), 0);
+
+    // Full fill: the order is completely drained and removed, so the owner
+    // query must also return None (same lifecycle as resting_order_escrow).
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let (leftover, matched_quote, _) =
+        book.place_market_order_ask(ask_payment, 1_000_000_000, 0, size, scenario.ctx());
+    leftover.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.resting_order_owner(true, default_price(), order_id).is_none(), 1);
+
+    // Cancel path: rest a fresh order, then cancel it -- must also read back
+    // as None.
+    scenario.next_tx(maker_b());
+    let bid_ticket_2 = rest_bid(&mut book, default_price(), size, 10, scenario.ctx());
+    let order_id_2 = bid_ticket_2.ticket_order_id();
+    assert!(book.resting_order_owner(true, default_price(), order_id_2).is_some(), 2);
+    let (cb, cq) = book.cancel_order(bid_ticket_2, scenario.ctx());
+    cb.burn_for_testing();
+    cq.burn_for_testing();
+    assert!(book.resting_order_owner(true, default_price(), order_id_2).is_none(), 3);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+fun resting_order_owner_reflects_update_resting_order_reassignment() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    assert!(book.resting_order_owner(true, default_price(), order_id).destroy_some() == maker_a(), 0);
+
+    let found = book.update_resting_order(&mut bid_ticket, other());
+    assert!(found, 1);
+
+    // The recorded owner must now reflect the NEW owner, not the placement-
+    // time one -- via both the raw lookup and the ticket-based wrapper.
+    assert!(book.resting_order_owner(true, default_price(), order_id).destroy_some() == other(), 2);
+    assert!(book.resting_order_owner_by_ticket(&bid_ticket).destroy_some() == other(), 3);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 16, location = tiny_clob)] // EWrongBook
+fun resting_order_owner_by_ticket_wrong_book_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (book, cap) = new_book(&mut scenario);
+    let (other_book, other_cap) = new_book(&mut scenario);
+
+    let other_book_id = other_book.book_id();
+    let foreign_ticket = tiny_clob::new_ticket_for_testing(0, other_book_id, tiny_clob::bid(), default_price());
+    let _ = book.resting_order_owner_by_ticket(&foreign_ticket);
+
+    unit_test::destroy(foreign_ticket);
+    destroy_book_and_cap(book, cap);
+    destroy_book_and_cap(other_book, other_cap);
+    scenario.end();
+}
+
+// === `proceeds_owner` / `proceeds_owner_by_ticket` ===
+
+#[test]
+fun proceeds_owner_none_before_credit_some_after_and_synced_by_update_resting_order() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let size = 200;
+    let fill_size = 100;
+    let mut bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    // No pooled proceeds entry yet: both the raw lookup and the ticket-based
+    // wrapper read back None.
+    assert!(book.proceeds_owner(order_id).is_none(), 0);
+    assert!(book.proceeds_owner_by_ticket(&bid_ticket).is_none(), 1);
+
+    // Partially fill: creates a pooled MakerBalance entry credited to the
+    // order's live owner, maker_a().
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover, matched_quote, _) =
+        book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx());
+    leftover.burn_for_testing();
+    matched_quote.burn_for_testing();
+
+    assert!(book.proceeds_owner(order_id).destroy_some() == maker_a(), 2);
+    assert!(book.proceeds_owner_by_ticket(&bid_ticket).destroy_some() == maker_a(), 3);
+
+    // Reassign ownership via update_resting_order -- this must immediately
+    // resync the already-pooled proceeds entry's recorded owner, which is
+    // exactly the scenario resting_order_owner/proceeds_owner exist to let
+    // an integrator verify ahead of relying on push_proceeds/drain_proceeds.
+    let found = book.update_resting_order(&mut bid_ticket, other());
+    assert!(found, 4);
+    assert!(book.proceeds_owner(order_id).destroy_some() == other(), 5);
+    assert!(book.proceeds_owner_by_ticket(&bid_ticket).destroy_some() == other(), 6);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 16, location = tiny_clob)] // EWrongBook
+fun proceeds_owner_by_ticket_wrong_book_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (book, cap) = new_book(&mut scenario);
+    let (other_book, other_cap) = new_book(&mut scenario);
+
+    let other_book_id = other_book.book_id();
+    let foreign_ticket = tiny_clob::new_ticket_for_testing(0, other_book_id, tiny_clob::bid(), default_price());
+    let _ = book.proceeds_owner_by_ticket(&foreign_ticket);
+
+    unit_test::destroy(foreign_ticket);
+    destroy_book_and_cap(book, cap);
+    destroy_book_and_cap(other_book, other_cap);
+    scenario.end();
+}
+
 #[test]
 fun bid_quote_escrow_at_price_sums_two_orders_one_partially_filled() {
     let mut scenario = ts::begin(admin());
