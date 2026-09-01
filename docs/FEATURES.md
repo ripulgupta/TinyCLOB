@@ -986,8 +986,12 @@ for anything else.)
 
 `limit_price` is `None` for market orders; for `place_limit_order_*`, the
 resting/placement price. `unmatched_size` is the remaining size after
-matching, gross of taker fee — it does not directly equal the base returned
-to the taker when `taker_fee_bps > 0`. `rested_size` is `0` if nothing rests;
+matching. For `entry_point` 0, 1, and 3, this is gross of taker fee — it does
+not directly equal the base returned to the taker when `taker_fee_bps > 0`.
+For `entry_point` 2 (`place_market_order_bid`) specifically, it is instead
+the NET shortfall against the caller's own NET `max_base_out` request, so for
+that entry point `requested_size - unmatched_size` does equal the base
+actually delivered to the taker. `rested_size` is `0` if nothing rests;
 on the bid limit path it can be less than `unmatched_size` even when
 something rests, because `place_limit_order_bid` clamps the resting size to
 what leftover escrow can actually back. `rested_order_id` is `Some(id)` iff

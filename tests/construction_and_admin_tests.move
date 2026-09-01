@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    Self, admin, other, taker, maker_a, maker_b, min_size, max_min_size, default_price, default_size, new_book, destroy_book_and_cap, rest_bid, rest_ask,
 };
 
 
@@ -25,7 +23,7 @@ public struct CapHolder has key, store {
 // fee_accumulator at all — it now sweeps whatever's left in the accumulator
 // itself and hands it back to the caller as coins, so a nonzero
 // fee_accumulator is no longer a precondition failure. The
-// `clob_admin_finalize` tests above only ever exercise resting-order-only
+// `clob_admin_finalize` tests below only ever exercise resting-order-only
 // scenarios where fee_accumulator stays (0, 0), so that sweep path is never
 // actually hit there. These tests close that gap: they generate a genuine
 // fee-bearing fill, retire+drain the book, and confirm `clob_admin_finalize`
@@ -117,7 +115,7 @@ fun new_size_at_max_boundary_succeeds() {
 fun two_books_identical_types_fully_independent_construction() {
     let mut scenario = ts::begin(admin());
     let (mut book1, cap1) = new_book(&mut scenario);
-    let (mut book2, cap2) = new_book(&mut scenario);
+    let (book2, cap2) = new_book(&mut scenario);
 
     assert!(book1.book_id() != book2.book_id(), 0);
     assert!(cap1.cap_id_for_testing() != cap2.cap_id_for_testing(), 1);
@@ -365,9 +363,9 @@ fun finalize_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
-    sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(fee_base_coin);
-    sui::test_utils::destroy(fee_quote_coin);
+    unit_test::destroy(deleted_id);
+    unit_test::destroy(fee_base_coin);
+    unit_test::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -385,11 +383,11 @@ fun finalize_rejects_wrong_cap() {
 
     // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap.
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap2.clob_admin_finalize(book1, scenario.ctx());
-    sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(fee_base_coin);
-    sui::test_utils::destroy(fee_quote_coin);
-    sui::test_utils::destroy(book2);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(deleted_id);
+    unit_test::destroy(fee_base_coin);
+    unit_test::destroy(fee_quote_coin);
+    unit_test::destroy(book2);
+    unit_test::destroy(_cap1);
     scenario.end();
 }
 
@@ -408,9 +406,9 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
 
     cap.clob_admin_retire(&mut book);
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
-    sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(fee_base_coin);
-    sui::test_utils::destroy(fee_quote_coin);
+    unit_test::destroy(deleted_id);
+    unit_test::destroy(fee_base_coin);
+    unit_test::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -433,9 +431,9 @@ fun finalize_while_only_asks_nonempty_aborts_not_fully_drained() {
 
     cap.clob_admin_retire(&mut book);
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
-    sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(fee_base_coin);
-    sui::test_utils::destroy(fee_quote_coin);
+    unit_test::destroy(deleted_id);
+    unit_test::destroy(fee_base_coin);
+    unit_test::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -478,9 +476,9 @@ fun finalize_while_only_proceeds_nonempty_aborts_not_fully_drained() {
 
     cap.clob_admin_retire(&mut book);
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
-    sui::test_utils::destroy(deleted_id);
-    sui::test_utils::destroy(fee_base_coin);
-    sui::test_utils::destroy(fee_quote_coin);
+    unit_test::destroy(deleted_id);
+    unit_test::destroy(fee_base_coin);
+    unit_test::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -519,6 +517,11 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     assert!(deleted_book_id == deleted_id, 4);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 40);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 41);
+
+    // Zero-fee finalize (nothing ever filled here, so `fee_accumulator`
+    // stayed (0, 0)) must not spuriously emit a `FeesClaimed` event.
+    let fees_claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
+    assert!(fees_claimed_events.length() == 0, 42);
 
     scenario.end();
 }
@@ -757,7 +760,7 @@ fun finalize_succeeds_and_sweeps_fee_accumulator_without_claim() {
     assert!(ev_base_amount == fee_base, 7);
     assert!(ev_quote_amount == fee_quote, 8);
 
-    sui::test_utils::destroy(deleted_id);
+    unit_test::destroy(deleted_id);
     scenario.end();
 }
 
@@ -792,6 +795,13 @@ fun finalize_succeeds_after_fees_claimed() {
     assert!(deleted_book_id == deleted_id, 6);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 60);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 61);
+
+    // Exactly one `FeesClaimed` event total, from the up-front
+    // `clob_admin_claim_fees` call above -- finalize's zero-fee auto-sweep
+    // must not emit a spurious SECOND one (which a bare `>= 1` check would
+    // miss).
+    let fees_claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
+    assert!(fees_claimed_events.length() == 1, 64);
 
     scenario.end();
 }
@@ -887,7 +897,7 @@ fun finalize_recovers_after_reclaiming_fees_post_drain() {
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     assert!(fee_base_coin.burn_for_testing() == 0, 12);
     assert!(fee_quote_coin.burn_for_testing() == 0, 13);
-    sui::test_utils::destroy(deleted_id);
+    unit_test::destroy(deleted_id);
     scenario.end();
 }
 
@@ -940,7 +950,7 @@ fun finalize_succeeds_directly_when_drain_reintroduces_reserve_after_claim() {
     assert!(ev_base_amount == 0, 6);
     assert!(ev_quote_amount == 2_500, 7);
 
-    sui::test_utils::destroy(deleted_id);
+    unit_test::destroy(deleted_id);
     scenario.end();
 }
 
@@ -971,7 +981,7 @@ fun finalize_succeeds_when_fees_claimed_after_all_drain_steps() {
     let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     assert!(fee_base_coin.burn_for_testing() == 0, 6);
     assert!(fee_quote_coin.burn_for_testing() == 0, 7);
-    sui::test_utils::destroy(deleted_id);
+    unit_test::destroy(deleted_id);
     scenario.end();
 }
 
@@ -999,16 +1009,17 @@ fun unpause_after_retire_aborts_with_ebookretiring() {
 }
 
 #[test]
-fun drain_step_remains_callable_after_failed_unpause_attempt() {
+fun retire_then_drain_step_succeeds_and_retiring_stays_set() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
     cap.clob_admin_retire(&mut book);
-    // An unpause attempt against a retiring book aborts before mutating
-    // anything (see unpause_after_retire_aborts_with_ebookretiring above),
-    // so `retiring` stays sticky regardless of any such attempt —
-    // clob_admin_drain_step remains callable exactly as if no unpause had
-    // ever been attempted.
+    // A Move test aborts on its first failing call, so this can't chain an
+    // actual failed unpause attempt before draining (a prior name/comment
+    // here claimed exactly that, but the body never called `unpause` at
+    // all) -- what this test actually pins down is simpler: after
+    // `clob_admin_retire`, `clob_admin_drain_step` succeeds and `retiring`
+    // remains `true` throughout.
     cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
     assert!(book.is_book_retiring(), 0);
 
@@ -1196,8 +1207,8 @@ fun claim_fees_rejects_wrong_cap() {
     let (base_coin, quote_coin) = cap2.clob_admin_claim_fees(&mut book1, scenario.ctx());
     base_coin.burn_for_testing();
     quote_coin.burn_for_testing();
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1218,8 +1229,8 @@ fun pause_book_rejects_wrong_cap() {
     let (mut book1, _cap1) = new_book(&mut scenario);
     let (book2, cap2) = new_book(&mut scenario);
     cap2.clob_admin_pause_book(&mut book1);
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1233,8 +1244,8 @@ fun unpause_book_rejects_wrong_cap() {
     // book1 is not even paused — the cap check must fire before that state
     // is ever consulted.
     cap2.clob_admin_unpause_book(&mut book1);
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1248,8 +1259,8 @@ fun set_taker_fee_rejects_wrong_cap() {
     // rate_bps = 0 is always within bounds, so a mismatched-cap abort here
     // can only be EWrongClobAdminCap, never ETakerFeeRateTooHigh.
     cap2.clob_admin_set_taker_fee(&mut book1, 0);
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1263,8 +1274,8 @@ fun set_maker_fee_rejects_wrong_cap() {
     // rate_bps = 0 is always within bounds, so a mismatched-cap abort here
     // can only be EWrongClobAdminCap, never EMakerFeeRateTooHigh.
     cap2.clob_admin_set_maker_fee(&mut book1, 0);
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1278,8 +1289,8 @@ fun set_price_band_factor_rejects_wrong_cap() {
     // option::none() never trips EZeroPriceBandFactor, so a mismatched-cap
     // abort here can only be EWrongClobAdminCap.
     cap2.clob_admin_set_price_band_factor(&mut book1, option::none());
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1293,8 +1304,8 @@ fun cancel_order_rejects_wrong_cap() {
     // book1 has no such resting order at all — the cap check must fire
     // before the (side, price, order_id) lookup is ever attempted.
     cap2.clob_admin_cancel_order(&mut book1, true, 1, 1, scenario.ctx());
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1308,8 +1319,8 @@ fun drain_step_rejects_wrong_cap() {
     // book1 was never retired — the cap check must fire before ENotRetiring
     // is ever consulted.
     cap2.clob_admin_drain_step(&mut book1, 10, scenario.ctx());
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }
@@ -1323,8 +1334,8 @@ fun retire_rejects_wrong_cap() {
     // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap
     // before book1's paused/retiring flags are ever touched.
     cap2.clob_admin_retire(&mut book1);
-    sui::test_utils::destroy(book1);
-    sui::test_utils::destroy(_cap1);
+    unit_test::destroy(book1);
+    unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
     scenario.end();
 }

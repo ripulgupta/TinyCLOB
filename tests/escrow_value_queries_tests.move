@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    Self, admin, other, taker, maker_a, maker_b, min_size, default_price, default_size, shortfall_price, new_book, destroy_book_and_cap, rest_bid, rest_ask, shortfall_book, u64_max,
 };
 
 
@@ -319,7 +317,7 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     // capacity once the escrow is exhausted.
     scenario.next_tx(maker_b());
     let mut total_charged: u64 = 0;
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 97) {
         let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
         // Pure crossing fill (never rests): `place_market_order_ask` needs
@@ -404,7 +402,7 @@ fun resting_order_zero_escrow_continues_to_full_drain_conclusion() {
     // Same 97-fill sequence as the base fixture: escrow hits exactly 0 while
     // 3 units of Base capacity are still genuinely resting.
     scenario.next_tx(maker_b());
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 97) {
         let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
         let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
@@ -466,7 +464,7 @@ fun resting_order_zero_escrow_cancel_returns_pooled_base_proceeds() {
     let order_id = bid_ticket.ticket_order_id();
 
     scenario.next_tx(maker_b());
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 97) {
         let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
         let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
@@ -525,7 +523,7 @@ fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
     // dust fee) -- this is exactly the superadditive over-collection
     // `conclude_order_fee` exists to true up.
     scenario.next_tx(maker_b());
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 97) {
         let base = coin::mint_for_testing<BTC>(1, scenario.ctx());
         let (lb, mq, _) = book.place_market_order_ask(base, 200, 0, u64_max(), scenario.ctx());
@@ -857,6 +855,17 @@ fun proceeds_owner_none_before_credit_some_after_and_synced_by_update_resting_or
     assert!(found, 4);
     assert!(book.proceeds_owner(order_id).destroy_some() == other(), 5);
     assert!(book.proceeds_owner_by_ticket(&bid_ticket).destroy_some() == other(), 6);
+
+    // Consuming the pooled entry via `claim_proceeds` must clear it back to
+    // `None` -- the order still has a resting remainder (100 of 200), so the
+    // ticket comes back for future claims/cancellation, but the entry itself
+    // is gone until a later fill re-credits it.
+    let (claimed_base, claimed_quote, ticket_opt) = book.claim_proceeds(bid_ticket, scenario.ctx());
+    assert!(claimed_base.burn_for_testing() == fill_size, 7);
+    assert!(claimed_quote.burn_for_testing() == 0, 8);
+    let bid_ticket = ticket_opt.destroy_some();
+    assert!(book.proceeds_owner(order_id).is_none(), 9);
+    assert!(book.proceeds_owner_by_ticket(&bid_ticket).is_none(), 10);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);

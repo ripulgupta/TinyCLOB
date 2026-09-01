@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
+    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, default_price, default_size, new_book, destroy_book_and_cap, rest_bid, rest_ask,
 };
 
 
@@ -102,43 +100,17 @@ fun update_resting_order_not_found_paths_emit_no_event() {
     scenario.end();
 }
 
-#[test]
-fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-
-    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
-    let order_id = bid_ticket.ticket_order_id();
-
-    let found = book.update_resting_order(&mut bid_ticket, other());
-    assert!(found, 0);
-    let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
-    assert!(events.length() == 1, 1);
-    let (_, _, _, ev_old_owner, ev_new_owner) = events[0].order_owner_updated_fields_for_testing();
-    assert!(ev_old_owner == admin(), 2);
-    assert!(ev_new_owner == other(), 3);
-    unit_test::destroy(bid_ticket);
-
-    // Cross the reassigned resting bid; proceeds must land on the new owner
-    // (pooled-proceeds owner sync still works alongside the new event).
-    scenario.next_tx(taker());
-    let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
-    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
-    );
-    leftover_payment.burn_for_testing();
-    matched_quote.burn_for_testing();
-
-    // `push_proceeds` now requires a retiring book.
-    cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
-    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
-    assert!(claimed_events.length() == 1, 4);
-    let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
-    assert!(ev_claimant == other(), 5);
-
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
+// A former test here, `update_resting_order_reassign_emits_event_and_syncs_
+// pooled_proceeds`, covered the same ground as two other tests combined:
+// `update_resting_order_reassign_emits_order_owner_updated_with_correct_fields`
+// above (full `OrderOwnerUpdated` field assertions, including `book_id`/
+// `enclosing_object_id`, which this test only ever asserted a subset of)
+// and `update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push`
+// in `cancellation_and_proceeds_tests.move` (the identical rest-bid ->
+// reassign -> cross -> retire -> push_proceeds -> assert-claimant-is-new-
+// owner sequence). It added no assertion neither of those two already made
+// together, so it was removed as a strict subset rather than kept as a
+// third near-duplicate.
 
 // === Change 5: per-item events in `clob_admin_drain_step`'s helpers ===
 
@@ -221,7 +193,16 @@ fun clob_admin_drain_step_emits_proceeds_claimed_only_for_the_nonzero_order() {
 #[test]
 fun clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
+    // Constructed with a deliberately foreign `enclosing_object_id` (see the
+    // idiom in construction_and_admin_tests.move's
+    // `every_event_type_stamps_true_book_id_and_foreign_enclosing_object_id_independently`)
+    // so this test can also assert `drain_side`'s `OrderCancelled` emit
+    // stamps BOTH id fields correctly -- previously unchecked anywhere.
+    let wrapper_uid = object::new(scenario.ctx());
+    let foreign_id = wrapper_uid.uid_to_inner();
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let true_book_id = book.book_id();
+    assert!(true_book_id != foreign_id, 5);
 
     scenario.next_tx(maker_a());
     let ticket_a = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
@@ -245,19 +226,24 @@ fun clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders()
     assert!(events.length() == 4, 0);
     // FIFO order within the bid side: A, B, C were inserted in that order at
     // the same price; the ask D drains only after the whole bid side does.
-    let (_, _, ev_id_a, ev_trader_a) = events[0].order_cancelled_fields_for_testing();
-    let (_, _, ev_id_b, ev_trader_b) = events[1].order_cancelled_fields_for_testing();
-    let (_, _, ev_id_c, ev_trader_c) = events[2].order_cancelled_fields_for_testing();
-    let (_, _, ev_id_d, ev_trader_d) = events[3].order_cancelled_fields_for_testing();
+    let (ev_book_a, ev_enclosing_a, ev_id_a, ev_trader_a) = events[0].order_cancelled_fields_for_testing();
+    let (ev_book_b, ev_enclosing_b, ev_id_b, ev_trader_b) = events[1].order_cancelled_fields_for_testing();
+    let (ev_book_c, ev_enclosing_c, ev_id_c, ev_trader_c) = events[2].order_cancelled_fields_for_testing();
+    let (ev_book_d, ev_enclosing_d, ev_id_d, ev_trader_d) = events[3].order_cancelled_fields_for_testing();
     assert!(ev_id_a == id_a && ev_trader_a == maker_a(), 1);
     assert!(ev_id_b == id_b && ev_trader_b == maker_b(), 2);
     assert!(ev_id_c == id_c && ev_trader_c == maker_c(), 3);
     assert!(ev_id_d == id_d && ev_trader_d == other(), 4);
+    assert!(ev_book_a == true_book_id && ev_enclosing_a == foreign_id, 6);
+    assert!(ev_book_b == true_book_id && ev_enclosing_b == foreign_id, 7);
+    assert!(ev_book_c == true_book_id && ev_enclosing_c == foreign_id, 8);
+    assert!(ev_book_d == true_book_id && ev_enclosing_d == foreign_id, 9);
 
     unit_test::destroy(ticket_a);
     unit_test::destroy(ticket_b);
     unit_test::destroy(ticket_c);
     unit_test::destroy(ticket_d);
+    wrapper_uid.delete();
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

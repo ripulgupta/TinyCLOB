@@ -132,7 +132,7 @@ fun drain_ascending_levels(tree: &mut PriceTree<PriceLevel<BTC, USDC>>): vector<
 
 #[test]
 fun insert_single_key_becomes_root_min_max() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(42_000_000, mock(1));
 
@@ -156,7 +156,7 @@ fun insert_single_key_becomes_root_min_max() {
 /// only be confirmed by reading `insert`'s implementation.
 #[test]
 fun insert_ascending_keys_updates_max_leaf_incrementally() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     // Ascending resting-bid-style prices (6-decimal USDC-style raw units).
     let prices = vector[1_000_000u64, 1_500_000, 2_000_000, 2_750_000, 3_100_000];
@@ -188,7 +188,7 @@ fun insert_ascending_keys_updates_max_leaf_incrementally() {
 /// above, for `min_leaf`.
 #[test]
 fun insert_descending_keys_updates_min_leaf_incrementally() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     let prices = vector[9_000_000u64, 8_400_000, 7_950_000, 7_000_000, 6_100_000];
     let mut i = 0;
@@ -216,7 +216,7 @@ fun insert_descending_keys_updates_min_leaf_incrementally() {
 /// only test that inserts a key strictly between the current min and max.
 #[test]
 fun insert_middle_key_leaves_min_max_unchanged() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1)); // low -> min
     tree.insert(8_800_000, mock(2)); // high -> max
@@ -238,7 +238,7 @@ fun insert_middle_key_leaves_min_max_unchanged() {
 
 #[test]
 fun remove_non_extreme_leaf_leaves_min_max_unchanged() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1)); // min
     tree.insert(6_250_000, mock(2)); // middle
@@ -263,7 +263,7 @@ fun remove_non_extreme_leaf_leaves_min_max_unchanged() {
 
 #[test]
 fun remove_min_leaf_recomputes_new_min() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1)); // min
     tree.insert(6_250_000, mock(2)); // new min after removal
@@ -283,7 +283,7 @@ fun remove_min_leaf_recomputes_new_min() {
 
 #[test]
 fun remove_max_leaf_recomputes_new_max() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1)); // min
     tree.insert(6_250_000, mock(2)); // new max after removal
@@ -303,7 +303,7 @@ fun remove_max_leaf_recomputes_new_max() {
 
 #[test]
 fun remove_last_leaf_empties_tree() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(12_500_000, mock(1));
     let ptr = tree.find(12_500_000).destroy_some();
@@ -321,7 +321,7 @@ fun remove_last_leaf_empties_tree() {
 
 #[test]
 fun find_missing_key_returns_none() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(3_300_000, mock(1));
     assert!(tree.find(9_900_000).is_none(), 0);
@@ -332,7 +332,7 @@ fun find_missing_key_returns_none() {
 
 #[test]
 fun find_present_key_returns_some_pointer() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(3_300_000, mock(1));
     assert!(tree.find(3_300_000).is_some(), 0);
@@ -341,11 +341,11 @@ fun find_present_key_returns_some_pointer() {
     teardown(scenario, tree);
 }
 
-// === insert_many_distinct_prices_grows_tree_depth ===
+// === insert_many_prices_in_narrow_cluster_and_verify_structure ===
 
 #[test]
-fun insert_many_distinct_prices_grows_tree_depth() {
-    let (mut scenario, mut tree) = setup();
+fun insert_many_prices_in_narrow_cluster_and_verify_structure() {
+    let (scenario, mut tree) = setup();
 
     // 12 distinct adjacent prices, realistic 6-decimal magnitude.
     let base = 4_000_000u64;
@@ -391,11 +391,79 @@ fun insert_many_distinct_prices_grows_tree_depth() {
     teardown(scenario, tree);
 }
 
+// === insert_staircase_keys_ascending/descending_forces_max_depth_spine ===
+
+/// Inserts keys `1u64 << i` for `i` in `0..64`, ascending. Each key's single
+/// set bit is strictly higher than every previously-inserted key's, so the
+/// crit-bit chosen for each new insertion is always the just-inserted key's
+/// own high bit — forcing a maximal-depth spine (each new leaf becomes an
+/// ancestor of all previous ones) rather than a balanced tree. This exercises
+/// the true worst case for this crit-bit implementation, unlike
+/// `insert_many_prices_in_narrow_cluster_and_verify_structure` above (whose
+/// keys differ only in their low 4 bits and so stay shallow).
+#[test]
+fun insert_staircase_keys_ascending_forces_max_depth_spine() {
+    let (scenario, mut tree) = setup();
+
+    let mut keys: vector<u64> = vector[];
+    let mut i = 0;
+    while (i < 64) {
+        let key = 1u64 << (i as u8);
+        tree.insert(key, mock(i));
+        keys.push_back(key);
+        i = i + 1;
+    };
+    assert!(tree.size() == 64, 0);
+
+    // Spot-check several of the 64 keys, not all, to keep this readable.
+    let mut j = 0;
+    while (j < keys.length()) {
+        assert!(tree.find(keys[j]).is_some(), 1);
+        j = j + 8;
+    };
+    assert!(tree.find(keys[0]).is_some(), 2);
+    assert!(tree.find(keys[63]).is_some(), 3);
+
+    cleanup(&mut tree, keys);
+    teardown(scenario, tree);
+}
+
+/// Symmetric to `insert_staircase_keys_ascending_forces_max_depth_spine`
+/// above, inserting the same staircase key set in DESCENDING order — since
+/// insertion order can affect which specific internal-node structure results
+/// (even though the tree's externally-visible behavior must not depend on
+/// it), this is a genuinely distinct test, not a duplicate.
+#[test]
+fun insert_staircase_keys_descending_forces_max_depth_spine() {
+    let (scenario, mut tree) = setup();
+
+    let mut keys: vector<u64> = vector[];
+    let mut i = 64;
+    while (i > 0) {
+        i = i - 1;
+        let key = 1u64 << (i as u8);
+        tree.insert(key, mock(i));
+        keys.push_back(key);
+    };
+    assert!(tree.size() == 64, 0);
+
+    let mut j = 0;
+    while (j < keys.length()) {
+        assert!(tree.find(keys[j]).is_some(), 1);
+        j = j + 8;
+    };
+    assert!(tree.find(keys[0]).is_some(), 2);
+    assert!(tree.find(keys[63]).is_some(), 3);
+
+    cleanup(&mut tree, keys);
+    teardown(scenario, tree);
+}
+
 // === insert_same_price_repeatedly_leaves_tree_depth_unchanged ===
 
 #[test]
 fun insert_same_price_repeatedly_leaves_tree_depth_unchanged() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     // First order at this price creates the leaf.
     tree.insert(7_500_000, mock(1));
@@ -423,7 +491,7 @@ fun insert_same_price_repeatedly_leaves_tree_depth_unchanged() {
 
 #[test]
 fun no_tick_divisibility_check() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     // 7 and 13 share no common divisor beyond 1 — no tick-size/divisibility
     // check exists anywhere in price_tree, so both inserts succeed with no
@@ -442,13 +510,30 @@ fun no_tick_divisibility_check() {
 #[test]
 #[expected_failure(abort_code = price_tree::EKeyAlreadyExists)]
 fun insert_duplicate_key_aborts() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(2_000_000, mock(1));
     tree.insert(2_000_000, mock(2));
 
     cleanup(&mut tree, vector[2_000_000]);
     teardown(scenario, tree);
+}
+
+// === Non-empty price level cannot be destroyed ===
+
+/// `destroy_empty_price_level` must abort with `EPriceLevelNotEmpty` when the
+/// level still has a live order in it (`total_size != 0`), rather than
+/// silently discarding the order — see the error's doc comment.
+#[test]
+#[expected_failure(abort_code = price_tree::EPriceLevelNotEmpty, location = tiny_clob::price_tree)]
+fun destroy_empty_price_level_with_live_order_aborts() {
+    let mut scenario = ts::begin(ADMIN);
+    let mut level = price_tree::new_price_level<BTC, USDC>(scenario.ctx());
+    level.level_insert_order(1, mock_order(1));
+
+    level.destroy_empty_price_level();
+
+    scenario.end();
 }
 
 // === Invalid leaf pointer aborts (M-1) ===
@@ -460,7 +545,7 @@ fun insert_duplicate_key_aborts() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_with_internal_node_index_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1));
     tree.insert(8_800_000, mock(2));
@@ -478,7 +563,7 @@ fun borrow_with_internal_node_index_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun remove_with_internal_node_index_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1));
     tree.insert(8_800_000, mock(2));
@@ -493,7 +578,7 @@ fun remove_with_internal_node_index_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun key_with_internal_node_index_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1));
     tree.insert(8_800_000, mock(2));
@@ -508,7 +593,7 @@ fun key_with_internal_node_index_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_mut_with_internal_node_index_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(5_000_000, mock(1));
     tree.insert(8_800_000, mock(2));
@@ -547,7 +632,7 @@ fun insert_order_independence_same_key_set() {
     let mut o = 0;
     while (o < orders.length()) {
         let order = orders[o];
-        let (mut scenario, mut tree) = setup();
+        let (scenario, mut tree) = setup();
 
         let mut i = 0;
         while (i < order.length()) {
@@ -1089,7 +1174,7 @@ const NO_PARENT_FOR_TESTING: u64 = 0x8000000000000000;
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun remove_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
     tree.insert(5_000_000, mock(1));
     let _v = tree.remove(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
@@ -1099,7 +1184,7 @@ fun remove_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
     tree.insert(5_000_000, mock(1));
     let _v = tree.borrow(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
@@ -1109,7 +1194,7 @@ fun borrow_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun borrow_mut_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
     tree.insert(5_000_000, mock(1));
     let _v = tree.borrow_mut(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
@@ -1119,7 +1204,7 @@ fun borrow_mut_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
 #[test]
 #[expected_failure(abort_code = price_tree::EInvalidLeafPtr, location = tiny_clob::price_tree)]
 fun key_with_no_parent_ptr_aborts_invalid_leaf_ptr() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
     tree.insert(5_000_000, mock(1));
     let _k = tree.key(NO_PARENT_FOR_TESTING);
     cleanup(&mut tree, vector[5_000_000]);
@@ -1154,7 +1239,7 @@ const U64_MAX_MINUS_SIGN_BIT: u64 = 0x7FFFFFFFFFFFFFFF; // U64_MAX with bit 63 c
 /// track correctly, both remain independently findable and removable).
 #[test]
 fun insert_keys_differing_only_at_bit_63_splits_correctly() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     let low_key = 1u64;
     let high_key = 0x8000000000000001u64; // low_key with bit 63 also set
@@ -1195,7 +1280,7 @@ fun insert_keys_differing_only_at_bit_63_splits_correctly() {
 /// sibling subtree is the bit-63-tagged leaf.
 #[test]
 fun insert_keys_differing_only_at_bit_63_remove_min_first() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     let low_key = 1u64;
     let high_key = 0x8000000000000001u64;
@@ -1229,7 +1314,7 @@ fun insert_keys_differing_only_at_bit_63_remove_min_first() {
 /// file's established practice of varying removal order across tests.
 #[test]
 fun insert_extreme_boundary_keys_with_normal_magnitudes() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     let normal_keys = vector[5_000_000u64, 6_250_000, 8_800_000];
     tree.insert(1, mock(0));
@@ -1288,7 +1373,7 @@ fun insert_extreme_boundary_keys_with_normal_magnitudes() {
 /// first, then min, then max) not yet used by the tests above.
 #[test]
 fun insert_max_u64_and_sign_bit_boundary_key_together() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     tree.insert(U64_MAX, mock(1));
     tree.insert(U64_MAX_MINUS_SIGN_BIT, mock(2));
@@ -1331,7 +1416,7 @@ fun insert_max_u64_and_sign_bit_boundary_key_together() {
 
 /// The removal-order tests above are all either min-first, max-first, or
 /// "arbitrary order but only checked at the very end"
-/// (`insert_many_distinct_prices_grows_tree_depth`'s odd/even removal, and
+/// (`insert_many_prices_in_narrow_cluster_and_verify_structure`'s odd/even removal, and
 /// the middle-key removal in `remove_non_extreme_leaf_leaves_min_max_unchanged`
 /// above, both check only a couple of snapshots). This test instead: inserts
 /// 16 distinct pseudo-random keys (via `gen_distinct_keys`, this file's
@@ -1353,7 +1438,7 @@ fun insert_max_u64_and_sign_bit_boundary_key_together() {
 /// in-memory model (`remaining`) of the keys still live in the tree.
 #[test]
 fun remove_genuinely_mixed_order_recomputes_min_max_every_step() {
-    let (mut scenario, mut tree) = setup();
+    let (scenario, mut tree) = setup();
 
     let keys = gen_distinct_keys(16, 314159, 20_000_000);
     let mut i = 0;

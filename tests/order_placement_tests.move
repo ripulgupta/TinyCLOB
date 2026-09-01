@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    Self, admin, default_price, default_size, new_book, destroy_book_and_cap, rest_bid, rest_ask, u64_max,
 };
 
 
@@ -71,7 +69,7 @@ fun place_limit_order_ask_rests_and_emits_orderplaced() {
     assert!(leftover_base.burn_for_testing() == 0, 1);
     assert!(matched_quote.burn_for_testing() == 0, 2);
     let ticket = ticket_opt.destroy_some();
-    let _t_order_id = ticket.ticket_order_id();
+    let t_order_id = ticket.ticket_order_id();
     let t_book_id = ticket.ticket_order_book_id();
     let t_side = ticket.ticket_side();
     let t_price = ticket.ticket_price();
@@ -81,6 +79,15 @@ fun place_limit_order_ask_rests_and_emits_orderplaced() {
 
     let placed_events = event::events_by_type<tiny_clob::OrderPlaced>();
     assert!(placed_events.length() == 1, 6);
+    let (ev_book_id, _ev_enclosing_id, ev_order_id, ev_side, ev_price, ev_size, ev_trader, ev_maker_fee_bps) =
+        placed_events[0].order_placed_fields_for_testing();
+    assert!(ev_order_id == t_order_id, 7);
+    assert!(ev_book_id == book_id, 8);
+    assert!(ev_side == false, 9);
+    assert!(ev_price == default_price(), 10);
+    assert!(ev_size == default_size(), 11);
+    assert!(ev_trader == admin(), 12);
+    assert!(ev_maker_fee_bps == 0, 13);
 
     unit_test::destroy(ticket);
     destroy_book_and_cap(book, cap);

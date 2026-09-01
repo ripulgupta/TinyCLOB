@@ -133,7 +133,7 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
 
     // The resting bid must now be fully gone (drained, popped off the book).
     assert!(book.bid_quote_escrow_at_price(price) == 0, 16);
-    assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 18);
+    assert!(book.resting_order_escrow(tiny_clob::bid(), price, bid_ticket.ticket_order_id()).is_none(), 18);
 
     // Sum of all 4 quote_cost deltas exactly equals `total_reserved` -- zero
     // stranded, zero over-collected: 4+6+15+25 == 50.
@@ -266,7 +266,7 @@ fun cumulative_ceiling_scheme_at_scale_25_fragmented_fills_still_conserves_exact
     // After all 25 fills (cumulative Base = 1000 == original_size), the
     // resting bid must be fully gone: zero live escrow, popped off the book.
     assert!(book.bid_quote_escrow_at_price(price) == 0, 400);
-    assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 402);
+    assert!(book.resting_order_escrow(tiny_clob::bid(), price, bid_ticket.ticket_order_id()).is_none(), 402);
 
     // (a) Zero dust: the running sum of Quote charged across all 25 fills
     // (each verified per-fill above to equal that fill's escrow drop)

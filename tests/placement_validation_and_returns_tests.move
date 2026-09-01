@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    Self, admin, taker, min_size, default_price, default_size, new_book, destroy_book_and_cap, rest_bid, rest_ask, u64_max,
 };
 
 
@@ -895,12 +893,20 @@ fun place_market_order_ask_below_min_size_succeeds() {
     // had a `validate_size`/`min_size` guard (it deliberately does not),
     // this fixture would be exactly the case that guard would reject.
     let max_base_in = min_size() - 1;
+    // `new_book`'s `price_scale == 1` and no fees are configured, so the
+    // telescoping-ceiling formula's `target_charge = ceil(total_reserved *
+    // cumulative_filled / original_size)` collapses to exactly `price *
+    // max_base_in` here (this is the resting bid's only fill, and
+    // `total_reserved == price * default_size()` divides evenly by
+    // `original_size == default_size()`) -- i.e. exactly
+    // `bid_escrow_amount(price, max_base_in)`.
+    let expected_matched_quote = book.bid_escrow_amount(price, max_base_in);
     let payment = coin::mint_for_testing<BTC>(max_base_in, scenario.ctx());
     let (leftover_base, matched_quote, stopped) =
         book.place_market_order_ask(payment, 10, 0, max_base_in, scenario.ctx());
     assert!(!stopped, 0);
     assert!(leftover_base.burn_for_testing() == 0, 1);
-    unit_test::destroy(matched_quote);
+    assert!(matched_quote.burn_for_testing() == expected_matched_quote, 2);
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);

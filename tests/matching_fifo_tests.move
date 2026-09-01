@@ -10,10 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, realistic_decimals_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks,
-    bid_payment_for_price, ask_expected_output_for_price,
+    Self, admin, other, taker, maker_a, maker_b, maker_c, shortfall_price, new_book, realistic_decimals_book, destroy_book_and_cap, rest_ask, shortfall_book, bid_payment_for_price, ask_expected_output_for_price, u64_max,
 };
 
 
@@ -132,7 +129,12 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
     let (_, _, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
 
     assert!(matched_base_val == expected_matched_base, 0);
-    assert!(remaining_budget_val == book.bid_escrow_amount(FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE) - expected_quote_cost, 1);
+    // Full fill consumes the whole budget exactly; the real pinning of the
+    // quote cost is the `expected_quote_cost == 3_495` assertion above
+    // (checking `remaining_budget_val == bid_escrow_amount(...) - expected_quote_cost`
+    // here would be tautological, since `expected_quote_cost` is itself
+    // defined as that same `bid_escrow_amount(...)` call).
+    assert!(remaining_budget_val == 0, 1);
     ticket_opt.destroy_none();
     assert!(unmatched_size == 0, 2);
     assert!(stopped == false, 3);
@@ -1107,6 +1109,128 @@ fun fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_
     scenario.end();
 }
 
+// === Coverage gap: a 2-maker sweep where ONE maker already carries
+// pre-existing fill history from an earlier, separate transaction ===
+//
+// `fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_per_order`
+// above starts BOTH makers fresh (`already_charged == 0` for each). This is
+// a variant of that same fixture where maker B is partially filled by its
+// OWN prior taker call before A even exists, so B enters the later 2-maker
+// sweep with nonzero `already_charged`/fill history while A is still fresh
+// -- exercising that each maker's own `quote_cost` in the combined sweep is
+// still computed strictly from that maker's OWN `total_reserved`/
+// `original_size`/`already_charged`, independent of the other maker and of
+// which transaction produced that history.
+#[test]
+fun fill_level_ask_sweep_with_one_maker_carrying_preexisting_fill_history() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+    let price = shortfall_price(); // 5; shortfall_book derives price_scale == 10.
+
+    // Bid B: size 7, total_reserved = ceil(35/10) = 4. Inserted FIRST (so it
+    // sits at the front of the FIFO queue), and partially filled by its own
+    // prior taker call before A is even inserted.
+    let size_b = 7;
+    let escrow_b = book.bid_escrow_amount(price, size_b);
+    assert!(escrow_b == 4, 900);
+    let order_id_b = book.next_order_id();
+    let bid_b = order::new<BTC, USDC>(
+        order_id_b, maker_b(), size_b, option::none(), option::some(balance::create_for_testing<USDC>(escrow_b)), 0,
+    );
+    book.insert_resting_order_for_testing(true, price, bid_b, scenario.ctx());
+
+    // Pre-fill: a separate, earlier `place_limit_order_ask` call sells 2
+    // Base, filling only B (A does not exist yet). Telescoping-ceiling:
+    // cumulative_before = 0, cumulative_after = 2, original_size = 7:
+    //   target_charge = ceil(4*2/7) = ceil(8/7) = ceil(1.1428...) = 2.
+    //   already_charged = 0 => quote_cost = 2.
+    // After this, B's own fill history is: already_charged = 2,
+    // cumulative_filled = 2, escrow remaining = 4 - 2 = 2, Base remaining =
+    // 7 - 2 = 5.
+    let prefill_size = 2;
+    let prefill_expected_quote_output = ask_expected_output_for_price(&book, price, prefill_size);
+    let prefill_payment = coin::mint_for_testing<BTC>(prefill_size, scenario.ctx());
+    let (prefill_ticket_opt, prefill_leftover, prefill_matched_quote, prefill_stopped) =
+        book.place_limit_order_ask(prefill_payment, prefill_expected_quote_output, 1_000_000, scenario.ctx());
+    assert!(!prefill_stopped, 901);
+    prefill_ticket_opt.destroy_none();
+    assert!(prefill_leftover.burn_for_testing() == 0, 902);
+    let prefill_already_charged = 2;
+    assert!(prefill_matched_quote.burn_for_testing() == prefill_already_charged, 903);
+
+    // Bid A: size 3, total_reserved = ceil(15/10) = 2. Inserted AFTER the
+    // pre-fill above -- fresh, `already_charged == 0`.
+    let size_a = 3;
+    let escrow_a = book.bid_escrow_amount(price, size_a);
+    assert!(escrow_a == 2, 904);
+    let order_id_a = book.next_order_id();
+    let bid_a = order::new<BTC, USDC>(
+        order_id_a, maker_a(), size_a, option::none(), option::some(balance::create_for_testing<USDC>(escrow_a)), 0,
+    );
+    book.insert_resting_order_for_testing(true, price, bid_a, scenario.ctx());
+
+    // One later taker call sells 7 Base, sweeping BOTH makers: B is still at
+    // the front of the FIFO queue (partial fills don't reorder a level's
+    // queue), so it is filled first for its remaining 5 (fully concluding
+    // it), then A is filled for the remaining 2 (a partial fill, leaving 1
+    // resting).
+    let taker_size = 5 + 2;
+    let expected_quote_output = ask_expected_output_for_price(&book, price, taker_size);
+    let payment = coin::mint_for_testing<BTC>(taker_size, scenario.ctx());
+    let (ticket_opt, remaining_escrow, matched_quote, stopped) =
+        book.place_limit_order_ask(payment, expected_quote_output, 1_000_000, scenario.ctx());
+
+    assert!(stopped == false, 1);
+    ticket_opt.destroy_none();
+    assert!(remaining_escrow.burn_for_testing() == 0, 2);
+
+    // B's own quote_cost, computed strictly from B's OWN state: cumulative
+    // reaches original_size == 7 exactly (full conclusion).
+    //   target_charge = ceil(4*7/7) = 4; already_charged = 2 (from the
+    //   pre-fill). quote_cost_b = 4 - 2 = 2.
+    let expected_quote_cost_b = 4 - prefill_already_charged;
+    assert!(expected_quote_cost_b == 2, 905);
+    // A's own quote_cost, from A's OWN fresh state: cumulative_after = 2,
+    // original_size = 3.
+    //   target_charge = ceil(2*2/3) = ceil(4/3) = 2; already_charged = 0.
+    //   quote_cost_a = 2.
+    let expected_quote_cost_a = 2;
+
+    let expected_matched_quote = expected_quote_cost_b + expected_quote_cost_a;
+    assert!(matched_quote.burn_for_testing() == expected_matched_quote, 3);
+
+    // Fill order follows FIFO: B (front of queue) fills first, then A.
+    let fills = event::events_by_type<tiny_clob::OrderFilled>();
+    assert!(fills.length() == 3, 4); // prefill's own fill against B, then B, then A
+
+    let (_, _, fid_b, _, fsize_b, fmaker_b, _) = fills[1].order_filled_fields_for_testing();
+    let (fside_b, fquote_b) = fills[1].order_filled_side_and_quote_fields_for_testing();
+    assert!(fid_b == order_id_b, 5);
+    assert!(fsize_b == 5, 6); // B's remaining capacity, fully drained
+    assert!(fmaker_b == maker_b(), 7);
+    assert!(fside_b == true, 8);
+    assert!(fquote_b == expected_quote_cost_b, 9);
+
+    let (_, _, fid_a, _, fsize_a, fmaker_a, _) = fills[2].order_filled_fields_for_testing();
+    let (fside_a, fquote_a) = fills[2].order_filled_side_and_quote_fields_for_testing();
+    assert!(fid_a == order_id_a, 10);
+    assert!(fsize_a == 2, 11); // A's own fresh partial fill
+    assert!(fmaker_a == maker_a(), 12);
+    assert!(fside_a == true, 13);
+    assert!(fquote_a == expected_quote_cost_a, 14);
+
+    // B is fully drained and gone; A still rests with `size_a - 2 = 1` Base
+    // capacity left, and `escrow_a - quote_cost_a` Quote escrow remaining.
+    assert!(book.resting_order_escrow(true, price, order_id_b).is_none(), 15);
+    let (a_escrow_after, a_remaining_after) =
+        book.resting_order_escrow(true, price, order_id_a).destroy_some().resting_order_escrow_fields();
+    assert!(a_escrow_after == escrow_a - expected_quote_cost_a, 16);
+    assert!(a_remaining_after == escrow_a - expected_quote_cost_a, 17);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 // === Coverage gap #2: a `stopped_on_max_fills_while_crossing` sweep
 // resumed by a second call ===
 //
@@ -1244,6 +1368,131 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
     assert!(fid_b == order_id_b && fsize_b == 100 && fmaker_b == maker_b(), 29);
     let (_, _, fid_c, _, fsize_c, fmaker_c, _) = fills[2].order_filled_fields_for_testing();
     assert!(fid_c == order_id_c && fsize_c == second_call_size && fmaker_c == maker_c(), 30);
+
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+// === Coverage gap: `max_fills` exhaustion exactly at a price-LEVEL
+// boundary ===
+//
+// Every existing `max_fills` fixture in this suite rests all resting
+// liquidity at a SINGLE price level, so `max_fills` exhaustion only ever
+// happens mid-level (consuming some but not all orders at that one price) or
+// trivially at `max_fills == 0`. Neither exercises the boundary where
+// `max_fills` is consumed EXACTLY by one price level's resting order(s),
+// stopping the sweep right before it would cross into a second, further
+// (but still fully crossable) price level -- which must leave that second
+// level completely untouched. Both directions (bid crossing asks, ask
+// crossing bids) are covered below.
+
+#[test]
+fun max_fills_exhausted_exactly_at_price_level_boundary_bid_crossing_asks() {
+    let mut scenario = ts::begin(admin());
+    // Same bespoke `price_scale == 1` book shape used elsewhere in this
+    // file, so every quote-cost division is exact (`quote_cost == price *
+    // fill_qty`).
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+
+    // Level A (best/lowest ask price): exactly ONE resting order, size 50.
+    let price_a = 100;
+    let order_id_a = book.next_order_id();
+    let ask_a = order::new<BTC, USDC>(
+        order_id_a, maker_a(), 50, option::some(balance::create_for_testing<BTC>(50)), option::none(), 0,
+    );
+    book.insert_resting_order_for_testing(false, price_a, ask_a, scenario.ctx());
+
+    // Level B: a further, still-crossable (higher) ask price with MORE
+    // resting liquidity than level A.
+    let price_b = 200;
+    let order_id_b = book.next_order_id();
+    let ask_b = order::new<BTC, USDC>(
+        order_id_b, maker_b(), 200, option::some(balance::create_for_testing<BTC>(200)), option::none(), 0,
+    );
+    book.insert_resting_order_for_testing(false, price_b, ask_b, scenario.ctx());
+
+    // Taker bid at price 300 crosses both levels and wants more (200) than
+    // level A alone can supply (50) -- but `max_fills == 1` is consumed
+    // entirely by level A's single order, so the sweep must stop there,
+    // never touching level B.
+    let taker_price = 300;
+    let taker_size = 200;
+    let payment = coin::mint_for_testing<USDC>(
+        bid_payment_for_price(&book, taker_price, taker_size), scenario.ctx(),
+    );
+    let (ticket_opt, matched_base, remaining_budget, stopped) =
+        book.place_limit_order_bid(payment, taker_size, 1, scenario.ctx());
+
+    assert!(stopped == true, 0);
+    assert!(ticket_opt.is_none(), 1); // should_rest forced false while stopped
+    ticket_opt.destroy_none();
+    assert!(matched_base.burn_for_testing() == 50, 2); // level A's full size only
+    // quote_cost for the single fill against A: price_a * 50 = 5_000
+    // (exact, price_scale == 1); the rest of the escrowed budget comes back
+    // untouched.
+    let expected_quote_cost = price_a * 50;
+    assert!(
+        remaining_budget.burn_for_testing()
+            == bid_payment_for_price(&book, taker_price, taker_size) - expected_quote_cost,
+        3,
+    );
+
+    // Level A is fully gone; level B is completely untouched -- still
+    // resting its full original size/escrow.
+    assert!(book.resting_order_escrow(false, price_a, order_id_a).is_none(), 4);
+    let (b_escrow, b_remaining) =
+        book.resting_order_escrow(false, price_b, order_id_b).destroy_some().resting_order_escrow_fields();
+    assert!(b_escrow == 200, 5);
+    assert!(b_remaining == 200, 6);
+
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+#[test]
+fun max_fills_exhausted_exactly_at_price_level_boundary_ask_crossing_bids() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+
+    // Level A (best/highest bid price): exactly ONE resting order, size 50.
+    let price_a = 300;
+    let order_id_a = book.next_order_id();
+    let bid_a = order::new<BTC, USDC>(
+        order_id_a, maker_a(), 50, option::none(), option::some(balance::create_for_testing<USDC>(price_a * 50)), 0,
+    );
+    book.insert_resting_order_for_testing(true, price_a, bid_a, scenario.ctx());
+
+    // Level B: a further, still-crossable (lower) bid price with MORE
+    // resting liquidity than level A.
+    let price_b = 200;
+    let order_id_b = book.next_order_id();
+    let bid_b = order::new<BTC, USDC>(
+        order_id_b, maker_b(), 200, option::none(), option::some(balance::create_for_testing<USDC>(price_b * 200)), 0,
+    );
+    book.insert_resting_order_for_testing(true, price_b, bid_b, scenario.ctx());
+
+    // Taker ask sells 200 Base -- more than level A alone can absorb (50) --
+    // but `max_fills == 1` is consumed entirely by level A's single order,
+    // so the sweep must stop there, never touching level B.
+    let taker_base = coin::mint_for_testing<BTC>(200, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) =
+        book.place_market_order_ask(taker_base, 1, 0, u64_max(), scenario.ctx());
+
+    assert!(stopped == true, 0);
+    assert!(leftover_base.burn_for_testing() == 200 - 50, 1); // level A's full size only
+    assert!(matched_quote.burn_for_testing() == price_a * 50, 2); // exact, price_scale == 1
+
+    // Level A is fully gone; level B is completely untouched -- still
+    // resting its full original size/escrow.
+    assert!(book.resting_order_escrow(true, price_a, order_id_a).is_none(), 3);
+    let (b_escrow, b_remaining) =
+        book.resting_order_escrow(true, price_b, order_id_b).destroy_some().resting_order_escrow_fields();
+    assert!(b_escrow == price_b * 200, 4);
+    assert!(b_remaining == price_b * 200, 5);
 
     destroy_book_and_cap(book, cap);
     wrapper_uid.delete();

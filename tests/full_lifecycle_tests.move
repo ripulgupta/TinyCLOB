@@ -39,7 +39,7 @@ use sui::event;
 use sui::test_scenario as ts;
 use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap};
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
-use tiny_clob::test_utils::{Self, admin, other, taker, maker_a, maker_b, maker_c, realistic_decimals_book};
+use tiny_clob::test_utils::{Self, admin, taker, maker_a, maker_b, maker_c, realistic_decimals_book};
 
 #[test]
 fun full_lifecycle_realistic_btc_usdc_decimals() {
@@ -242,8 +242,11 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(fee_base.burn_for_testing() == cross4_maker_fee_base, 44); // = 1
     assert!(fee_quote.burn_for_testing() == cross3_taker_fee + cross4_taker_fee, 45); // = 109
 
-    // --- Retire, drain (across two calls, proving the incremental-drain ---
-    // --- story), then finalize. Only bid2 (maker_c(), untouched) remains. ---
+    // --- Drain (across two calls, proving the incremental-drain story), ---
+    // --- then finalize. Only bid2 (maker_c(), untouched) remains. This  ---
+    // --- retire call is a harmless no-op repeat -- the book is already  ---
+    // --- retiring from the earlier retire above (needed to unblock the  ---
+    // --- push_proceeds call). ---
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 0, scenario.ctx()); // no-op
     assert!(book.bids_size_for_testing() == 1, 46);

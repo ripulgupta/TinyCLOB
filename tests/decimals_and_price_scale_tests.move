@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    Self, admin, taker, maker_a, maker_b, min_size, new_book, destroy_book_and_cap, rest_ask, assert_extremes_and_adjacent_ticks, u64_max,
 };
 
 
@@ -364,8 +362,99 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     assert!(max_b.burn_for_testing() == size, 10);
     assert!(max_q.burn_for_testing() == 0, 11);
 
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+/// Ask-side counterpart to `btc_sui_pair_price_extremes_and_adjacent_ticks`
+/// above (`price_scale = 1`, `p_min = 10`, `p_max = 10_000_000`). Unlike the
+/// USDC/BTC-reversed ask test above, `price_scale == 1` means any nonzero
+/// size round-trips a price exactly (`expected_quote_output * price_scale ==
+/// price * size` always holds when `price_scale == 1`), so `min_size()`
+/// alone suffices at both ends -- no special-cased leg size needed.
+#[test]
+fun btc_sui_pair_ask_side_price_extremes() {
+    let mut scenario = ts::begin(admin());
+    let p_min: u64 = 10;
+    let p_max: u64 = 10_000_000;
+    let p_mid: u64 = 337_140;
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, p_mid, &wrapper_uid, scenario.ctx());
+    let size = min_size();
+
+    let min_payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let min_expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_min, size);
+    let (min_ticket_opt, min_leftover, min_matched, min_stopped) =
+        book.place_limit_order_ask(min_payment, min_expected_quote_output, 10, scenario.ctx());
+    assert!(!min_stopped, 0);
+    assert!(min_leftover.burn_for_testing() == 0, 1);
+    assert!(min_matched.burn_for_testing() == 0, 2);
+    assert!(book.ask_base_escrow_at_price(p_min) == size, 3);
+    let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(min_b.burn_for_testing() == size, 4);
+    assert!(min_q.burn_for_testing() == 0, 5);
+
+    let max_payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let max_expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_max, size);
+    let (max_ticket_opt, max_leftover, max_matched, max_stopped) =
+        book.place_limit_order_ask(max_payment, max_expected_quote_output, 10, scenario.ctx());
+    assert!(!max_stopped, 6);
+    assert!(max_leftover.burn_for_testing() == 0, 7);
+    assert!(max_matched.burn_for_testing() == 0, 8);
+    assert!(book.ask_base_escrow_at_price(p_max) == size, 9);
+    let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(max_b.burn_for_testing() == size, 10);
+    assert!(max_q.burn_for_testing() == 0, 11);
+
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+/// Ask-side counterpart to
+/// `wal_sui_same_decimals_pair_price_extremes_and_adjacent_ticks` above
+/// (`price_scale = 100`, `p_min = 1`, `p_max = 1_000_000`). At `p_min == 1`,
+/// `price * size >= price_scale` requires `size >= 100`, which `min_size()`
+/// (100) meets exactly, so no special-cased leg size is needed here either.
+#[test]
+fun wal_sui_same_decimals_pair_ask_side_price_extremes() {
+    let mut scenario = ts::begin(admin());
+    let p_min: u64 = 1;
+    let p_max: u64 = 1_000_000;
+    let p_mid: u64 = 250;
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<WAL, SUI>(min_size(), 9, 9, 2, 4, p_mid, &wrapper_uid, scenario.ctx());
+    let size = min_size();
+
+    let min_payment = coin::mint_for_testing<WAL>(size, scenario.ctx());
+    let min_expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_min, size);
+    let (min_ticket_opt, min_leftover, min_matched, min_stopped) =
+        book.place_limit_order_ask(min_payment, min_expected_quote_output, 10, scenario.ctx());
+    assert!(!min_stopped, 0);
+    assert!(min_leftover.burn_for_testing() == 0, 1);
+    assert!(min_matched.burn_for_testing() == 0, 2);
+    assert!(book.ask_base_escrow_at_price(p_min) == size, 3);
+    let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(min_b.burn_for_testing() == size, 4);
+    assert!(min_q.burn_for_testing() == 0, 5);
+
+    let max_payment = coin::mint_for_testing<WAL>(size, scenario.ctx());
+    let max_expected_quote_output = test_utils::ask_expected_output_for_price(&book, p_max, size);
+    let (max_ticket_opt, max_leftover, max_matched, max_stopped) =
+        book.place_limit_order_ask(max_payment, max_expected_quote_output, 10, scenario.ctx());
+    assert!(!max_stopped, 6);
+    assert!(max_leftover.burn_for_testing() == 0, 7);
+    assert!(max_matched.burn_for_testing() == 0, 8);
+    assert!(book.ask_base_escrow_at_price(p_max) == size, 9);
+    let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
+    assert!(max_b.burn_for_testing() == size, 10);
+    assert!(max_q.burn_for_testing() == 0, 11);
+
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -548,7 +637,7 @@ fun place_limit_order_ask_price_overflow_aborts() {
 //
 // USDC(6)/BTC(8), precision=1, exponent=0 -- the same shape used by
 // `usdc_btc_reversed_pair_price_just_below_min_aborts`/`_just_above_max_aborts`
-// above: `price_scale = ceil(10^6 * 10^1 / 10^8) = 1`, `p_min = 10`,
+// in tests/escrow_shortfall_and_edge_case_tests.move: `price_scale = ceil(10^6 * 10^1 / 10^8) = 1`, `p_min = 10`,
 // `p_max = 100` (both derived the same way as those tests' doc comments).
 // Neither book below has any resting order (`best_bid`/`best_ask` are both
 // `None`), so `set_last_price`'s later best-bid/best-ask bound checks never
@@ -565,8 +654,8 @@ fun set_last_price_below_declared_min_aborts() {
     let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
     book.set_last_price(p_min - 1, scenario.ctx());
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -581,8 +670,8 @@ fun set_last_price_above_declared_max_aborts() {
     let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
     book.set_last_price(p_max + 1, scenario.ctx());
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -592,7 +681,8 @@ fun set_last_price_above_declared_max_aborts() {
 // Same USDC(6)/BTC(8), precision=1, exponent=0 book shape as Gap 1 above
 // (`price_scale = 1`, `p_min = 10`, `p_max = 100`). Mirrors the existing
 // bid-side reject tests (`usdc_btc_reversed_pair_price_just_below_min_aborts`/
-// `_just_above_max_aborts`), but through `place_limit_order_ask` -- using
+// `_just_above_max_aborts`, in tests/escrow_shortfall_and_edge_case_tests.move),
+// but through `place_limit_order_ask` -- using
 // `test_utils::ask_expected_output_for_price` to derive an
 // `expected_quote_output` that round-trips back to exactly the target
 // out-of-range price, same as `usdc_btc_reversed_pair_ask_side_price_extremes`
@@ -616,8 +706,8 @@ fun place_limit_order_ask_price_just_below_min_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(leftover_base);
     unit_test::destroy(matched_quote);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -641,8 +731,8 @@ fun place_limit_order_ask_price_just_above_max_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(leftover_base);
     unit_test::destroy(matched_quote);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -711,8 +801,8 @@ fun realistic_decimals_book_bid_below_min_size_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(matched_base);
     unit_test::destroy(leftover_quote);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     scenario.end();
 }
 
@@ -755,8 +845,8 @@ fun realistic_decimals_book_ask_below_min_size_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(leftover_base);
     unit_test::destroy(matched_quote);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     scenario.end();
 }
 

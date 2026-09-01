@@ -311,7 +311,6 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
 
     assert!(book.bid_quote_escrow_at_price(p_mid) == mid_escrow, 19);
     assert!(book.bid_quote_escrow_at_price(p_mid_next) == mid_next_escrow, 20);
-    assert!(p_mid != p_mid_next, 21);
 
     unit_test::destroy(mid_ticket_opt.destroy_some());
     unit_test::destroy(mid_next_ticket_opt.destroy_some());

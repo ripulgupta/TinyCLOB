@@ -10,9 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
+    Self, admin, other, taker, maker_a, maker_b, min_size, shortfall_price, destroy_book_and_cap, rest_bid, rest_ask, shortfall_book, u64_max,
 };
 
 
@@ -524,8 +522,8 @@ fun usdc_btc_reversed_pair_price_just_below_min_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -552,8 +550,8 @@ fun usdc_btc_reversed_pair_price_just_above_max_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -574,8 +572,8 @@ fun btc_sui_pair_price_just_below_min_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -596,8 +594,8 @@ fun btc_sui_pair_price_just_above_max_aborts() {
     unit_test::destroy(ticket_opt);
     unit_test::destroy(mb);
     unit_test::destroy(ml);
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -615,8 +613,8 @@ fun new_initial_last_price_just_below_declared_min_aborts() {
     let p_min: u64 = 10;
     let wrapper_uid = object::new(scenario.ctx());
     let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_min - 1, &wrapper_uid, scenario.ctx());
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -629,8 +627,8 @@ fun new_initial_last_price_just_above_declared_max_aborts() {
     let p_max: u64 = 100_000_000;
     let wrapper_uid = object::new(scenario.ctx());
     let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_max + 1, &wrapper_uid, scenario.ctx());
-    sui::test_utils::destroy(book);
-    sui::test_utils::destroy(cap);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -657,6 +655,64 @@ fun new_base_decimals_over_max_aborts() {
     // MAX_DECIMALS = 38; 39 is one over.
     let wrapper_uid = object::new(scenario.ctx());
     let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 39, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+// `EDecimalsTooLarge`'s guard checks all four of `base_decimals`,
+// `quote_decimals`, `precision`, `exponent` in a single conjunction; the test
+// above only ever exercises `base_decimals`. The three tests below exercise
+// each of the other three params at `39` individually (others held at `0`) —
+// this check runs before any `price_scale`/feasibility computation, so the
+// other params' values don't matter for triggering this particular abort.
+#[test]
+#[expected_failure(abort_code = 28, location = tiny_clob)] // EDecimalsTooLarge
+fun new_quote_decimals_over_max_aborts() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 39, 0, 0, 1, &wrapper_uid, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 28, location = tiny_clob)] // EDecimalsTooLarge
+fun new_precision_over_max_aborts() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 39, 0, 1, &wrapper_uid, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 28, location = tiny_clob)] // EDecimalsTooLarge
+fun new_exponent_over_max_aborts() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 39, 1, &wrapper_uid, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+/// Constructs a book at the ACCEPT boundary `base_decimals = quote_decimals =
+/// MAX_DECIMALS (38)`, `precision = exponent = 0` — one over any of these
+/// would trip `EDecimalsTooLarge` above, so this pins down that `38` itself
+/// is still accepted, not just rejected-at-39.
+/// `scale_lo = ceil(10^38 * 10^0 / 10^38) = 1`;
+/// `scale_hi = floor(u64::MAX * 10^38 / (10^38 * 10^0)) = u64::MAX` — feasible,
+/// with `price_scale = 1`. `initial_last_price = 1` lands exactly on both
+/// `P_min` and `P_max` (both `= 1`, since `precision = exponent = 0`).
+#[test]
+fun new_at_max_decimals_boundary_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 38, 38, 0, 0, 1, &wrapper_uid, scenario.ctx());
+    assert!(book.price_scale() == 1, 0);
     destroy_book_and_cap(book, cap);
     wrapper_uid.delete();
     scenario.end();

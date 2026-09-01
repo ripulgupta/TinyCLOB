@@ -10,10 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
-    bid_payment_for_price, ask_expected_output_for_price, realistic_decimals_book,
+    Self, admin, other, new_book, destroy_book_and_cap, u64_max, bid_payment_for_price, ask_expected_output_for_price, realistic_decimals_book,
 };
 
 // Fee-rate fixture shared with the `match_bid`/`match_ask` regression tests

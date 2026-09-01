@@ -2325,9 +2325,16 @@ public struct OrderExecuted has copy, drop {
     /// caller's `payment.value()`; for `place_market_order_bid`, `max_base_out`;
     /// for `place_market_order_ask`, `min(payment.value(), max_base_in)`.
     requested_size: u64,
-    /// Remaining size after matching (gross base; NOT reduced by taker fee,
-    /// so `requested_size - unmatched_size` does not equal the base actually
-    /// returned to the taker when `taker_fee_bps > 0`).
+    /// Remaining size after matching. For `entry_point` 0 (limit bid), 1
+    /// (limit ask), and 3 (market ask), this is GROSS base -- NOT reduced by
+    /// the taker fee, so `requested_size - unmatched_size` does not equal the
+    /// base actually returned to the taker when `taker_fee_bps > 0`. For
+    /// `entry_point` 2 (`place_market_order_bid`) specifically, this is
+    /// instead the NET shortfall against the caller's own NET
+    /// `max_base_out` request (`max_base_out - matched_base.value()`, where
+    /// `matched_base` is already post-fee) -- so for that one entry point,
+    /// `requested_size - unmatched_size` DOES equal the base actually
+    /// delivered to the taker.
     unmatched_size: u64,
     /// 0 if nothing ends up resting. On the bid limit path this can be LESS
     /// than `unmatched_size` even when something rests, because

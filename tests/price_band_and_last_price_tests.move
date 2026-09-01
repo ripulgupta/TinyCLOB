@@ -10,10 +10,7 @@ use tiny_clob::tiny_clob::{Self, OrderBook, OrderTicket, ClobAdminCap, ProceedsC
 use tiny_clob::order;
 use tiny_clob::test_markers::{BTC, USDC, SUI, WAL};
 use tiny_clob::test_utils::{
-    Self, admin, other, taker, maker_a, maker_b, maker_c, min_size, max_min_size,
-    default_price, default_size, shortfall_price, new_book, destroy_book_and_cap,
-    rest_bid, rest_ask, shortfall_book, assert_extremes_and_adjacent_ticks, u64_max,
-    realistic_decimals_book,
+    Self, admin, other, taker, maker_a, min_size, new_book, destroy_book_and_cap, rest_bid, rest_ask, u64_max, realistic_decimals_book,
 };
 
 
@@ -105,6 +102,34 @@ fun set_last_price_empty_book_is_unconstrained() {
     let (mut book, cap) = new_book(&mut scenario);
     book.set_last_price(12_345, scenario.ctx());
     assert!(book.last_price() == 12_345, 0);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// The test above only ever moves `last_price` UPWARD on an empty book. This
+/// proves the empty-book bracket-skip (no `best_bid`/`best_ask` to bound
+/// against) genuinely works in the DOWNWARD direction too: rest a bid at
+/// 1000, jump `last_price` up to 5000 (bounded by nothing, since there's no
+/// resting ask), cancel the bid (book now empty again), then jump back down
+/// to 1 -- which would abort `EResetPriceBelowBestBid` if the bid were still
+/// resting, but must succeed cleanly now that the book is genuinely empty.
+#[test]
+fun set_last_price_empty_book_is_unconstrained_downward() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
+    book.set_last_price(5000, scenario.ctx());
+    assert!(book.last_price() == 5000, 0);
+
+    let (cb, cq) = book.cancel_order(ticket, scenario.ctx());
+    cb.burn_for_testing();
+    cq.burn_for_testing();
+    assert!(book.best_bid().is_none() && book.best_ask().is_none(), 1); // genuinely empty again
+
+    book.set_last_price(1, scenario.ctx());
+    assert!(book.last_price() == 1, 2);
+
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -315,6 +340,191 @@ fun last_price_reflects_last_of_two_fully_filled_bid_levels() {
 
     unit_test::destroy(bid1);
     unit_test::destroy(bid2);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Price band anchored to a fill-driven `last_price` change ---
+//
+// Every price-band test above sets `last_price` directly via `set_last_price`;
+// none of them ever let a real fill move `last_price` and then re-checked the
+// band against the new value. The tests below close that gap: a resting ask
+// at 1900 is crossed by a market bid (updating `last_price` to 1900 via the
+// fill path, not `set_last_price`), then the band -- now anchored to 1900,
+// not the original 1000 -- is shown to have genuinely moved.
+
+/// Shared setup: `last_price = 1000`, `factor = Some(2)` (old band
+/// `[500, 2000]`), then a resting ask at 1900 is fully crossed by a market
+/// bid, updating `last_price` to 1900 via the fill path. New band:
+/// `[1900/2, 1900*2] = [950, 3800]` (per the source's `price * factor >=
+/// last_price` / `price <= last_price * factor` check).
+fun band_anchored_to_1900_fill(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap, OrderTicket) {
+    let (mut book, cap) = new_book(scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+
+    let ask_ticket = rest_ask(&mut book, 1900, min_size(), 10, scenario.ctx());
+
+    scenario.next_tx(taker());
+    let budget = book.bid_escrow_amount(1900, min_size());
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover, stopped) =
+        book.place_market_order_bid(payment, 10, 0, min_size(), u64_max(), scenario.ctx());
+    assert!(!stopped, 90);
+    assert!(matched_base.burn_for_testing() == min_size(), 91);
+    assert!(leftover.burn_for_testing() == 0, 92);
+    assert!(book.last_price() == 1900, 93); // moved via the fill path, not set_last_price
+
+    (book, cap, ask_ticket)
+}
+
+#[test]
+fun price_band_anchors_to_fill_driven_last_price_bid_at_new_high_edge_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap, ask_ticket) = band_anchored_to_1900_fill(&mut scenario);
+
+    // New band's high edge (3800): succeeds.
+    let ticket = rest_bid(&mut book, 3800, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(ticket);
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 24, location = tiny_clob)] // EPriceAboveBand
+fun price_band_anchors_to_fill_driven_last_price_bid_above_new_band_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap, ask_ticket) = band_anchored_to_1900_fill(&mut scenario);
+
+    // One above the new band's high edge (3801): aborts.
+    let ticket = rest_bid(&mut book, 3801, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(ticket);
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 23, location = tiny_clob)] // EPriceBelowBand
+fun price_band_anchors_to_fill_driven_last_price_bid_below_new_band_though_in_old_band_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap, ask_ticket) = band_anchored_to_1900_fill(&mut scenario);
+
+    // 949 was comfortably inside the OLD band ([500, 2000], anchored to the
+    // original last_price of 1000) but the band has genuinely moved to
+    // [950, 3800] -- 949 is now rejected, proving the anchor really did move.
+    let ticket = rest_bid(&mut book, 949, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(ticket);
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// --- Price-band edge values: `factor == 1` and u128 headroom ---
+//
+// Every price-band test above uses `factor = 2` (or the incidental `1000` in
+// `clob_admin_set_price_band_factor_none_clears_band_and_price_now_succeeds`,
+// used there only for an id/field check, never for actually placing an
+// order at the band's edge). The tests below cover `factor == 1` (the band
+// collapses to a single exact point) and a maximal `factor` combined with a
+// large `last_price` (confirming the `u128` band arithmetic has headroom and
+// doesn't spuriously overflow/abort).
+
+/// `factor == 1` collapses the band to exactly `{last_price}`: a bid placed
+/// at exactly `last_price` (1000) must succeed. (Placing a bid AND an ask
+/// both at exactly 1000 on the same book would cross and fully fill each
+/// other rather than rest — that's a matching-engine property, not a
+/// band-check one — so the ask side gets its own book below instead.)
+#[test]
+fun price_band_factor_one_collapses_band_to_exact_last_price_bid_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(1));
+    // band: [1000/1, 1000*1] = [1000, 1000] -- a single point.
+
+    let bid_ticket = rest_bid(&mut book, 1000, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// Ask-side counterpart to the bid test above, on its own book (see that
+/// test's doc comment for why they can't share one book at this price).
+#[test]
+fun price_band_factor_one_collapses_band_to_exact_last_price_ask_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(1));
+
+    let ask_ticket = rest_ask(&mut book, 1000, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 23, location = tiny_clob)] // EPriceBelowBand
+fun price_band_factor_one_rejects_one_below_collapsed_point() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(1));
+    let ticket = rest_bid(&mut book, 999, min_size(), 10, scenario.ctx());
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+#[test]
+#[expected_failure(abort_code = 24, location = tiny_clob)] // EPriceAboveBand
+fun price_band_factor_one_rejects_one_above_collapsed_point() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(1));
+    let ticket = rest_bid(&mut book, 1001, min_size(), 10, scenario.ctx());
+    unit_test::destroy(ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// A very large `price_band_factor` (`u64::MAX`) combined with a large
+/// `last_price` must not overflow the band check's `u128` arithmetic
+/// (`price * factor` / `last_price * factor`, both computed as `u128` in the
+/// source). `large_last_price = 10^17` is chosen as the largest power of ten
+/// still compatible with placing an actual resting order at `min_size()`
+/// (100) on this `price_scale == 1` book -- `price * size` (the quote value
+/// `bid_escrow_amount`/`ask_expected_output_for_price` must itself compute
+/// and cast to `u64`) is a SEPARATE `u64`-sized quantity from the band
+/// check's `u128` product, and caps how large a price this fixture can
+/// legally place an order at (`10^17 * 100 = 10^19`, just under `u64::MAX`
+/// =~ 1.8e19; `10^19 * 100` would itself overflow that unrelated cast). The
+/// band product itself, `10^17 * u64::MAX =~ 1.8e36`, is still far below
+/// `u128::MAX` (~3.4e38) but far above `u64::MAX` (~1.8e19) -- so a `u64`
+/// implementation of this check would have overflowed here, while the
+/// actual `u128` one doesn't: both a tiny price (1) and `large_last_price`
+/// itself succeed.
+#[test]
+fun price_band_factor_max_u64_with_large_last_price_accepts_everything_without_overflow() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let large_last_price: u64 = 100_000_000_000_000_000; // 10^17
+    book.set_last_price(large_last_price, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(u64_max()));
+
+    let low_ticket = rest_bid(&mut book, 1, min_size(), 10, scenario.ctx());
+    let high_ticket = rest_bid(&mut book, large_last_price, min_size(), 10, scenario.ctx());
+
+    unit_test::destroy(low_ticket);
+    unit_test::destroy(high_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

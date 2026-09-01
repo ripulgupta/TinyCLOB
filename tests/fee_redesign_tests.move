@@ -173,7 +173,7 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
 
     // Two 100-unit ask fills against the resting bid.
     scenario.next_tx(other());
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 2) {
         let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
         let (leftover_base, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000, 0, 100, scenario.ctx(),
@@ -302,7 +302,7 @@ fun maker_fee_reserve_trues_up_on_clob_admin_drain_step_with_nonzero_slack() {
     let bid = order::new<BTC, USDC>(order_id, other(), 300, option::none(), option::some(escrow), MAKER_FEE_BPS);
     book.insert_resting_order_for_testing(true, PRICE, bid, scenario.ctx());
 
-    let mut i = 0;
+    let mut i = 0u64;
     while (i < 2) {
         let ask_payment = coin::mint_for_testing<BTC>(100, scenario.ctx());
         let (leftover_base, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000, 0, 100, scenario.ctx(),
@@ -514,6 +514,90 @@ fun place_market_order_bid_net_cap_binds_with_ample_liquidity_and_equal_min_max(
     // `taker_fee_amount = ceil(11 * 10 / 10_000) = ceil(0.011) = 1`.
     // Net delivered = `11 - 1 = 10 == max_base_out` exactly.
     assert!(taker_fee_amount == 1, 3);
+    assert!(matched_base_val == net_cap, 4);
+    assert!(unmatched_size == 0, 5);
+
+    let (fee_base_after, _fee_quote_after) = book.fee_accumulator_balances();
+    assert!(fee_base_after == taker_fee_amount, 6);
+
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+/// `gross_size_bound_for_net_cap`'s zero-`net_cap` short-circuit: `net_cap ==
+/// 0` must cleanly no-op (`matched_base == 0`), not abort -- even with a
+/// nonzero taker fee rate and ample resting liquidity available to match
+/// against. `gross_size_bound_for_net_cap(0, 10) == ceil(0 * 10_000 / 9_990)
+/// == 0`, so the gross bound fed to matching is itself 0.
+#[test]
+fun place_market_order_bid_zero_net_cap_no_ops_cleanly() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let taker_fee_bps = 10; // MAX_TAKER_FEE_BPS
+    cap.clob_admin_set_taker_fee(&mut book, taker_fee_bps);
+
+    let order_id = book.next_order_id();
+    let escrow = balance::create_for_testing<BTC>(50);
+    let ask = order::new<BTC, USDC>(order_id, other(), 50, option::some(escrow), option::none(), 0);
+    book.insert_resting_order_for_testing(false, PRICE, ask, scenario.ctx());
+
+    let payment = coin::mint_for_testing<USDC>(PRICE * 50, scenario.ctx());
+    let (matched_base, leftover_payment, stopped) =
+        book.place_market_order_bid(payment, 1_000_000, 0, 0, u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    assert!(matched_base.burn_for_testing() == 0, 1);
+    assert!(leftover_payment.burn_for_testing() == PRICE * 50, 2);
+
+    let (fee_base_after, fee_quote_after) = book.fee_accumulator_balances();
+    assert!(fee_base_after == 0, 3);
+    assert!(fee_quote_after == 0, 4);
+
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+/// A second `gross_size_bound_for_net_cap` fee-path data point beyond the
+/// existing `net_cap=10, rate=10` coverage above: a larger `net_cap = 1_000`
+/// at the same `MAX_TAKER_FEE_BPS = 10` rate, with ample resting liquidity.
+/// `gross_size_bound_for_net_cap(1_000, 10) == ceil(1_000 * 10_000 / 9_990)
+/// == ceil(1_001.001...) == 1_002`.
+/// `taker_fee_amount = ceil(1_002 * 10 / 10_000) == ceil(1.002) == 2`.
+/// Net delivered = `1_002 - 2 == 1_000 == net_cap` exactly.
+#[test]
+fun place_market_order_bid_larger_net_cap_at_max_taker_fee_bps() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let taker_fee_bps = 10; // MAX_TAKER_FEE_BPS
+    cap.clob_admin_set_taker_fee(&mut book, taker_fee_bps);
+
+    // A single resting ask of size 2_000 -- comfortably more than the
+    // 1_002 gross bound this net cap derives -- rather than thousands of
+    // separate 1-unit orders, to keep this test's VM execution cost low.
+    let num_resting = 2_000;
+    let order_id = book.next_order_id();
+    let escrow = balance::create_for_testing<BTC>(num_resting);
+    let ask = order::new<BTC, USDC>(order_id, other(), num_resting, option::some(escrow), option::none(), 0);
+    book.insert_resting_order_for_testing(false, PRICE, ask, scenario.ctx());
+
+    let net_cap = 1_000;
+    let budget = PRICE * num_resting;
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_payment, stopped) =
+        book.place_market_order_bid(payment, 1_000_000, net_cap, net_cap, u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    let matched_base_val = matched_base.burn_for_testing();
+    leftover_payment.burn_for_testing();
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 1);
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(requested_size == net_cap, 2);
+    assert!(taker_fee_amount == 2, 3);
     assert!(matched_base_val == net_cap, 4);
     assert!(unmatched_size == 0, 5);
 
