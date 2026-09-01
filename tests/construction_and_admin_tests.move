@@ -21,16 +21,16 @@ public struct CapHolder has key, store {
     cap: ClobAdminCap,
 }
 
-// `clob_admin_finalize`'s precondition assert now also checks the book's
-// fee_accumulator is empty, so an unclaimed-fees book fails fast with the
-// module's own clear `ENotFullyDrained` instead of aborting deep inside
-// `balance::destroy_zero` with a generic Sui-framework-level abort. The
-// clob_admin_finalize tests above only ever exercise resting-order-only
-// scenarios where fee_accumulator stays (0, 0), so that path is never
-// actually hit there. These two tests close that gap: the first generates
-// a genuine fee-bearing fill, retires+drains the book, and confirms
-// clob_admin_finalize aborts on the unclaimed fees; the second repeats the setup but
-// claims the fees first, confirming the claim-then-clob_admin_finalize path succeeds.
+// `clob_admin_finalize`'s precondition assert no longer checks the book's
+// fee_accumulator at all — it now sweeps whatever's left in the accumulator
+// itself and hands it back to the caller as coins, so a nonzero
+// fee_accumulator is no longer a precondition failure. The
+// `clob_admin_finalize` tests above only ever exercise resting-order-only
+// scenarios where fee_accumulator stays (0, 0), so that sweep path is never
+// actually hit there. These tests close that gap: they generate a genuine
+// fee-bearing fill, retire+drain the book, and confirm `clob_admin_finalize`
+// succeeds either way — whether or not fees were claimed beforehand — and
+// returns the correct swept fee amounts as coins.
 
 const FINALIZE_FEES_PRICE: u64 = 50_000;
 const FINALIZE_FEES_SIZE: u64 = 2_000;
@@ -154,7 +154,9 @@ fun clob_admin_cap_store_and_discard() {
     // with the correct `cap_id`/`book_id`.
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     assert!(deleted_id == book_id, 3);
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
@@ -362,8 +364,10 @@ fun drain_step_before_retire_aborts() {
 fun finalize_before_retire_aborts() {
     let mut scenario = ts::begin(admin());
     let (book, cap) = new_book(&mut scenario);
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(fee_base_coin);
+    sui::test_utils::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -380,8 +384,10 @@ fun finalize_rejects_wrong_cap() {
     cap2.clob_admin_drain_step(&mut book2, 10, scenario.ctx());
 
     // cap2 belongs to book2, not book1 — must abort with EWrongClobAdminCap.
-    let deleted_id = cap2.clob_admin_finalize(book1);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap2.clob_admin_finalize(book1, scenario.ctx());
     sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(fee_base_coin);
+    sui::test_utils::destroy(fee_quote_coin);
     sui::test_utils::destroy(book2);
     sui::test_utils::destroy(_cap1);
     scenario.end();
@@ -401,8 +407,10 @@ fun finalize_while_nonempty_aborts_not_fully_drained() {
     book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
 
     cap.clob_admin_retire(&mut book);
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(fee_base_coin);
+    sui::test_utils::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -424,8 +432,10 @@ fun finalize_while_only_asks_nonempty_aborts_not_fully_drained() {
     book.insert_resting_order_for_testing(false, price, order, scenario.ctx());
 
     cap.clob_admin_retire(&mut book);
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(fee_base_coin);
+    sui::test_utils::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -467,8 +477,10 @@ fun finalize_while_only_proceeds_nonempty_aborts_not_fully_drained() {
     assert!(fee_quote == 0, 103);
 
     cap.clob_admin_retire(&mut book);
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     sui::test_utils::destroy(deleted_id);
+    sui::test_utils::destroy(fee_base_coin);
+    sui::test_utils::destroy(fee_quote_coin);
     scenario.end();
 }
 
@@ -497,7 +509,9 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
     assert!(book.bids_size_for_testing() == 0, 2);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 3);
     let (deleted_book_id, _deleted_enclosing_id, deleted_base, deleted_quote) =
@@ -535,7 +549,9 @@ fun clob_admin_finalize_returns_true_book_id_not_enclosing_object_id() {
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     assert!(deleted_id == true_book_id, 1);
 
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
@@ -579,7 +595,9 @@ fun book_version_upgraded_and_cap_discarded_stamp_both_book_id_and_enclosing_obj
 
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     assert!(deleted_id == true_book_id, 4);
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
@@ -710,22 +728,34 @@ fun every_event_type_stamps_true_book_id_and_foreign_enclosing_object_id_indepen
     scenario.end();
 }
 
-#[test, expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
-fun finalize_aborts_when_fee_accumulator_nonzero() {
+#[test]
+fun finalize_succeeds_and_sweeps_fee_accumulator_without_claim() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     cap.clob_admin_set_taker_fee(&mut book, 10);
     cap.clob_admin_set_maker_fee(&mut book, 5);
 
-    let (fee_base, _fee_quote) = generate_one_fee_bearing_fill(&mut scenario, &mut book, 10, 5);
+    let (fee_base, fee_quote) = generate_one_fee_bearing_fill(&mut scenario, &mut book, 10, 5);
     assert!(fee_base > 0, 0);
-    let (fee_base_bal, _) = book.fee_accumulator_balances();
+    let (fee_base_bal, fee_quote_bal) = book.fee_accumulator_balances();
     assert!(fee_base_bal == fee_base, 1);
+    assert!(fee_quote_bal == fee_quote, 2);
 
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
-    // Fee accumulator is still nonzero (never claimed) — this aborts.
-    let deleted_id = cap.clob_admin_finalize(book);
+    // Fee accumulator is still nonzero (never claimed) — `clob_admin_finalize`
+    // now sweeps it automatically instead of requiring a prior claim.
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    assert!(fee_base_coin.burn_for_testing() == fee_base, 3);
+    assert!(fee_quote_coin.burn_for_testing() == fee_quote, 4);
+
+    let fees_claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
+    assert!(fees_claimed_events.length() == 1, 5);
+    let (ev_book_id, _ev_enclosing_id, _ev_claimant, ev_base_amount, ev_quote_amount) =
+        fees_claimed_events[0].fees_claimed_fields_for_testing();
+    assert!(ev_book_id == deleted_id, 6);
+    assert!(ev_base_amount == fee_base, 7);
+    assert!(ev_quote_amount == fee_quote, 8);
 
     sui::test_utils::destroy(deleted_id);
     scenario.end();
@@ -751,7 +781,10 @@ fun finalize_succeeds_after_fees_claimed() {
 
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    // Fees were already claimed, so finalize sweeps nothing further.
+    assert!(fee_base_coin.burn_for_testing() == 0, 62);
+    assert!(fee_quote_coin.burn_for_testing() == 0, 63);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 5);
     let (deleted_book_id, _deleted_enclosing_id, deleted_base, deleted_quote) =
@@ -770,11 +803,13 @@ fun finalize_succeeds_after_fees_claimed() {
 // --- maker-fee reserve into `book.fee_accumulator`, same as any other order
 // --- conclusion. So if `clob_admin_claim_fees` is called BEFORE every drain
 // --- step has run, a later step can re-credit the accumulator after it was
-// --- already claimed down to zero, and `clob_admin_finalize` then aborts
-// --- with `ENotFullyDrained` — recoverable by simply claiming fees again.
-// --- The three tests below pin down: the reintroduced-reserve abort, its
-// --- recovery via a second claim, and the trivially-safe claim-after-drain
-// --- ordering.
+// --- already claimed down to zero. Under the OLD design this blocked
+// --- `clob_admin_finalize` with `ENotFullyDrained` until fees were reclaimed;
+// --- now `clob_admin_finalize` simply sweeps the residual itself. The three
+// --- tests below pin down: finalize succeeding directly on a re-credited
+// --- residual without any second claim (the exact scenario that used to
+// --- trap an admin operationally), reclaiming as an equally-valid
+// --- alternative, and the trivially-safe claim-after-drain ordering.
 
 const CLAIM_DRAIN_ORDER_PRICE: u64 = 50_000;
 const CLAIM_DRAIN_ORDER_SIZE: u64 = 200;
@@ -849,14 +884,24 @@ fun finalize_recovers_after_reclaiming_fees_post_drain() {
     assert!(base_final == 0, 10);
     assert!(quote_final == 0, 11);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    assert!(fee_base_coin.burn_for_testing() == 0, 12);
+    assert!(fee_quote_coin.burn_for_testing() == 0, 13);
     sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
 
+/// Regression test for the reported operational trap: an admin calls
+/// `clob_admin_claim_fees` before every `clob_admin_drain_step` has run, a
+/// later drain step force-cancels a still-resting, previously-partially-
+/// filled order and re-credits the maker-fee reserve into the accumulator,
+/// and the admin then calls `clob_admin_finalize` directly — WITHOUT
+/// reclaiming fees a second time. Under the old design this aborted with
+/// `ENotFullyDrained` until fees were reclaimed; `clob_admin_finalize` must
+/// now succeed unconditionally and return the correct residual fee amount
+/// (2_500 Quote, 0 Base) as a swept coin.
 #[test]
-#[expected_failure(abort_code = 7, location = tiny_clob)] // tiny_clob::ENotFullyDrained
-fun finalize_aborts_when_fees_claimed_before_drain_reintroduces_reserve() {
+fun finalize_succeeds_directly_when_drain_reintroduces_reserve_after_claim() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     cap.clob_admin_set_taker_fee(&mut book, 10);
@@ -878,8 +923,23 @@ fun finalize_aborts_when_fees_claimed_before_drain_reintroduces_reserve() {
     assert!(fee_base == 0, 0);
     assert!(fee_quote == 2_500, 1);
 
-    // The accumulator is nonzero again — this aborts with ENotFullyDrained.
-    let deleted_id = cap.clob_admin_finalize(book);
+    // The accumulator is nonzero again, but `clob_admin_finalize` sweeps it
+    // itself now — no re-claim required, and no abort.
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    assert!(fee_base_coin.burn_for_testing() == 0, 2);
+    assert!(fee_quote_coin.burn_for_testing() == 2_500, 3);
+
+    // Two `FeesClaimed` events total: one from the up-front
+    // `clob_admin_claim_fees` call above (base=1, quote=0), one from
+    // `clob_admin_finalize`'s own sweep of the re-credited residual.
+    let fees_claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
+    assert!(fees_claimed_events.length() == 2, 4);
+    let (ev_book_id, _ev_enclosing_id, _ev_claimant, ev_base_amount, ev_quote_amount) =
+        fees_claimed_events[1].fees_claimed_fields_for_testing();
+    assert!(ev_book_id == deleted_id, 5);
+    assert!(ev_base_amount == 0, 6);
+    assert!(ev_quote_amount == 2_500, 7);
+
     sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
@@ -894,8 +954,8 @@ fun finalize_succeeds_when_fees_claimed_after_all_drain_steps() {
     rest_and_partially_fill_ask(&mut scenario, &mut book);
 
     cap.clob_admin_retire(&mut book);
-    // Drain first, then claim: the recommended ordering from
-    // `clob_admin_finalize`'s doc comment.
+    // Drain first, then claim: still a perfectly valid ordering, though no
+    // longer a required one.
     cap.clob_admin_drain_step(&mut book, 10, scenario.ctx());
     let (fee_base, fee_quote) = book.fee_accumulator_balances();
     assert!(fee_base == 1, 0);
@@ -908,7 +968,9 @@ fun finalize_succeeds_when_fees_claimed_after_all_drain_steps() {
     assert!(fee_base_after == 0, 4);
     assert!(fee_quote_after == 0, 5);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    assert!(fee_base_coin.burn_for_testing() == 0, 6);
+    assert!(fee_quote_coin.burn_for_testing() == 0, 7);
     sui::test_utils::destroy(deleted_id);
     scenario.end();
 }
@@ -1298,7 +1360,9 @@ fun push_proceeds_with_no_pooled_entry_is_silent_noop() {
     let (mut book, cap) = new_book(&mut scenario);
 
     // No order has ever been filled/credited on this book, so `order_id = 1`
-    // has no pooled proceeds entry whatsoever.
+    // has no pooled proceeds entry whatsoever. `push_proceeds` now requires a
+    // retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, 1, scenario.ctx());
 
     let claimed_events = event::events_by_type<ProceedsClaimed>();

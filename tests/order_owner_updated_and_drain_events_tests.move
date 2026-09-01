@@ -128,6 +128,8 @@ fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
 
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 4);
@@ -567,7 +569,9 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
     assert!(book.proceeds_contains_for_testing(order_id), 0);
 
     // First push_proceeds: genuinely claims the pooled credit.
+    // `push_proceeds` now requires a retiring book.
     scenario.next_tx(admin());
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     assert!(!book.proceeds_contains_for_testing(order_id), 1);
 
@@ -691,8 +695,10 @@ fun destroy_ticket_unconditionally_disposes_ticket_after_mid_drain_force_cancel(
 //
 // After call 3, the book must be fully drained -- proven definitively by a
 // final `clob_admin_finalize` call succeeding (it asserts
-// `bids.size() == 0 && asks.size() == 0 && proceeds.is_empty()` plus a
-// zeroed fee accumulator, aborting with `ENotFullyDrained` otherwise).
+// `bids.size() == 0 && asks.size() == 0 && proceeds.is_empty()`, aborting
+// with `ENotFullyDrained` otherwise; the fee accumulator no longer needs to
+// be pre-drained -- `clob_admin_finalize` sweeps it and returns the swept
+// amount as `Coin<Base>`/`Coin<Quote>`).
 #[test]
 fun clob_admin_drain_step_carries_remaining_budget_across_bid_ask_proceeds_boundaries() {
     let mut scenario = ts::begin(admin());
@@ -833,7 +839,9 @@ fun clob_admin_drain_step_carries_remaining_budget_across_bid_ask_proceeds_bound
     // (rather than aborting with `ENotFullyDrained`) is itself the
     // definitive proof, including for the ask side, which has no direct
     // `_for_testing` size accessor of its own.
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     assert!(deleted_id == book_id, 26);
 
     scenario.end();
@@ -887,8 +895,10 @@ fun clob_admin_drain_step_handles_dozens_of_orders_in_a_single_call() {
     assert!(cancelled.length() == order_count, 1);
     assert!(book.bids_size_for_testing() == 0, 2);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
     let _ = deleted_id;
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
 
     scenario.end();
 }

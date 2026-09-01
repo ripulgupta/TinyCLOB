@@ -225,6 +225,9 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
 
     // --- Admin-push bid1's pooled proceeds: pays the REASSIGNED owner ---
     // --- (maker_c()), not the original resting owner (maker_b()).    ---
+    // `push_proceeds` now requires a retiring book; retiring here early is
+    // harmless since none of the remaining steps place new orders.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, bid1_order_id, scenario.ctx());
     scenario.next_tx(maker_c());
     let bid1_payout = ts::take_from_address<coin::Coin<BTC>>(&scenario, maker_c());
@@ -253,11 +256,15 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     bid2_refund.burn_for_testing();
     unit_test_destroy_ticket(bid2_ticket);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    // Fees were already fully claimed above, and bid2's force-drain is a
+    // plain refund with no fill involved -- the accumulator swept here is 0.
+    assert!(fee_base_coin.burn_for_testing() == 0, 49);
+    assert!(fee_quote_coin.burn_for_testing() == 0, 50);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
-    assert!(deleted_events.length() == 1, 49);
+    assert!(deleted_events.length() == 1, 51);
     let (ev_book_id, _, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(ev_book_id == deleted_id, 50);
+    assert!(ev_book_id == deleted_id, 52);
 
     scenario.end();
 }
@@ -398,12 +405,17 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     assert!(!ts::has_most_recent_for_address<coin::Coin<SUI>>(maker_c()), 31);
     unit_test_destroy_ticket(bid_ticket);
 
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    // Fees stayed zero the whole way through (see the zero-fee claim above),
+    // and the reassigned bid's force-drain is a plain refund with no fill
+    // involved -- the accumulator swept here is 0.
+    assert!(fee_base_coin.burn_for_testing() == 0, 32);
+    assert!(fee_quote_coin.burn_for_testing() == 0, 33);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
-    assert!(deleted_events.length() == 1, 32);
+    assert!(deleted_events.length() == 1, 34);
     let (ev_book_id, ev_enclosing_id, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(ev_book_id == deleted_id, 33);
-    assert!(ev_enclosing_id == wrapper_id, 34);
+    assert!(ev_book_id == deleted_id, 35);
+    assert!(ev_enclosing_id == wrapper_id, 36);
 
     wrapper_uid.delete();
     scenario.end();

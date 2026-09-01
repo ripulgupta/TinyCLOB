@@ -467,7 +467,9 @@ fun set_last_price_succeeds_on_retiring_book_and_finalize_still_works() {
     // The deletion lifecycle proceeds normally afterward: an empty book
     // drains trivially and finalizes.
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
-    let deleted_id = cap.clob_admin_finalize(book);
+    let (deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     assert!(deleted_id == book_id, 1);
 
     scenario.end();

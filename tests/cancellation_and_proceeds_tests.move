@@ -249,8 +249,10 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     // here from other()'s transaction context (the cap authorizes the call
     // regardless of tx sender) — the payout still lands on admin(), the
     // address recorded as owner against this order_id at credit time, never
-    // on the caller or the cap holder.
+    // on the caller or the cap holder. `push_proceeds` now requires a
+    // retiring book.
     scenario.next_tx(other());
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
@@ -266,6 +268,39 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     assert!(!book.proceeds_contains_for_testing(order_id), 5);
 
     destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// `push_proceeds` is a retirement/drain-sequence tool, same as
+// `drain_proceeds` -- it must never be usable to sweep a maker's pooled
+// proceeds out from under `claim_proceeds` on a live, non-retiring book.
+// Mirrors `push_proceeds_matches_claim_proceeds_and_pays_recorded_owner`
+// above up through creating a genuine, nonzero pooled balance, but never
+// calls `clob_admin_retire`.
+#[test]
+#[expected_failure(abort_code = 6, location = tiny_clob)] // tiny_clob::ENotRetiring
+fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    unit_test::destroy(bid_ticket);
+
+    let ask_payment = coin::mint_for_testing<BTC>(default_size(), scenario.ctx());
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, default_size(), scenario.ctx(),
+    );
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // `book.retiring` is still false here -- must abort, not silently sweep
+    // the pooled proceeds an admin has no business touching outside the
+    // retirement sequence.
+    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+
+    sui::test_utils::destroy(book);
+    sui::test_utils::destroy(cap);
     scenario.end();
 }
 
@@ -299,8 +334,10 @@ fun update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push() {
     // other() after reassignment) — proving the owner field was actually
     // overwritten, not just the ticket's own bookkeeping. Called here with
     // taker() as the tx sender (authorized via the book's cap, not the
-    // sender) — the payout still lands on other().
+    // sender) — the payout still lands on other(). `push_proceeds` now
+    // requires a retiring book.
     assert!(book.proceeds_contains_for_testing(order_id), 1);
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
@@ -356,7 +393,9 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     // push_proceeds must pay out to other() — the order's CURRENT owner as
     // of the most recent credit — not admin(), the address that created the
     // ledger entry on the first fill. The pooled amount covers both fills.
+    // `push_proceeds` now requires a retiring book.
     scenario.next_tx(taker());
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
@@ -414,7 +453,8 @@ fun update_resting_order_not_found_is_a_noop() {
     // push_proceeds (called here with taker() as tx sender, authorized via the
     // book's cap) pays whoever is recorded as owner for this order_id —
     // still admin(), proving the failed reassignment attempts above never
-    // touched the real order.
+    // touched the real order. `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 3);
@@ -466,6 +506,25 @@ fun update_resting_order_rejects_ticket_from_wrong_book() {
     unit_test::destroy(other_ticket);
     destroy_book_and_cap(book, cap);
     destroy_book_and_cap(other_book, other_cap);
+    scenario.end();
+}
+
+// `new_owner == @0x0` must be rejected outright: it would otherwise silently
+// arm a burn on every subsequent recorded-address payout path for this
+// order (escrow refunds via a later force-cancel/drain, pooled proceeds
+// sweeps via `push_proceeds`/`drain_proceeds`).
+#[test]
+#[expected_failure(abort_code = 33, location = tiny_clob)] // tiny_clob::EInvalidOwner
+fun update_resting_order_rejects_zero_address_new_owner() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+
+    book.update_resting_order(&mut bid_ticket, @0x0);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
@@ -726,6 +785,8 @@ fun destroy_ticket_unconditionally_disposes_with_real_escrow_and_proceeds_still_
     // proceeds, using only (side, price, order_id) -- no ticket needed.
     scenario.next_tx(admin());
     cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
@@ -764,7 +825,9 @@ fun destroy_ticket_unconditionally_disposes_ticket_after_book_finalized() {
     // The ticket itself is never touched by any of this.
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
-    let _deleted_id = cap.clob_admin_finalize(book);
+    let (_deleted_id, fee_base_coin, fee_quote_coin) = cap.clob_admin_finalize(book, scenario.ctx());
+    fee_base_coin.burn_for_testing();
+    fee_quote_coin.burn_for_testing();
     // `book`/`cap` no longer exist -- there is no way to construct a
     // `destroy_orphaned_ticket`/`cancel_order`/`claim_proceeds` call for
     // `bid_ticket` ever again. This is the only remaining disposal path.
@@ -923,6 +986,8 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_push() {
     assert!(found, 1);
     unit_test::destroy(bid_ticket);
 
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
@@ -1008,6 +1073,8 @@ fun update_resting_order_reassign_with_no_pooled_proceeds_yet_then_fill_credits_
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
 
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
@@ -1060,6 +1127,8 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
     assert!(book.update_resting_order(&mut bid_ticket, maker_a()), 1); // B -> C
     unit_test::destroy(bid_ticket);
 
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
 
     // Event-field-shape assertions carried over from the merged-away
@@ -1118,6 +1187,8 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
     unit_test::destroy(ticket_hi);
     unit_test::destroy(ticket_lo);
 
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id_lo, scenario.ctx());
     cap.push_proceeds(&mut book, order_id_hi, scenario.ctx());
 
@@ -1308,7 +1379,9 @@ fun update_resting_order_after_force_cancel_still_syncs_pooled_proceeds_owner() 
 
     // push_proceeds pays maker_c() -- the target of this last reassignment
     // -- not maker_b(), proving the sync ran even though the call reported
-    // the resting order itself as not-found.
+    // the resting order itself as not-found. `push_proceeds` now requires a
+    // retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 4);
@@ -1384,8 +1457,10 @@ fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_cancel() {
 
     // The pooled entry is now gone: a subsequent push_proceeds pays nobody
     // (claim_maker_balance returns zero balances for a missing entry, so no
-    // transfer and no event fire).
+    // transfer and no event fire). `push_proceeds` now requires a retiring
+    // book.
     assert!(!book.proceeds_contains_for_testing(order_id), 10);
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 1, 11);
 
@@ -1483,6 +1558,8 @@ fun update_resting_order_after_full_fill_still_syncs_pooled_proceeds_owner() {
     unit_test::destroy(bid_ticket);
 
     // ...but the pooled proceeds ARE retargeted to `other()` regardless.
+    // `push_proceeds` now requires a retiring book.
+    cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);

@@ -98,6 +98,11 @@ const EOrderStillResting: u64 = 31;
 /// by a future refactor.
 const EEnclosingIsSelf: u64 = 32;
 
+/// `update_resting_order` routes funds through recorded-address payout paths
+/// (escrow refunds, pooled proceeds sweeps) that would otherwise silently
+/// burn to the zero address.
+const EInvalidOwner: u64 = 33;
+
 /// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
 /// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
 /// consumed by its own fee (see `fee_amount`'s doc comment, and the project's
@@ -1150,15 +1155,14 @@ public struct OrderBookDeleted has copy, drop {
     quote: TypeName,
 }
 
-/// First step of the deletion lifecycle. The correct operational sequence
-/// to guarantee `clob_admin_finalize` succeeds on the first attempt is:
+/// First step of the deletion lifecycle. The operational sequence is:
 /// `clob_admin_retire` -> all `clob_admin_drain_step` calls (draining every
-/// resting order and pooled-proceeds entry) -> `clob_admin_claim_fees`
-/// LAST -> `clob_admin_finalize`. Claiming fees any earlier in that
-/// sequence is not wrong, but a later `clob_admin_drain_step` can re-credit
-/// the fee accumulator (see that function's doc comment), so an earlier
-/// claim may need to be repeated afterward — see `clob_admin_finalize`'s
-/// doc comment for what happens if it isn't.
+/// resting order and pooled-proceeds entry) -> `clob_admin_finalize`, which
+/// also sweeps whatever remains in the fee accumulator and returns it to
+/// the caller as coins. `clob_admin_claim_fees` may be called at any point
+/// in that sequence (including never) purely for cashflow timing — there is
+/// no required ordering between it and `clob_admin_drain_step`/
+/// `clob_admin_finalize` — see `clob_admin_finalize`'s doc comment.
 public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
@@ -1189,11 +1193,11 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
 /// is called before every `clob_admin_drain_step` call has finished, a
 /// later drain step on a still-resting, previously-partially-filled order
 /// can re-credit a nonzero amount into the accumulator after that claim
-/// already emptied it. This is not a fund-loss bug and not a permanent
-/// trap — `clob_admin_claim_fees` has no `retiring` gate, so calling it
-/// again after all drain steps complete (and before `clob_admin_finalize`)
-/// resolves it cleanly. See `clob_admin_finalize`'s doc comment for the
-/// full recommended ordering.
+/// already emptied it. This is not a fund-loss bug and not a trap either:
+/// `clob_admin_claim_fees` has no `retiring` gate, so calling it again any
+/// time resolves it, and `clob_admin_finalize` itself now sweeps whatever
+/// is left in the accumulator automatically, so no re-claim is required
+/// before finalizing. See `clob_admin_finalize`'s doc comment.
 public fun clob_admin_drain_step<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -1329,30 +1333,32 @@ fun drain_proceeds<Base, Quote>(
 /// caller-controllable at construction time and must never be trusted for
 /// that purpose.
 ///
-/// The emptiness check below includes the fee accumulator
-/// (`fee_base == 0 && fee_quote == 0`), not just resting orders and pooled
-/// proceeds. The correct operational sequence to guarantee this function
-/// succeeds on the first attempt is: `clob_admin_retire` -> drain every
-/// resting order and pooled-proceeds entry (`clob_admin_drain_step`,
-/// repeated as needed) -> `clob_admin_claim_fees` LAST -> this function.
-/// If fees are instead claimed earlier in that sequence, a later
-/// `clob_admin_drain_step` can re-credit the accumulator (force-cancelling
-/// a partially-filled resting order settles its maker-fee reserve into
-/// `book.fee_accumulator`, same as any other order conclusion — see that
-/// function's doc comment), and this function will abort with
-/// `ENotFullyDrained` rather than silently failing, until
-/// `clob_admin_claim_fees` is called again.
+/// The emptiness check below covers only resting orders and pooled
+/// proceeds (`book.bids`, `book.asks`, `book.proceeds`) — NOT the fee
+/// accumulator. Whatever remains in `book.fee_accumulator` at call time is
+/// swept automatically and returned to the caller as the second and third
+/// tuple elements (`Coin<Base>`, `Coin<Quote>`, either possibly zero-valued),
+/// with a `FeesClaimed` event emitted alongside `OrderBookDeleted` and
+/// `ClobAdminCapDiscarded` when the swept amount is nonzero. This means
+/// there is no required ordering between `clob_admin_claim_fees` and
+/// `clob_admin_drain_step`/this function anymore: a later
+/// `clob_admin_drain_step` can still re-credit the accumulator
+/// (force-cancelling a partially-filled resting order settles its
+/// maker-fee reserve into `book.fee_accumulator`, same as any other order
+/// conclusion — see that function's doc comment), but this function simply
+/// sweeps whatever is left rather than requiring it to already be zero.
+/// Calling `clob_admin_claim_fees` before this function is now purely
+/// optional, for cashflow timing — never a correctness requirement.
 public fun clob_admin_finalize<Base, Quote>(
     cap: ClobAdminCap,
     mut book: OrderBook<Base, Quote>,
-): ID {
+    ctx: &mut TxContext,
+): (ID, Coin<Base>, Coin<Quote>) {
     assert_book_version(&mut book);
     assert_clob_admin(&cap, &book);
     assert!(book.retiring, ENotRetiring);
-    let (fee_base, fee_quote) = fee_accumulator_balances(&book);
     assert!(
-        book.bids.size() == 0 && book.asks.size() == 0 && book.proceeds.is_empty()
-            && fee_base == 0 && fee_quote == 0,
+        book.bids.size() == 0 && book.asks.size() == 0 && book.proceeds.is_empty(),
         ENotFullyDrained,
     );
 
@@ -1367,9 +1373,12 @@ public fun clob_admin_finalize<Base, Quote>(
     bids.destroy_empty();
     asks.destroy_empty();
     proceeds.destroy_empty();
-    let (base, quote) = destroy_fee_accumulator(fee_accumulator);
-    base.destroy_zero();
-    quote.destroy_zero();
+    let claimant = ctx.sender();
+    let (fee_base, fee_quote) = destroy_fee_accumulator(fee_accumulator);
+    let fee_base_amount = fee_base.value();
+    let fee_quote_amount = fee_quote.value();
+    let fee_base_coin = coin_or_zero(fee_base, ctx);
+    let fee_quote_coin = coin_or_zero(fee_quote, ctx);
     object::delete(id);
 
     event::emit(OrderBookDeleted {
@@ -1379,12 +1388,22 @@ public fun clob_admin_finalize<Base, Quote>(
         quote: type_name::with_defining_ids<Quote>(),
     });
 
+    if (fee_base_amount != 0 || fee_quote_amount != 0) {
+        event::emit(FeesClaimed {
+            book_id: true_book_id,
+            enclosing_object_id,
+            claimant,
+            base_amount: fee_base_amount,
+            quote_amount: fee_quote_amount,
+        });
+    };
+
     let ClobAdminCap { id: cap_id_uid } = cap;
     let cap_id = object::uid_to_inner(&cap_id_uid);
     object::delete(cap_id_uid);
     event::emit(ClobAdminCapDiscarded { book_id: true_book_id, enclosing_object_id, cap_id });
 
-    true_book_id
+    (true_book_id, fee_base_coin, fee_quote_coin)
 }
 
 // === Matching engine, escrow/fee math, OrderTicket ===
@@ -2822,6 +2841,10 @@ public struct OrderOwnerUpdated has copy, drop {
 /// `owner` field in place. Returns `true` if an order was found and
 /// updated, `false` if the price level or the order itself doesn't exist (a
 /// no-op, mirroring `cancel_order`'s own not-found-is-a-no-op handling).
+/// Rejects `new_owner == @0x0` outright, since `owner` is the destination
+/// every recorded-address payout path (escrow refunds, pooled proceeds
+/// sweeps) later pays to, and a zero address there would silently burn
+/// those funds.
 ///
 /// Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
 /// whenever an order is actually found and reassigned — including when
@@ -2884,6 +2907,7 @@ public fun update_resting_order<Base, Quote>(
     ticket: &mut OrderTicket,
     new_owner: address,
 ): bool {
+    assert!(new_owner != @0x0, EInvalidOwner);
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     let ids = book.book_ids();
@@ -2999,7 +3023,10 @@ public fun claim_proceeds<Base, Quote>(
 /// is always whatever `owner` was recorded against `order_id` in the
 /// proceeds ledger at credit time (see `credit_maker_table`), so even the
 /// admin can only trigger payout to the legitimately recorded owner and can
-/// never redirect funds elsewhere.
+/// never redirect funds elsewhere. Only usable as part of the retirement/
+/// drain sequence, same as `drain_proceeds` — requires `book.retiring`, so a
+/// live book's makers can only reach their pooled proceeds through
+/// `claim_proceeds` themselves.
 public fun push_proceeds<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -3008,6 +3035,7 @@ public fun push_proceeds<Base, Quote>(
 ) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
+    assert!(book.retiring, ENotRetiring);
     let ids = book.book_ids();
     let (owner, base, quote) = claim_maker_balance(book, order_id);
     let base_amount = base.value();
