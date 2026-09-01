@@ -129,7 +129,7 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 10);
-    let (_, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
 
     assert!(matched_base_val == expected_matched_base, 0);
     assert!(remaining_budget_val == book.bid_escrow_amount(FEE_TEST_PRICE, FEE_TEST_TAKER_SIZE) - expected_quote_cost, 1);
@@ -205,7 +205,7 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 10);
-    let (_, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
 
     assert!(matched_quote_val == expected_matched_quote, 0);
     assert!(remaining_escrow_val == 0, 1);
@@ -242,7 +242,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 10);
-    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 11);
     let (fee_base_after_1, _) = book.fee_accumulator_balances();
     assert!(fee_base_after_1 == 1, 1);
@@ -258,7 +258,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 12);
-    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 13);
     let (fee_base_after_2, _) = book.fee_accumulator_balances();
     assert!(fee_base_after_2 == 2, 3);
@@ -283,7 +283,8 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
     // `min_size` instead of shrinking `dust_fill_size` — same
     // decimals/precision/exponent/price-scale-seed as `new_book()`
     // (0, 0, 0, 19, 1), just `min_size = 1`.
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     cap.clob_admin_set_taker_fee(&mut book, FEE_ROUND_TAKER_BPS);
 
     let order_id = book.next_order_id();
@@ -306,7 +307,7 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 102);
-        let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 103);
         i = i + 1;
     };
@@ -319,6 +320,7 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
     assert!(fee_base_after > 0, 101);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -352,9 +354,9 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 8);
-    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 9);
-    assert!(book.depth_at_price(false, FILL_INPLACE_PRICE) == 400, 1); // 200 (A left) + 200 (B)
+    assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == 400, 1); // 200 (A left) + 200 (B)
 
     // A large enough fill to drain the rest of A, then start on B: if A had
     // been silently demoted behind B, the first `OrderFilled` event here
@@ -367,15 +369,15 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 10);
-    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 11);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 3, 3);
-    let (id_2, _, _, size_2, _, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, id_2, _, size_2, _, _) = fills[1].order_filled_fields_for_testing();
     assert!(id_2 == order_id_a, 4); // A drains first (still at the front)
     assert!(size_2 == 200, 5);
-    let (id_3, _, _, size_3, _, _) = fills[2].order_filled_fields_for_testing();
+    let (_, _, id_3, _, size_3, _, _) = fills[2].order_filled_fields_for_testing();
     assert!(id_3 == order_id_b, 6);
     assert!(size_3 == 50, 7);
 
@@ -385,7 +387,7 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
 
 /// A fill that exactly drains the front order must pop it entirely — the
 /// level's depth must reflect its removal, and once the level itself is
-/// fully emptied it must disappear from the tree (depth_at_price -> 0).
+/// fully emptied it must disappear from the tree (ask_base_escrow_at_price -> 0).
 #[test]
 fun fill_in_place_full_drain_removes_order_and_frees_level() {
     let mut scenario = ts::begin(admin());
@@ -396,7 +398,7 @@ fun fill_in_place_full_drain_removes_order_and_frees_level() {
         order_id, other(), 150, option::some(balance::create_for_testing<BTC>(150)), option::none(), 0,
     );
     book.insert_resting_order_for_testing(false, FILL_INPLACE_PRICE, ask, scenario.ctx());
-    assert!(book.depth_at_price(false, FILL_INPLACE_PRICE) == 150, 0);
+    assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == 150, 0);
 
     let payment = coin::mint_for_testing<USDC>(bid_payment_for_price(&book, FILL_INPLACE_PRICE, 150), scenario.ctx());
     let (ticket_opt, matched_base, remaining_budget, _) =
@@ -406,11 +408,11 @@ fun fill_in_place_full_drain_removes_order_and_frees_level() {
     ticket_opt.destroy_none();
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 6);
-    let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
     assert!(unmatched_size == 0, 7);
 
     // Level is now empty and must have been removed from the tree entirely.
-    assert!(book.depth_at_price(false, FILL_INPLACE_PRICE) == 0, 4);
+    assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == 0, 4);
     assert!(book.best_ask().is_none(), 5);
 
     destroy_book_and_cap(book, cap);
@@ -419,7 +421,7 @@ fun fill_in_place_full_drain_removes_order_and_frees_level() {
 
 /// Strict, per-step regression guard against `total_size` drift: several
 /// orders at one level, a mix of partial and full fills, asserting
-/// `depth_at_price` (backed by `level_total_size`) exactly matches a
+/// `ask_base_escrow_at_price` (backed by `level_total_size`) exactly matches a
 /// brute-force running total after EVERY SINGLE fill, not just at the end.
 #[test]
 fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() {
@@ -429,7 +431,8 @@ fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() 
     // a bespoke book with the same decimals/precision/exponent/
     // price-scale-seed as `new_book()` (0, 0, 0, 19, 1) but `min_size = 1`
     // sidesteps that without changing the fill-size sequence under test.
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
 
     let order_id_1 = book.next_order_id();
     let ask_1 = order::new<BTC, USDC>(
@@ -450,7 +453,7 @@ fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() 
     book.insert_resting_order_for_testing(false, FILL_INPLACE_PRICE, ask_3, scenario.ctx());
 
     let mut expected_total: u64 = 150 + 100 + 200;
-    assert!(book.depth_at_price(false, FILL_INPLACE_PRICE) == expected_total, 0);
+    assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == expected_total, 0);
 
     // Mixed partial/full fill sequence: 50 (partial 1), 100 (full-drain 1),
     // 30 (partial 2), 70 (full-drain 2), 50 (partial 3), 150 (full-drain 3,
@@ -470,20 +473,21 @@ fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() 
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 300 + i);
-        let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 400 + i);
 
         expected_total = expected_total - fill_size;
-        let actual_total = book.depth_at_price(false, FILL_INPLACE_PRICE);
+        let actual_total = book.ask_base_escrow_at_price(FILL_INPLACE_PRICE);
         assert!(actual_total == expected_total, 200 + i);
         i = i + 1;
     };
 
     assert!(expected_total == 0, 1);
-    assert!(book.depth_at_price(false, FILL_INPLACE_PRICE) == 0, 2);
+    assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == 0, 2);
     assert!(book.best_ask().is_none(), 3);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -540,7 +544,7 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 12);
-    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 13);
 
     // Second taker buys 500 more: must drain A's remaining 200 first, then
@@ -553,24 +557,24 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 14);
-    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 15);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     // 1 event from the first taker + 3 from the second.
     assert!(fills.length() == 4, 2);
 
-    let (id_1, _, _, size_1, maker_1, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, id_1, _, size_1, maker_1, _) = fills[1].order_filled_fields_for_testing();
     assert!(id_1 == order_id_a, 3);
     assert!(size_1 == 200, 4);
     assert!(maker_1 == maker_a(), 5);
 
-    let (id_2, _, _, size_2, maker_2, _) = fills[2].order_filled_fields_for_testing();
+    let (_, _, id_2, _, size_2, maker_2, _) = fills[2].order_filled_fields_for_testing();
     assert!(id_2 == order_id_b, 6);
     assert!(size_2 == 200, 7);
     assert!(maker_2 == maker_b(), 8);
 
-    let (id_3, _, _, size_3, maker_3, _) = fills[3].order_filled_fields_for_testing();
+    let (_, _, id_3, _, size_3, maker_3, _) = fills[3].order_filled_fields_for_testing();
     assert!(id_3 == order_id_c, 9);
     assert!(size_3 == 100, 10);
     assert!(maker_3 == maker_c(), 11);
@@ -615,7 +619,7 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 12);
-    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 13);
 
     // Second taker sells 500 more: must drain A's remaining 200 first, then
@@ -629,24 +633,24 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 14);
-    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 15);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     // 1 event from the first taker + 3 from the second.
     assert!(fills.length() == 4, 2);
 
-    let (id_1, _, _, size_1, maker_1, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, id_1, _, size_1, maker_1, _) = fills[1].order_filled_fields_for_testing();
     assert!(id_1 == order_id_a, 3);
     assert!(size_1 == 200, 4);
     assert!(maker_1 == maker_a(), 5);
 
-    let (id_2, _, _, size_2, maker_2, _) = fills[2].order_filled_fields_for_testing();
+    let (_, _, id_2, _, size_2, maker_2, _) = fills[2].order_filled_fields_for_testing();
     assert!(id_2 == order_id_b, 6);
     assert!(size_2 == 200, 7);
     assert!(maker_2 == maker_b(), 8);
 
-    let (id_3, _, _, size_3, maker_3, _) = fills[3].order_filled_fields_for_testing();
+    let (_, _, id_3, _, size_3, maker_3, _) = fills[3].order_filled_fields_for_testing();
     assert!(id_3 == order_id_c, 9);
     assert!(size_3 == 100, 10);
     assert!(maker_3 == maker_c(), 11);
@@ -687,9 +691,9 @@ fun repeated_partial_fills_of_head_never_reorder() {
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 70 + i);
-        let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 80 + i);
-        assert!(book.depth_at_price(false, price) == 500 - (i + 1) * 100 + 100, 20 + i);
+        assert!(book.ask_base_escrow_at_price(price) == 500 - (i + 1) * 100 + 100, 20 + i);
         i = i + 1;
     };
 
@@ -702,23 +706,23 @@ fun repeated_partial_fills_of_head_never_reorder() {
     ticket_opt6.destroy_none();
     let executed6 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed6.length() == 6, 90);
-    let (_, _, _, _, _, _, unmatched_size6, _, _, _, _) = executed6[5].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size6, _, _, _, _) = executed6[5].order_executed_fields_for_testing();
     assert!(unmatched_size6 == 0, 91);
-    assert!(book.depth_at_price(false, price) == 0, 11);
+    assert!(book.ask_base_escrow_at_price(price) == 0, 11);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 6, 12);
 
     let mut j = 0;
     while (j < 5) {
-        let (fid, _, _, fsize, fmaker, _) = fills[j].order_filled_fields_for_testing();
+        let (_, _, fid, _, fsize, fmaker, _) = fills[j].order_filled_fields_for_testing();
         assert!(fid == order_id_a, 30 + j);
         assert!(fsize == 100, 40 + j);
         assert!(fmaker == maker_a(), 50 + j);
         j = j + 1;
     };
 
-    let (id_6, _, _, size_6, maker_6, _) = fills[5].order_filled_fields_for_testing();
+    let (_, _, id_6, _, size_6, maker_6, _) = fills[5].order_filled_fields_for_testing();
     assert!(id_6 == order_id_b, 60);
     assert!(size_6 == 100, 61);
     assert!(maker_6 == maker_b(), 62);
@@ -749,7 +753,7 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 7);
-    let (_, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 8);
 
     // A brand-new maker rests at the same price via the ordinary placement
@@ -772,18 +776,18 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 1, 9);
-    let (_, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[0].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 10);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 2, 2);
 
-    let (id_1, _, _, size_1, maker_1, _) = fills[0].order_filled_fields_for_testing();
+    let (_, _, id_1, _, size_1, maker_1, _) = fills[0].order_filled_fields_for_testing();
     assert!(id_1 == order_id_a, 3);
     assert!(size_1 == 200, 4);
     assert!(maker_1 == maker_a(), 5);
 
-    let (id_2, _, _, size_2, maker_2, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, id_2, _, size_2, maker_2, _) = fills[1].order_filled_fields_for_testing();
     assert!(id_2 == order_id_b, 6);
     assert!(size_2 == 300, 7);
     assert!(maker_2 == maker_b(), 8);
@@ -813,7 +817,7 @@ fun force_cancel_refunds_owner_not_caller() {
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 1, 0);
-    let (ev_order_id, ev_book, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
+    let (ev_book, _ev_enclosing_id, ev_order_id, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
     assert!(ev_order_id == order_id, 1);
     assert!(ev_book == book_id, 2);
     assert!(ev_trader == other(), 3);
@@ -868,7 +872,7 @@ fun cancelling_middle_of_fifo_queue_preserves_neighbours_order() {
     );
     book.insert_resting_order_for_testing(false, price, ask_c, scenario.ctx());
 
-    assert!(book.depth_at_price(false, price) == 700, 0);
+    assert!(book.ask_base_escrow_at_price(price) == 700, 0);
 
     // Cancel B -- the middle order -- via the real owner-driven entry point.
     scenario.next_tx(maker_b());
@@ -881,13 +885,13 @@ fun cancelling_middle_of_fifo_queue_preserves_neighbours_order() {
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 1, 3);
-    let (ev_order_id, ev_book, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
+    let (ev_book, _ev_enclosing_id, ev_order_id, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
     assert!(ev_order_id == order_id_b, 4);
     assert!(ev_book == book_id, 5);
     assert!(ev_trader == maker_b(), 6);
 
     // Depth excludes B's size; B itself is gone; A and C are untouched.
-    assert!(book.depth_at_price(false, price) == 500, 7);
+    assert!(book.ask_base_escrow_at_price(price) == 500, 7);
     assert!(book.resting_order_escrow(false, price, order_id_b).is_none(), 8);
     let (escrow_a, remaining_a) =
         book.resting_order_escrow(false, price, order_id_a).destroy_some().resting_order_escrow_fields();
@@ -909,23 +913,23 @@ fun cancelling_middle_of_fifo_queue_preserves_neighbours_order() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 11);
-    let (_, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
     assert!(unmatched_size == 0, 12);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 2, 13);
 
-    let (fid_1, _, _, fsize_1, fmaker_1, _) = fills[0].order_filled_fields_for_testing();
+    let (_, _, fid_1, _, fsize_1, fmaker_1, _) = fills[0].order_filled_fields_for_testing();
     assert!(fid_1 == order_id_a, 14);
     assert!(fsize_1 == 300, 15);
     assert!(fmaker_1 == maker_a(), 16);
 
-    let (fid_2, _, _, fsize_2, fmaker_2, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, fid_2, _, fsize_2, fmaker_2, _) = fills[1].order_filled_fields_for_testing();
     assert!(fid_2 == order_id_c, 17);
     assert!(fsize_2 == 200, 18);
     assert!(fmaker_2 == maker_c(), 19);
 
-    assert!(book.depth_at_price(false, price) == 0, 20);
+    assert!(book.ask_base_escrow_at_price(price) == 0, 20);
     assert!(book.resting_order_escrow(false, price, order_id_a).is_none(), 21);
     assert!(book.resting_order_escrow(false, price, order_id_c).is_none(), 22);
 
@@ -935,7 +939,7 @@ fun cancelling_middle_of_fifo_queue_preserves_neighbours_order() {
 
 /// Rests orders at 60 distinct bid prices through the real
 /// `insert_resting_order` path (via `insert_resting_order_for_testing`) and
-/// checks `depth_at_price`/`best_bid` after every single insertion. None of
+/// checks `bid_quote_escrow_at_price`/`best_bid` after every single insertion. None of
 /// the other book-level tests in this file build a price tree deep enough
 /// for `price_tree::insert`'s crit-bit routing to be observable
 /// at the book level, so this is the only test that would catch a
@@ -961,12 +965,12 @@ fun many_price_levels_depth_and_best_bid_correct_after_each_insertion() {
         let mut j = 0;
         while (j <= i) {
             let q = prices[j] + 1;
-            // `depth_at_price` for a bid is Quote-denominated: each order
+            // `bid_quote_escrow_at_price` is Quote-denominated: each order
             // here was constructed with an escrow of exactly `q * size`
             // (see `escrow` above), which is also this book's `price_scale
             // == 1` fixture's exact `bid_escrow_amount(q, size)` -- not the
             // Base `size` itself.
-            assert!(book.depth_at_price(true, q) == q * size, 0);
+            assert!(book.bid_quote_escrow_at_price(q) == q * size, 0);
             j = j + 1;
         };
         assert!(book.best_bid().destroy_some() == best_bid_expected, 1);
@@ -976,7 +980,7 @@ fun many_price_levels_depth_and_best_bid_correct_after_each_insertion() {
 
     // An absent price reports zero depth (no misrouting into a neighbour
     // level).
-    assert!(book.depth_at_price(true, 4_000_002) == 0, 3);
+    assert!(book.bid_quote_escrow_at_price(4_000_002) == 0, 3);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1030,7 +1034,7 @@ fun fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_
     );
     book.insert_resting_order_for_testing(true, price, bid_b, scenario.ctx());
 
-    assert!(book.depth_at_price(true, price) == escrow_a + escrow_b, 0);
+    assert!(book.bid_quote_escrow_at_price(price) == escrow_a + escrow_b, 0);
 
     // A single ask taker of size 7 sweeps BOTH bids in one
     // `place_limit_order_ask` call: fully drains A (3), then partially fills
@@ -1072,7 +1076,7 @@ fun fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 2, 4);
 
-    let (fid_a, _, _, fsize_a, fmaker_a, _) = fills[0].order_filled_fields_for_testing();
+    let (_, _, fid_a, _, fsize_a, fmaker_a, _) = fills[0].order_filled_fields_for_testing();
     let (fside_a, fquote_a) = fills[0].order_filled_side_and_quote_fields_for_testing();
     assert!(fid_a == order_id_a, 5);
     assert!(fsize_a == size_a, 6);
@@ -1080,7 +1084,7 @@ fun fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_
     assert!(fside_a == true, 8);
     assert!(fquote_a == expected_quote_cost_a, 9);
 
-    let (fid_b, _, _, fsize_b, fmaker_b, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, fid_b, _, fsize_b, fmaker_b, _) = fills[1].order_filled_fields_for_testing();
     let (fside_b, fquote_b) = fills[1].order_filled_side_and_quote_fields_for_testing();
     assert!(fid_b == order_id_b, 10);
     assert!(fsize_b == 4, 11);
@@ -1097,7 +1101,7 @@ fun fill_level_ask_sweep_of_two_rounding_bids_computes_quote_cost_independently_
         book.resting_order_escrow(true, price, order_id_b).destroy_some().resting_order_escrow_fields();
     assert!(b_escrow_after == escrow_b - expected_quote_cost_b, 16);
     assert!(b_remaining_after == escrow_b - expected_quote_cost_b, 17);
-    assert!(book.depth_at_price(true, price) == escrow_b - expected_quote_cost_b, 18);
+    assert!(book.bid_quote_escrow_at_price(price) == escrow_b - expected_quote_cost_b, 18);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -1123,7 +1127,8 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
     // check -- a bespoke book with the same decimals/precision/exponent/
     // price-scale-seed as `new_book()` (0, 0, 0, 19, 1) but `min_size = 1`
     // sidesteps that without changing anything else under test.
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
 
     let order_id_a = book.next_order_id();
     let ask_a = order::new<BTC, USDC>(
@@ -1143,7 +1148,7 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
     );
     book.insert_resting_order_for_testing(false, price, ask_c, scenario.ctx());
 
-    assert!(book.depth_at_price(false, price) == 300, 0);
+    assert!(book.ask_base_escrow_at_price(price) == 300, 0);
 
     // First call: taker wants 250 total, but `max_fills == 2` caps the sweep
     // right as C would start (A and B each consume one of the two allowed
@@ -1173,7 +1178,7 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 4);
-    let (_, _, _, _, _, requested_size1, unmatched_size1, rested_size1, rested_order_id1, exec_stopped1, _) =
+    let (_, _, _, _, _, _, requested_size1, unmatched_size1, rested_size1, rested_order_id1, exec_stopped1, _) =
         executed1[0].order_executed_fields_for_testing();
     assert!(requested_size1 == first_call_size, 5);
     assert!(unmatched_size1 == first_call_size - 200, 6); // 50
@@ -1183,7 +1188,7 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     // Only A and B were touched; C is completely untouched by the first
     // call.
-    assert!(book.depth_at_price(false, price) == 100, 10);
+    assert!(book.ask_base_escrow_at_price(price) == 100, 10);
     assert!(book.resting_order_escrow(false, price, order_id_a).is_none(), 11);
     assert!(book.resting_order_escrow(false, price, order_id_b).is_none(), 12);
     let (c_escrow_before, c_remaining_before) =
@@ -1208,7 +1213,7 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 17);
-    let (_, _, _, _, _, requested_size2, unmatched_size2, rested_size2, rested_order_id2, exec_stopped2, _) =
+    let (_, _, _, _, _, _, requested_size2, unmatched_size2, rested_size2, rested_order_id2, exec_stopped2, _) =
         executed2[1].order_executed_fields_for_testing();
     assert!(requested_size2 == second_call_size, 18);
     assert!(unmatched_size2 == 0, 19);
@@ -1223,7 +1228,7 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     // Final book depth correctly reflects C's own leftover only (100 - 50);
     // A and B remain gone.
-    assert!(book.depth_at_price(false, price) == 100 - second_call_size, 24);
+    assert!(book.ask_base_escrow_at_price(price) == 100 - second_call_size, 24);
     let (c_escrow_after, c_remaining_after) =
         book.resting_order_escrow(false, price, order_id_c).destroy_some().resting_order_escrow_fields();
     assert!(c_escrow_after == 100 - second_call_size, 25);
@@ -1233,13 +1238,14 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
     // sequence, each with its correct size -- no double-counting.
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
     assert!(fills.length() == 3, 27);
-    let (fid_a, _, _, fsize_a, fmaker_a, _) = fills[0].order_filled_fields_for_testing();
+    let (_, _, fid_a, _, fsize_a, fmaker_a, _) = fills[0].order_filled_fields_for_testing();
     assert!(fid_a == order_id_a && fsize_a == 100 && fmaker_a == maker_a(), 28);
-    let (fid_b, _, _, fsize_b, fmaker_b, _) = fills[1].order_filled_fields_for_testing();
+    let (_, _, fid_b, _, fsize_b, fmaker_b, _) = fills[1].order_filled_fields_for_testing();
     assert!(fid_b == order_id_b && fsize_b == 100 && fmaker_b == maker_b(), 29);
-    let (fid_c, _, _, fsize_c, fmaker_c, _) = fills[2].order_filled_fields_for_testing();
+    let (_, _, fid_c, _, fsize_c, fmaker_c, _) = fills[2].order_filled_fields_for_testing();
     assert!(fid_c == order_id_c && fsize_c == second_call_size && fmaker_c == maker_c(), 30);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }

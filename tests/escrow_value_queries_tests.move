@@ -282,7 +282,7 @@ fun resting_order_escrow_by_ticket_wrong_book_aborts() {
 // NOTE: this does NOT reuse the shared `shortfall_book`/`shortfall_price`
 // fixture (`price=5`, `price_scale=10`). Under the new `price_scale =
 // scale_lo` derivation `price_scale` is always a power of ten (see
-// `new_impl`'s doc comment), so a `price` of `5` against a `price_scale` of
+// `new`'s doc comment), so a `price` of `5` against a `price_scale` of
 // `10` is always exactly `1/2` -- the cumulative-ceiling target reaches
 // `total_reserved` only ONE unit before `original_size` is exhausted (a
 // structural consequence of a `1/2` ratio, independent of the chosen size),
@@ -299,7 +299,8 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
     // base_decimals=0, quote_decimals=0, precision=2, exponent=16:
     // scale_lo = ceil(10^2) = 100 = price_scale (scale_hi = floor(u64::MAX /
     // 10^16) = 1_844, comfortably above scale_lo, so feasible).
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     // A FRESH resting bid (no partial-cross clamp needed): size=100,
@@ -369,6 +370,7 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
 
     unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -389,7 +391,8 @@ fun resting_order_escrow_reaches_some_zero_escrow_while_still_resting() {
 #[test]
 fun resting_order_zero_escrow_continues_to_full_drain_conclusion() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     scenario.next_tx(maker_a());
@@ -445,13 +448,15 @@ fun resting_order_zero_escrow_continues_to_full_drain_conclusion() {
     assert!(quote_coin.burn_for_testing() == 0, 8);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
 #[test]
 fun resting_order_zero_escrow_cancel_returns_pooled_base_proceeds() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     scenario.next_tx(maker_a());
@@ -487,13 +492,15 @@ fun resting_order_zero_escrow_cancel_returns_pooled_base_proceeds() {
     assert!(book.resting_order_escrow(true, 33, order_id).is_none(), 6);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
 #[test]
 fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 2, 16, 33, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     // Nonzero maker fee (the max allowed rate), set on the book BEFORE the
@@ -552,7 +559,7 @@ fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
     // double-charged.
     let settled = event::events_by_type<MakerFeeSettled>();
     assert!(settled.length() == 1, 6);
-    let (_settled_order_id, _settled_book_id, _settled_maker, settled_amount) =
+    let (_settled_book_id, _settled_enclosing_id, _settled_order_id, _settled_maker, settled_amount) =
         settled[0].maker_fee_settled_fields_for_testing();
     assert!(settled_amount == 1, 7);
 
@@ -566,6 +573,7 @@ fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
     assert!(quote_coin.burn_for_testing() == 0, 10);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -610,7 +618,7 @@ fun resting_order_zero_escrow_with_nonzero_maker_fee_settles_correctly() {
 // runtime-enforced proof that `escrow_base`'s literal value tracked
 // `remaining_size` exactly at every step -- a divergence in EITHER direction
 // would have aborted the transaction instead of letting the test finish.
-// Layered on top: `depth_at_price`'s ask-side aggregate (`level.total_size`,
+// Layered on top: `ask_base_escrow_at_price`'s ask-side aggregate (`level.total_size`,
 // `price_tree.move`) is maintained via `level_remove_order`/
 // `level_insert_order_front` at fill time -- a different code path
 // (per-price-level bookkeeping across the FIFO queue) than the single
@@ -635,7 +643,7 @@ fun resting_ask_escrow_base_tracks_remaining_size_exactly_across_fills() {
     let (fresh_escrow, fresh_remaining) = fresh_opt.borrow().resting_order_escrow_fields();
     assert!(fresh_escrow == original_size, 1);
     assert!(fresh_remaining == original_size, 2);
-    assert!(book.depth_at_price(false, price) == original_size, 3);
+    assert!(book.ask_base_escrow_at_price(price) == original_size, 3);
 
     // Five varying-size fills, none of which drain the order except the
     // last: 80 + 150 + 40 + 130 + 100 == 500 == original_size. `price_scale
@@ -673,7 +681,7 @@ fun resting_ask_escrow_base_tracks_remaining_size_exactly_across_fills() {
             assert!(remaining == expected_remaining, 8);
             // Independently-derived aggregate (level.total_size, a different
             // code path than the order's own remaining_size() getter).
-            assert!(book.depth_at_price(false, price) == expected_remaining, 9);
+            assert!(book.ask_base_escrow_at_price(price) == expected_remaining, 9);
         } else {
             // Last fill fully drained the order: `sui::balance::destroy_zero`
             // inside `destroy_drained_ask_escrow` would already have aborted
@@ -682,7 +690,7 @@ fun resting_ask_escrow_base_tracks_remaining_size_exactly_across_fills() {
             // genuine, non-tautological proof (see the header comment
             // above). The order must now be entirely gone from the book.
             assert!(book.resting_order_escrow(false, price, order_id).is_none(), 10);
-            assert!(book.depth_at_price(false, price) == 0, 11);
+            assert!(book.ask_base_escrow_at_price(price) == 0, 11);
         };
     };
 

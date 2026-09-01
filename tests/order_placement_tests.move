@@ -41,7 +41,7 @@ fun place_limit_order_bid_rests_and_emits_orderplaced() {
 
     let placed_events = event::events_by_type<tiny_clob::OrderPlaced>();
     assert!(placed_events.length() == 1, 6);
-    let (ev_order_id, ev_book_id, ev_side, ev_price, ev_size, ev_trader, ev_maker_fee_bps) =
+    let (ev_book_id, _ev_enclosing_id, ev_order_id, ev_side, ev_price, ev_size, ev_trader, ev_maker_fee_bps) =
         placed_events[0].order_placed_fields_for_testing();
     assert!(ev_order_id == t_order_id, 7);
     assert!(ev_book_id == book_id, 8);

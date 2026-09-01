@@ -25,8 +25,10 @@ fun new_infeasible_precision_exponent_aborts() {
     // base_decimals=0, quote_decimals=0: scale_lo = ceil(10^precision) = 10^19;
     // scale_hi = floor(u64::MAX / 10^exponent) = floor(u64::MAX / 10^19) = 1.
     // scale_lo (10^19) > scale_hi (1) -> infeasible.
-    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 19, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 19, 19, 1, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -52,7 +54,8 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     // is seeded with a comfortably-clear-of-the-minimum value rather than
     // `1` regardless, since the minimum representable raw price can still
     // land above 1 for some decimals/precision/exponent shapes.
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 8, 6, 0, 19, 1_000_000_000, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 8, 6, 0, 19, 1_000_000_000, &wrapper_uid, scenario.ctx());
     let scale = book.price_scale();
 
     let price = scale * 79_000; // true price = $7,900,000 per BTC (see doc comment above)
@@ -70,13 +73,14 @@ fun btc_usdc_realistic_price_scale_end_to_end() {
     assert!(ticket_opt.is_some(), 4);
     let ticket = ticket_opt.destroy_some();
     // Quote-denominated for a bid -- equal to the escrow reserved, not `size`.
-    assert!(book.depth_at_price(tiny_clob::bid(), price) == expected_escrow, 5);
+    assert!(book.bid_quote_escrow_at_price(price) == expected_escrow, 5);
 
     let (b, q) = book.cancel_order(ticket, scenario.ctx());
     assert!(b.burn_for_testing() == 0, 6);
     assert!(q.burn_for_testing() == expected_escrow, 7);
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -263,7 +267,8 @@ const ASK_SIZE: u64 = 52_631_579;
 #[test]
 fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 9, 9, 1_000_000_000, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 9, 9, 1_000_000_000, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 1_000_000_000, 0);
     // A low, comfortably-valid raw price (minimum representable is 1).
     let ask_ticket = rest_ask(&mut book, 19, ASK_SIZE, 10, scenario.ctx());
@@ -281,6 +286,7 @@ fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
 
     unit_test::destroy(ask_ticket);
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -297,8 +303,10 @@ fun affordable_qty_narrowing_does_not_abort_for_large_budget_taker() {
 #[expected_failure(abort_code = 20, location = tiny_clob)] // EPriceRangeInfeasible
 fun price_scale_below_scale_lo_now_aborts() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 30, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 30, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -314,7 +322,8 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     let p_min: u64 = 1;
     let p_max: u64 = 100_000_000;
     let p_mid: u64 = 850;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_mid, &wrapper_uid, scenario.ctx());
     let scale = book.price_scale();
     let size = min_size();
 
@@ -334,7 +343,7 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     assert!(!min_stopped, 0);
     assert!(min_leftover.burn_for_testing() == 0, 1);
     assert!(min_matched.burn_for_testing() == 0, 2);
-    assert!(book.depth_at_price(tiny_clob::ask(), p_min) == min_leg_size, 3);
+    assert!(book.ask_base_escrow_at_price(p_min) == min_leg_size, 3);
     let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
     assert!(min_b.burn_for_testing() == min_leg_size, 4);
     assert!(min_q.burn_for_testing() == 0, 5);
@@ -350,13 +359,14 @@ fun usdc_btc_reversed_pair_ask_side_price_extremes() {
     assert!(!max_stopped, 6);
     assert!(max_leftover.burn_for_testing() == 0, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
-    assert!(book.depth_at_price(tiny_clob::ask(), p_max) == size, 9);
+    assert!(book.ask_base_escrow_at_price(p_max) == size, 9);
     let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
     assert!(max_b.burn_for_testing() == size, 10);
     assert!(max_q.burn_for_testing() == 0, 11);
 
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -389,7 +399,8 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     let mut scenario = ts::begin(admin());
     // base_decimals=8, quote_decimals=6, precision=0, exponent=19:
     // price_scale = ceil(10^8 / 10^6) = 100 (see header comment above).
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 8, 6, 0, 19, 79_000, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 8, 6, 0, 19, 79_000, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     // --- Bid side: payment/expected_base_output implies a fractional-dollar
@@ -414,7 +425,13 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     assert!(book.bid_escrow_amount(7_900, expected_base_output) <= payment_value, 4);
     let leftover_quote_val = bid_leftover_quote.burn_for_testing();
     assert!(leftover_quote_val == payment_value - book.bid_escrow_amount(7_900, expected_base_output), 5);
-    book.destroy_orphaned_ticket(bid_ticket);
+    // The bid is still resting (nothing crossed it) -- `destroy_orphaned_ticket`
+    // now aborts on a still-resting order (`EOrderStillResting`), so
+    // `cancel_order` is used here to both conclude the order and dispose of
+    // the ticket; disposal isn't what this test is about.
+    let (bid_cancel_base, bid_cancel_quote) = book.cancel_order(bid_ticket, scenario.ctx());
+    bid_cancel_base.burn_for_testing();
+    bid_cancel_quote.burn_for_testing();
 
     // --- Ask side: expected_quote_output/size implies the same
     // --- fractional-dollar ratio, which must ceil UP to the whole-dollar
@@ -427,10 +444,8 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     let (ask_ticket_opt, ask_leftover_base, ask_matched_quote, ask_stopped) =
         book.place_limit_order_ask(ask_payment, expected_quote_output, 10, scenario.ctx());
     assert!(!ask_stopped, 6);
-    // A bid IS still resting on the book at this point (rested above at
-    // price 7_900; `destroy_orphaned_ticket` only discarded the ticket, not
-    // the underlying order), but the ask's price (7_901) ends up above the
-    // resting bid's price (7_900), so this call doesn't cross it.
+    // The bid above was just cancelled, so the book has no resting bid to
+    // cross regardless of price.
     assert!(ask_matched_quote.burn_for_testing() == 0, 7);
     let ask_ticket = ask_ticket_opt.destroy_some();
     // Snapped UP to the whole-dollar tick 7_901, not left at a
@@ -441,9 +456,14 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
     let full_fill_quote = (7_901 * size) / book.price_scale();
     assert!(full_fill_quote >= expected_quote_output, 9);
     ask_leftover_base.burn_for_testing();
-    book.destroy_orphaned_ticket(ask_ticket);
+    // Still resting (nothing crossed it either) -- same reasoning as the bid
+    // above: cancel_order concludes it and disposes of the ticket in one call.
+    let (ask_cancel_base, ask_cancel_quote) = book.cancel_order(ask_ticket, scenario.ctx());
+    ask_cancel_base.burn_for_testing();
+    ask_cancel_quote.burn_for_testing();
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -473,7 +493,8 @@ fun expected_output_price_snaps_to_declared_tick_under_new_price_scale() {
 #[expected_failure(abort_code = 29, location = tiny_clob)] // EPriceOverflow
 fun place_limit_order_bid_price_overflow_aborts() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, &wrapper_uid, scenario.ctx());
 
     let payment = coin::mint_for_testing<USDC>(100, scenario.ctx());
     let (ticket_opt, matched_base, leftover_quote, stopped) =
@@ -484,6 +505,7 @@ fun place_limit_order_bid_price_overflow_aborts() {
     ticket_opt.destroy_none();
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -495,7 +517,8 @@ fun place_limit_order_bid_price_overflow_aborts() {
 #[expected_failure(abort_code = 29, location = tiny_clob)] // EPriceOverflow
 fun place_limit_order_ask_price_overflow_aborts() {
     let mut scenario = ts::begin(admin());
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 18, 1, 1, &wrapper_uid, scenario.ctx());
 
     let payment = coin::mint_for_testing<BTC>(1, scenario.ctx());
     let (ticket_opt, leftover_base, matched_quote, stopped) =
@@ -506,18 +529,20 @@ fun place_limit_order_ask_price_overflow_aborts() {
     ticket_opt.destroy_none();
 
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
 // === Coverage-audit gap closures (round 2) ===
 //
-// Gaps 1-6 below close specific missing-coverage items identified by a later
+// Gaps 1-5 below close specific missing-coverage items identified by a later
 // audit: `set_last_price`'s declared-range reject side, `place_limit_order_ask`'s
 // declared-range reject side, `bid_escrow_amount(book, 0, size) == 0`, the
-// `min_size` boundary on a `price_scale > 1` book, the exact
-// `EPriceRangeInfeasible` boundary (`scale_lo == scale_hi`), and
-// `new_with_event_id_override`'s price-scale-derivation equivalence with
-// plain `new`.
+// `min_size` boundary on a `price_scale > 1` book, and the exact
+// `EPriceRangeInfeasible` boundary (`scale_lo == scale_hi`). A former Gap 6
+// (`new_with_event_id_override`'s price-scale-derivation equivalence with
+// plain `new`) was removed along with that function — see the note where it
+// used to live, below.
 
 // --- Gap 1: `set_last_price` declared-range REJECT side ---
 //
@@ -536,11 +561,13 @@ fun set_last_price_below_declared_min_aborts() {
     let mut scenario = ts::begin(admin());
     let p_min: u64 = 10;
     let p_mid: u64 = 50;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
     book.set_last_price(p_min - 1, scenario.ctx());
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -550,11 +577,13 @@ fun set_last_price_above_declared_max_aborts() {
     let mut scenario = ts::begin(admin());
     let p_max: u64 = 100;
     let p_mid: u64 = 50;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     assert!(book.best_bid().is_none() && book.best_ask().is_none(), 0);
     book.set_last_price(p_max + 1, scenario.ctx());
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -574,7 +603,8 @@ fun place_limit_order_ask_price_just_below_min_aborts() {
     let mut scenario = ts::begin(admin());
     let p_min: u64 = 10;
     let p_mid: u64 = 50;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     let size = min_size();
     // expected_quote_output = floor((p_min - 1) * size / price_scale) =
     // floor(9 * 100 / 1) = 900; `place_limit_order_ask` re-derives
@@ -588,6 +618,7 @@ fun place_limit_order_ask_price_just_below_min_aborts() {
     unit_test::destroy(matched_quote);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -597,7 +628,8 @@ fun place_limit_order_ask_price_just_above_max_aborts() {
     let mut scenario = ts::begin(admin());
     let p_max: u64 = 100;
     let p_mid: u64 = 50;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     let size = min_size();
     // expected_quote_output = floor((p_max + 1) * size / price_scale) =
     // floor(101 * 100 / 1) = 10_100; re-derived price =
@@ -611,6 +643,7 @@ fun place_limit_order_ask_price_just_above_max_aborts() {
     unit_test::destroy(matched_quote);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -654,7 +687,12 @@ fun realistic_decimals_book_bid_at_exact_min_size_succeeds() {
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
-    book.destroy_orphaned_ticket(ticket);
+    // Nothing crosses on this empty book, so the order is still resting --
+    // `cancel_order` concludes it and disposes of the ticket in one call
+    // (this test is about the min_size boundary, not ticket disposal).
+    let (cancel_base, cancel_quote) = book.cancel_order(ticket, scenario.ctx());
+    cancel_base.burn_for_testing();
+    cancel_quote.burn_for_testing();
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -693,7 +731,12 @@ fun realistic_decimals_book_ask_at_exact_min_size_succeeds() {
     leftover_base.burn_for_testing();
     matched_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
-    book.destroy_orphaned_ticket(ticket);
+    // Nothing crosses on this empty book, so the order is still resting --
+    // `cancel_order` concludes it and disposes of the ticket in one call
+    // (this test is about the min_size boundary, not ticket disposal).
+    let (cancel_base, cancel_quote) = book.cancel_order(ticket, scenario.ctx());
+    cancel_base.burn_for_testing();
+    cancel_quote.burn_for_testing();
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
@@ -738,36 +781,16 @@ fun realistic_decimals_book_ask_below_min_size_aborts() {
 #[test]
 fun price_range_infeasibility_boundary_scale_lo_equals_scale_hi_accepts() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 1, 0, 18, 10, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 1, 0, 18, 10, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 1, 0);
     destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-// --- Gap 6: `new_with_event_id_override` doesn't change price-scale derivation ---
-//
-// Constructs one book via `new` and one via `new_with_event_id_override`,
-// identical `min_size`/decimals/precision/exponent/initial_last_price
-// (reusing the BTC/SUI decimal-pair shape from
-// `btc_sui_pair_price_extremes_and_adjacent_ticks` above), and confirms their
-// `price_scale()` values are identical -- the override changes only event
-// stamping, never price-scale/declared-range derivation.
-#[test]
-fun new_with_event_id_override_matches_new_price_scale() {
-    let mut scenario = ts::begin(admin());
-    let (plain_book, plain_cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, 337_140, scenario.ctx());
-
-    let wrapper_uid = object::new(scenario.ctx());
-    let (override_book, override_cap) = tiny_clob::new_with_event_id_override<BTC, SUI>(
-        min_size(), 8, 9, 0, 6, 337_140, &wrapper_uid, scenario.ctx(),
-    );
-
-    assert!(plain_book.price_scale() == override_book.price_scale(), 0);
-
-    sui::test_utils::destroy(plain_book);
-    sui::test_utils::destroy(plain_cap);
-    sui::test_utils::destroy(override_book);
-    sui::test_utils::destroy(override_cap);
     wrapper_uid.delete();
     scenario.end();
 }
+
+// Gap 6 ("`new_with_event_id_override` doesn't change price-scale
+// derivation") was removed: `new_with_event_id_override` no longer exists —
+// `new`'s `enclosing_object_id` parameter is now mandatory on the single
+// remaining constructor, so there is no second construction path left to
+// compare against.

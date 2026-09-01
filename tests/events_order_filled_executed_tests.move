@@ -98,7 +98,7 @@ fun order_filled_taker_buy_records_maker_side_false() {
     assert!(quote_amount == FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE, 2);
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 4);
-    let (_book_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, _unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, _unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     // Single fill, so the once-per-call aggregate taker fee equals what the
     // old per-fill computation would have charged -- see
@@ -141,7 +141,7 @@ fun order_filled_taker_sell_records_maker_side_true() {
     assert!(quote_amount == FEE_TEST_PRICE * FEE_TEST_TAKER_SIZE, 2);
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 4);
-    let (_book_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, _unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, _unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     // Single fill, so the once-per-call aggregate taker fee equals what the
     // old per-fill computation would have charged -- see
@@ -172,7 +172,7 @@ fun order_executed_fires_from_place_limit_order_bid_with_partial_rest() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
+    let (_book_id, _enclosing_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(taker == admin(), 1);
     assert!(taker_side == true, 2);
@@ -210,7 +210,7 @@ fun order_executed_fires_from_place_limit_order_ask_with_partial_rest() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
+    let (_book_id, _enclosing_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(taker == admin(), 1);
     assert!(taker_side == false, 2);
@@ -243,7 +243,7 @@ fun order_executed_fires_from_place_market_order_bid_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
+    let (_book_id, _enclosing_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(taker == admin(), 1);
     assert!(taker_side == true, 2);
@@ -476,7 +476,7 @@ fun order_executed_fires_from_place_market_order_ask_fully_filled() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 0);
-    let (_book_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
+    let (_book_id, _enclosing_id, taker, taker_side, entry_point, limit_price, requested_size, unmatched_size, rested_size, rested_order_id, stopped_flag, _taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(taker == admin(), 1);
     assert!(taker_side == false, 2);

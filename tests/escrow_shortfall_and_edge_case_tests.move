@@ -339,7 +339,7 @@ fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
 // `target(1..10) = 1,1,2,2,3,3,4,4,5,5`. Per-fill deltas therefore alternate
 // `1,0,1,0,1,0,1,0,1,0`. Unlike the old (`price_scale=18`) fixture, the new
 // `price_scale=10` derivation always makes this ratio (and hence this
-// alternating pattern) exact -- see `new_impl`'s doc comment: `price_scale`
+// alternating pattern) exact -- see `new`'s doc comment: `price_scale`
 // is always a power of ten (or 1), so a non-power-of-ten `price` like `5`
 // against it produces a clean recurring fraction (`1/2` here) rather than
 // an irregular one. This test drives 10 unit fills totalling all 10 Base:
@@ -434,7 +434,7 @@ fun taker_limited_fills_clamp_to_zero_after_escrow_exhausted_then_maker_limited_
 // The four `*_price_extremes_and_adjacent_ticks` tests above prove `p_min`/
 // `p_max` are ACCEPTED; the tests below prove `p_min - 1`/`p_max + 1` are
 // REJECTED, on two independently-derived decimal pairs (USDC/BTC reversed,
-// BTC/SUI), plus two construction-site (`new_impl`) tests proving the same
+// BTC/SUI), plus two construction-site (`new`) tests proving the same
 // check is wired at a call site other than order placement.
 
 // NOTE: this test deliberately does NOT reuse the `precision=8` USDC/BTC-
@@ -452,7 +452,8 @@ fun usdc_btc_reversed_pair_price_just_below_min_aborts() {
     let mut scenario = ts::begin(admin());
     let p_min: u64 = 10;
     let p_mid: u64 = 50;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_mid, &wrapper_uid, scenario.ctx());
     // Both this book's `price_scale` and the BTC/SUI book below's are `1`
     // (see the doc comment above), so `test_utils::bid_payment_for_price`
     // always reproduces the target price exactly regardless of size.
@@ -466,6 +467,7 @@ fun usdc_btc_reversed_pair_price_just_below_min_aborts() {
     unit_test::destroy(ml);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -475,7 +477,8 @@ fun usdc_btc_reversed_pair_price_just_above_max_aborts() {
     let mut scenario = ts::begin(admin());
     let p_max: u64 = 100_000_000;
     let p_mid: u64 = 850;
-    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_mid, &wrapper_uid, scenario.ctx());
     // Unlike `usdc_btc_reversed_pair_price_just_below_min_aborts` above, this
     // book's `precision == 8` gives `price_scale == 1_000_000` -- far larger
     // than `min_size()` (100) -- so `min_size()` can't round-trip back to
@@ -492,6 +495,7 @@ fun usdc_btc_reversed_pair_price_just_above_max_aborts() {
     unit_test::destroy(ml);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -501,7 +505,8 @@ fun btc_sui_pair_price_just_below_min_aborts() {
     let mut scenario = ts::begin(admin());
     let p_min: u64 = 10;
     let p_mid: u64 = 337_140;
-    let (mut book, cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, p_mid, &wrapper_uid, scenario.ctx());
     let payment = coin::mint_for_testing<SUI>(
         test_utils::bid_payment_for_price(&book, p_min - 1, min_size()), scenario.ctx(),
     );
@@ -512,6 +517,7 @@ fun btc_sui_pair_price_just_below_min_aborts() {
     unit_test::destroy(ml);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -521,7 +527,8 @@ fun btc_sui_pair_price_just_above_max_aborts() {
     let mut scenario = ts::begin(admin());
     let p_max: u64 = 10_000_000;
     let p_mid: u64 = 337_140;
-    let (mut book, cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, p_mid, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, SUI>(min_size(), 8, 9, 0, 6, p_mid, &wrapper_uid, scenario.ctx());
     let payment = coin::mint_for_testing<SUI>(
         test_utils::bid_payment_for_price(&book, p_max + 1, min_size()), scenario.ctx(),
     );
@@ -532,11 +539,12 @@ fun btc_sui_pair_price_just_above_max_aborts() {
     unit_test::destroy(ml);
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
 /// Proves `assert_price_in_declared_range`'s reject side is also wired at
-/// the construction call site (`new_impl`), not only at order placement —
+/// the construction call site (`new`), not only at order placement —
 /// same USDC/BTC-reversed pair, decimals/precision/exponent shape, and
 /// `p_min` as the order-placement test above (see that test's note on why
 /// `precision=1`, not `precision=8`, is needed here), but passed as
@@ -546,9 +554,11 @@ fun btc_sui_pair_price_just_above_max_aborts() {
 fun new_initial_last_price_just_below_declared_min_aborts() {
     let mut scenario = ts::begin(admin());
     let p_min: u64 = 10;
-    let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_min - 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 1, 0, p_min - 1, &wrapper_uid, scenario.ctx());
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -558,9 +568,11 @@ fun new_initial_last_price_just_below_declared_min_aborts() {
 fun new_initial_last_price_just_above_declared_max_aborts() {
     let mut scenario = ts::begin(admin());
     let p_max: u64 = 100_000_000;
-    let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_max + 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<USDC, BTC>(min_size(), 6, 8, 8, 0, p_max + 1, &wrapper_uid, scenario.ctx());
     sui::test_utils::destroy(book);
     sui::test_utils::destroy(cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -570,8 +582,10 @@ fun new_initial_last_price_just_above_declared_max_aborts() {
 #[expected_failure(abort_code = 14, location = tiny_clob)] // EZeroPrice
 fun new_zero_initial_last_price_aborts() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 0, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 0, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -582,7 +596,9 @@ fun new_zero_initial_last_price_aborts() {
 fun new_base_decimals_over_max_aborts() {
     let mut scenario = ts::begin(admin());
     // MAX_DECIMALS = 38; 39 is one over.
-    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 39, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 39, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }

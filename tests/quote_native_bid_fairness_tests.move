@@ -80,11 +80,10 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     assert!(bid_leftover_quote.burn_for_testing() == 0, 103);
     let bid_ticket = bid_ticket_opt.destroy_some();
 
-    // `resting_order_escrow`/`depth_at_price` must both report the FULL
-    // Quote reservation up front -- Quote-denominated `remaining_size` for a
-    // bid means these now report 50 (Quote), not 100 (Base).
-    assert!(book.depth_at_price(tiny_clob::bid(), price) == 50, 104);
-    assert!(book.bid_quote_escrow_at_price(price) == 50, 105);
+    // Must report the FULL Quote reservation up front -- Quote-denominated
+    // `remaining_size` for a bid means this now reports 50 (Quote), not
+    // 100 (Base).
+    assert!(book.bid_quote_escrow_at_price(price) == 50, 104);
 
     // Fill 1: incoming ask sells 7 Base. Expect quote_cost == 4.
     scenario.next_tx(taker());
@@ -133,8 +132,7 @@ fun cumulative_ceiling_scheme_delivers_full_size_and_conserves_exactly() {
     assert!(ask4_matched_quote.burn_for_testing() == 25, 15);
 
     // The resting bid must now be fully gone (drained, popped off the book).
-    assert!(book.depth_at_price(tiny_clob::bid(), price) == 0, 16);
-    assert!(book.bid_quote_escrow_at_price(price) == 0, 17);
+    assert!(book.bid_quote_escrow_at_price(price) == 0, 16);
     assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 18);
 
     // Sum of all 4 quote_cost deltas exactly equals `total_reserved` -- zero
@@ -266,10 +264,8 @@ fun cumulative_ceiling_scheme_at_scale_25_fragmented_fills_still_conserves_exact
     };
 
     // After all 25 fills (cumulative Base = 1000 == original_size), the
-    // resting bid must be fully gone: zero live escrow, zero depth, popped
-    // off the book.
-    assert!(book.depth_at_price(tiny_clob::bid(), price) == 0, 400);
-    assert!(book.bid_quote_escrow_at_price(price) == 0, 401);
+    // resting bid must be fully gone: zero live escrow, popped off the book.
+    assert!(book.bid_quote_escrow_at_price(price) == 0, 400);
     assert!(book.resting_order_escrow(tiny_clob::bid(), price, 0).is_none(), 402);
 
     // (a) Zero dust: the running sum of Quote charged across all 25 fills
@@ -363,7 +359,13 @@ fun place_limit_order_bid_smoke_test() {
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
-    book.destroy_orphaned_ticket(ticket);
+    // Nothing crosses on this empty book, so the order is still resting --
+    // `cancel_order` concludes it and disposes of the ticket in one call
+    // (this test is about `place_limit_order_bid`'s new entry point, not
+    // ticket disposal).
+    let (cancel_base, cancel_quote) = book.cancel_order(ticket, scenario.ctx());
+    cancel_base.burn_for_testing();
+    cancel_quote.burn_for_testing();
     unit_test::destroy(book);
     unit_test::destroy(cap);
     scenario.end();
@@ -384,7 +386,13 @@ fun place_limit_order_ask_smoke_test() {
     leftover_base.burn_for_testing();
     matched_quote.burn_for_testing();
     let ticket = ticket_opt.destroy_some();
-    book.destroy_orphaned_ticket(ticket);
+    // Nothing crosses on this empty book, so the order is still resting --
+    // `cancel_order` concludes it and disposes of the ticket in one call
+    // (this test is about `place_limit_order_ask`'s new entry point, not
+    // ticket disposal).
+    let (cancel_base, cancel_quote) = book.cancel_order(ticket, scenario.ctx());
+    cancel_base.burn_for_testing();
+    cancel_quote.burn_for_testing();
     unit_test::destroy(book);
     unit_test::destroy(cap);
     scenario.end();

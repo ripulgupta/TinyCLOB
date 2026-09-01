@@ -397,8 +397,8 @@ fun last_price_set_event_records_setter_and_value() {
 
     let events = event::events_by_type<tiny_clob::LastPriceSet>();
     assert!(events.length() == 1, 2);
-    let (ev_book_id, ev_last_price, ev_setter) = events[0].last_price_set_fields_for_testing();
-    assert!(ev_book_id == book_id, 3);
+    let (ev_true_book_id, _ev_enclosing_id, ev_last_price, ev_setter) = events[0].last_price_set_fields_for_testing();
+    assert!(ev_true_book_id == book_id, 3); // leading `book_id` field: the book's true, unforgeable id
     assert!(ev_last_price == 12_345, 4);
     assert!(ev_setter == maker_a(), 5); // the actual caller, not admin()
     assert!(ev_setter != admin(), 6);

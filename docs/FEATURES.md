@@ -34,32 +34,37 @@ public fun new<Base, Quote>(
     precision: u8,
     exponent: u8,
     initial_last_price: u64,
+    enclosing_object_id: &UID,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap)
 ```
 
-```
-public fun new_with_event_id_override<Base, Quote>(
-    min_size: u64,
-    base_decimals: u8,
-    quote_decimals: u8,
-    precision: u8,
-    exponent: u8,
-    initial_last_price: u64,
-    event_id_override: &UID,
-    ctx: &mut TxContext,
-): (OrderBook<Base, Quote>, ClobAdminCap)
-```
+Callable by any address; no capability is required to construct a book, and
+construction does not register or share the book anywhere. Mints and returns
+a fresh `ClobAdminCap` alongside the book.
 
-Both are callable by any address; no capability is required to construct a
-book, and construction does not register or share the book anywhere. Both
-mint and return a fresh `ClobAdminCap` alongside the book.
+`enclosing_object_id` is a MANDATORY `&UID` parameter, not optional: both
+`OrderBook` and `ClobAdminCap` are `store`-only, never `key` (§1), so a book
+can never exist as a top-level object in its own right — it is always
+embedded inside some enclosing object. Requiring that enclosing object's live
+`&UID` at construction time reflects how this type is actually used, not an
+artificial restriction. `enclosing_object_id` is stamped on every event this
+book ever emits (as `enclosing_object_id` — see §13), fixed permanently at
+construction and never changeable afterward. It is a borrowed `&UID` rather
+than a bare `ID` specifically so a caller cannot forge it to an arbitrary id
+merely copied off a public event or explorer; it is used solely for event
+stamping and is never used for authentication anywhere in this module (see
+§13's note on `book_id` vs `enclosing_object_id`).
 
-`new_with_event_id_override` additionally stamps every event this book ever
-emits with `object::uid_to_inner(event_id_override)` instead of the book's
-own object id (`new`'s default). This is fixed permanently at construction
-and cannot be changed afterward. `event_id` is used solely for event
-stamping and is never used for authentication anywhere in this module.
+A caller with no real wrapper object handy may mint a throwaway `UID` via
+`object::new(ctx)`, pass a borrow of it here, and delete it immediately
+afterward — this is a supported pattern, not a workaround: what matters for
+the event/indexer use case this parameter exists for is the id's uniqueness,
+not whether the referenced object is still live when an event is later read.
+In the same spirit, deliberately reusing the same (now-dead) enclosing id
+across a delete-and-reconstruct transition (an old enclosing object deleted,
+a new `OrderBook` created in its place) is a legitimate way to preserve
+indexer continuity across that transition, not a misuse.
 
 ### `min_size`
 
@@ -144,7 +149,7 @@ This check is applied to:
 
 | Call site | Value checked |
 |---|---|
-| `new` / `new_with_event_id_override` | `initial_last_price` |
+| `new` | `initial_last_price` |
 | `set_last_price` | `new_last_price` |
 | `place_limit_order_bid` | `price` (derived internally from `payment`/`expected_base_output`) |
 | `place_limit_order_ask` | `price` (derived internally from `expected_quote_output`/`payment.value()`) |
@@ -190,7 +195,7 @@ This check is applied only to `place_limit_order_bid` and
 applied to `place_market_order_bid` or `place_market_order_ask`.
 
 Every call to `clob_admin_set_price_band_factor` emits `PriceBandFactorSet {
-order_book_id, factor }`, including a call that sets the same value the
+book_id, enclosing_object_id, factor }`, including a call that sets the same value the
 book already has — there is no no-op skip on this event.
 
 ## 5. `last_price`
@@ -233,7 +238,7 @@ beyond the declared range applies — any value within the declared range is
 accepted.
 
 If `new_last_price` differs from the book's current `last_price`, the value
-is updated and `LastPriceSet { order_book_id, last_price, setter }` is
+is updated and `LastPriceSet { book_id, enclosing_object_id, last_price, setter }` is
 emitted, where `setter` is the calling transaction's sender address. If
 `new_last_price` equals the current `last_price`, the call succeeds as a
 no-op: no state is written and no event is emitted.
@@ -510,9 +515,9 @@ superadditive slack left in the order's reserve is folded into the returned
 escrow. If the order is no longer resting (already fully filled and
 removed, or never found), only the pooled proceeds (if any) are returned;
 calling this on an already-fully-consumed or nonexistent order is not an
-error. Emits `OrderCancelled { order_id, order_book_id, trader }` and
+error. Emits `OrderCancelled { book_id, enclosing_object_id, order_id, trader }` and
 `MakerFeeSettled` (§13) only if a still-resting order was actually found and
-removed; emits `ProceedsClaimed { claimant, order_book_id, base_amount,
+removed; emits `ProceedsClaimed { book_id, enclosing_object_id, claimant, base_amount,
 quote_amount }` only if nonzero pooled proceeds were paid out alongside.
 
 ### `update_resting_order`
@@ -527,27 +532,27 @@ public fun update_resting_order<Base, Quote>(
 
 Reassigns the resting order's payout destination to `new_owner`. Takes
 `ticket` by reference, so the caller retains it. Returns `true` if the order
-was found *still resting* and updated, `false` if not (a no-op; not an
-abort). Authority follows ticket possession, exactly like `cancel_order`.
-Only when the order is found still resting does this also immediately sync
-the payout address of the order's currently-pooled unclaimed proceeds (if
-any), not just future fills — this affects both proceeds already credited
-before the call and any credited afterward. Aborts with `EWrongBook` if
-`ticket` was not minted by `book`.
+was found *still resting* and updated, `false` if not (a no-op on the
+resting-order half; not an abort). Authority follows ticket possession,
+exactly like `cancel_order`. Aborts with `EWrongBook` if `ticket` was not
+minted by `book`.
 
-If the order has already concluded by the time this is called (fully
-filled and drained, `cancel_order`ed, force-cancelled via
-`clob_admin_cancel_order`, or removed by `clob_admin_drain_step`) but a
-pooled, unclaimed proceeds entry for its order id still exists, this
-function returns `false` and does **not** touch that entry's recorded
-owner — it stays whatever it was last synced to. This does not strand
-anything: the pooled amount is still fully claimable, either via
-`push_proceeds`/`drain_proceeds` (paying the last-recorded owner) or via
-`claim_proceeds` through the order's own `OrderTicket` (paying the ticket
-holder/caller regardless of the recorded owner — see `claim_proceeds`
-above), whichever happens first.
+Independently of that `bool`, this ALWAYS immediately syncs the payout
+address of the order's currently-pooled unclaimed proceeds (if any) to
+`new_owner` — this affects both proceeds already credited before the call
+and any credited afterward, and runs whether or not the order is found
+still resting: even if the order has already concluded by the time this is
+called (fully filled and drained, `cancel_order`ed, force-cancelled via
+`clob_admin_cancel_order`, or removed by `clob_admin_drain_step`), any
+pooled, unclaimed proceeds entry for its order id is still resynced to
+`new_owner`. The pooled amount is then payable either via
+`push_proceeds`/`drain_proceeds` (paying whichever owner was last synced,
+by either this function or the original placement) or via `claim_proceeds`
+through the order's own `OrderTicket` (paying the ticket holder/caller
+regardless of the recorded owner — see `claim_proceeds` above), whichever
+happens first.
 
-Emits `OrderOwnerUpdated { order_id, order_book_id, old_owner, new_owner }`
+Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
 whenever the order is found and reassigned — including when `new_owner`
 equals the order's current owner (the reassignment and its proceeds-owner
 sync still run in that case). Never emitted when the function returns
@@ -579,12 +584,14 @@ paid out.
 public fun destroy_orphaned_ticket<Base, Quote>(book: &OrderBook<Base, Quote>, ticket: OrderTicket)
 ```
 
-Disposes of a ticket. Aborts with `EWrongBook` if not minted by `book`, or
-with `EProceedsNotEmpty` (19) if the ticket's order id still has pooled,
+Disposes of a ticket. Aborts with `EWrongBook` if not minted by `book`, with
+`EProceedsNotEmpty` (19) if the ticket's order id still has pooled,
 unclaimed proceeds (destroying it in that case would permanently strand
-those funds). Does not check whether the order is still resting — destroying
-a ticket for a still-resting order with zero pooled proceeds is a valid
-choice (e.g. abandoning a dust order).
+those funds), or with `EOrderStillResting` (31) if the order is still
+resting on `book`. While the order and the book both still exist, this
+ticket remains the only self-service path back to that order's escrow;
+callers who want to give up on a still-resting order should call
+`cancel_order` instead, not discard the ticket out from under it.
 
 ### `destroy_ticket_unconditionally`
 
@@ -621,7 +628,7 @@ Pays out a specific order's accumulated proceeds. The destination is never
 caller-supplied — always the `owner` address currently recorded for that
 order id, so even the admin cannot redirect funds elsewhere. A no-op (no
 event, no transfer) if there is nothing to pay out. Emits `ProceedsClaimed
-{ claimant: owner, order_book_id, base_amount, quote_amount }` when nonzero.
+{ book_id, enclosing_object_id, claimant: owner, base_amount, quote_amount }` when nonzero.
 
 ## 9. Admin controls
 
@@ -639,7 +646,7 @@ trader can always recover funds already at rest, and the admin can always
 force-cancel or reset the reference price, whether or not the book is
 paused. `clob_admin_unpause_book` aborts with `EBookRetiring` (18) if the
 book is retiring — a retiring book can never be unpaused again (§10).
-Emits `Paused { order_book_id }` / `Unpaused { order_book_id }`.
+Emits `Paused { book_id, enclosing_object_id }` / `Unpaused { book_id, enclosing_object_id }`.
 
 ### Fees
 
@@ -659,8 +666,9 @@ nonzero rate pays at least 1 unit of fee. A receive amount of exactly 1 atom
 is the one case where this necessarily either consumes the entire leg (fee
 == the full 1 atom) or collects nothing (fee rounds down to 0 only if
 `rate_bps == 0`) — an accepted tradeoff of integer math at today's fee caps,
-not a bug (see §2's `min_size` guidance). Emits `TakerFeeSet { order_book_id,
-rate_bps }` / `MakerFeeSet { order_book_id, rate_bps }` unconditionally,
+not a bug (see §2's `min_size` guidance). Emits `TakerFeeSet { book_id,
+enclosing_object_id, rate_bps }` / `MakerFeeSet { book_id, enclosing_object_id,
+rate_bps }` unconditionally,
 including a same-value call.
 
 **Taker fee — computed once per call, in aggregate.** Each of the four
@@ -691,7 +699,7 @@ superadditive slack left over in the reserve is refunded back to the maker
 through whatever mechanism that conclusion event already uses to pay the
 maker (pooled proceeds for a fill-drain, the escrow/coin(s) returned for a
 cancellation or force-drain). This transfer is reported via a new event,
-`MakerFeeSettled { order_id, order_book_id, maker, amount }` (§13), emitted
+`MakerFeeSettled { book_id, enclosing_object_id, order_id, maker, amount }` (§13), emitted
 exactly once per concluded order, alongside whatever event that conclusion
 already emits (e.g. `OrderCancelled`).
 
@@ -708,7 +716,7 @@ public fun clob_admin_claim_fees<Base, Quote>(cap: &ClobAdminCap, book: &mut Ord
 ```
 
 Withdraws the entire accumulated fee balance (both legs) to the caller.
-Emits `FeesClaimed { claimant, order_book_id, base_amount, quote_amount }`
+Emits `FeesClaimed { book_id, enclosing_object_id, claimant, base_amount, quote_amount }`
 only if a nonzero amount was actually claimed. Readable without withdrawing
 via `fee_accumulator_balances<Base, Quote>(book): (u64, u64)`; current rates
 readable via `fee_config<Base, Quote>(book): (u64, u64)` (taker, maker).
@@ -728,8 +736,8 @@ public fun clob_admin_cancel_order<Base, Quote>(
 
 Removes a specific resting order by side/price/order id and refunds its
 escrow to its owner. A no-op (no abort, no event) if no such order exists.
-Not gated by pause. Emits `OrderCancelled { order_id, order_book_id,
-trader }` and `MakerFeeSettled` (§9's Fees section, §13) only when an order
+Not gated by pause. Emits `OrderCancelled { book_id, enclosing_object_id,
+order_id, trader }` and `MakerFeeSettled` (§9's Fees section, §13) only when an order
 was actually found and removed — the latter is this order's conclusion,
 which trues up its maker-fee reserve and folds any superadditive slack into
 the escrow refunded here. Does not touch or pay out that order's
@@ -749,7 +757,7 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
 
 Sets `paused = true` and `retiring = true`. `retiring` is sticky: no
 function ever clears it back to `false` once set. Emits `OrderBookRetired {
-order_book_id }`.
+book_id, enclosing_object_id }`.
 
 ```
 public fun clob_admin_drain_step<Base, Quote>(
@@ -801,9 +809,10 @@ with `ENotFullyDrained` (7) unless the book has zero resting bids, zero
 resting asks, zero pooled proceeds entries, and a zero fee-accumulator
 balance on both legs — i.e. `clob_admin_drain_step` and
 `clob_admin_claim_fees` must have fully emptied the book first. Emits
-`OrderBookDeleted { order_book_id, base: TypeName, quote: TypeName }` (using
-the book's `Base`/`Quote` type names) and `ClobAdminCapDiscarded { cap_id,
-for_book }`. Returns the book's true, unforgeable object id.
+`OrderBookDeleted { book_id, enclosing_object_id, base: TypeName, quote: TypeName }` (using
+the book's `Base`/`Quote` type names) and `ClobAdminCapDiscarded { book_id,
+enclosing_object_id, cap_id }`. Returns the book's true, unforgeable object
+id — the same value both events' `book_id` field carries.
 
 **Recommended ordering.** To guarantee this function succeeds on the first
 attempt: `clob_admin_retire` -> all `clob_admin_drain_step` calls (drain
@@ -825,9 +834,18 @@ sites the same way this module's own functions do (every function in this
 module that mutates the book calls this first). A book whose stored version
 lags behind the currently-published package's version is transparently
 upgraded in place with no separate migration call required — this emits
-`BookVersionUpgraded { order_book_id, from, to }`. A book whose stored version is
+`BookVersionUpgraded { book_id, enclosing_object_id, from, to }`. A book whose stored version is
 *ahead* of the currently-published package still aborts with
 `ENewVersionMismatch` (5), since that direction cannot be auto-resolved.
+
+The package's `CURRENT_VERSION` was bumped from 1 to 2 for the
+`event_id` -> `enclosing_object_id` rename plus the addition of the new
+`book_id` field to every emitted event (§13) — a wire-format change to
+every event this module emits, even though no `OrderBook` on-chain data
+actually needed converting (both stamped ids are derived fresh at emit
+time from fields that already existed on the book). This bump is a marker
+only; the self-healing auto-upgrade described above still applies
+unchanged, with no explicit migration step required.
 
 ## 12. View functions
 
@@ -842,14 +860,14 @@ upgraded in place with no separate migration call required — this emits
 | `is_book_retiring<Base, Quote>(book): bool` | current retiring state (sticky once `true`) |
 | `best_bid<Base, Quote>(book): Option<u64>` | highest resting bid price, or `None` |
 | `best_ask<Base, Quote>(book): Option<u64>` | lowest resting ask price, or `None` |
-| `depth_at_price<Base, Quote>(book, side: bool, price: u64): u64` | total resting size at that exact raw price on that side; `0` if no such level exists, for any `price` value including `0` — never aborts. Denomination depends on `side`: Base for an ask level, but QUOTE for a bid level (the sum of every resting bid's remaining Quote buying-power at that price — identical to `bid_quote_escrow_at_price(book, price)` for the same price) |
+| `ask_base_escrow_at_price<Base, Quote>(book, price: u64): u64` | total resting Base size at that exact raw ask price; `0` if no such level exists, for any `price` value including `0` — never aborts. Ask-only (no `side` parameter): the bid-side equivalent is `bid_quote_escrow_at_price`, which is Quote-denominated, not Base — a single `side`-switched function returning the same `u64` type for two different denominations was removed as an integration hazard. |
 | `bid_escrow_amount<Base, Quote>(book, price, size): u64` | escrow required for a bid at `(price, size)` (§3) |
 | `ticket_order_id`/`ticket_order_book_id`/`ticket_side`/`ticket_price` | the corresponding field of an `OrderTicket` |
 | `last_price<Base, Quote>(book): u64` | the book's current `last_price` (§5) |
 | `price_band_factor<Base, Quote>(book): Option<u64>` | the book's current price-band factor, or `None` (§4) |
 | `book_version<Base, Quote>(book): u64` | the book's current `version` (§11) |
 | `min_size<Base, Quote>(book): u64` | the book's `min_size` floor (§2) |
-| `bid_quote_escrow_at_price<Base, Quote>(book, price): u64` | the exact, maintained total of live `Quote` escrow held by every resting bid order at `price`; `0` if no bid level exists there. Bid-only (no `side` parameter) — an ask level's escrow is `Base`, already exactly equal to `depth_at_price(book, ask(), price)`, so there is no analogous "quote value" for it. |
+| `bid_quote_escrow_at_price<Base, Quote>(book, price): u64` | the exact, maintained total of live `Quote` escrow held by every resting bid order at `price`; `0` if no bid level exists there. Bid-only (no `side` parameter) — an ask level's escrow is `Base`, already exactly equal to `ask_base_escrow_at_price(book, price)`, so there is no analogous "quote value" for it. |
 | `resting_order_escrow<Base, Quote>(book, side, price, order_id): Option<RestingOrderEscrow>` | the live state of one resting order, or `None` if that price level doesn't exist or holds no such order (fully filled, cancelled, or never placed). Never aborts, for any input. |
 | `resting_order_escrow_by_ticket<Base, Quote>(book, ticket): Option<RestingOrderEscrow>` | `resting_order_escrow` for the order `ticket` was minted for. Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. |
 | `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows). `remaining_size` is ALSO denominated in Quote for a bid, Base for an ask — NOT always Base regardless of side. For a bid, `escrow` and `remaining_size` are therefore always equal (both are just the live Quote escrow value); for an ask they were already equal. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. For an ask, `escrow`/`remaining_size` can never reach `0` while still resting (draining to `0` is the same fill that stops it from resting). For a bid, under the telescoping proportional-ceiling escrow-charging scheme, `(escrow: 0, remaining_size: 0)` for a live, still-resting, still-fillable order IS a real, reachable state whenever the order's resting price is below `price_scale` — the Quote escrow can hit exactly `0` strictly before the order's Base side is exhausted. `None` (not resting at all) remains the only other state for either side. |
@@ -862,26 +880,45 @@ exactly one `OrderExecuted` as a trailer. Correlating fills to their
 triggering call relies on this within-transaction ordering (Sui's event
 ordering within a transaction's effects is deterministic).
 
+**Two-field id prefix.** Every event below leads with the same two fields,
+in the same order:
+
+- `book_id: ID` — the book's own true, unforgeable object id
+  (`object::uid_to_inner(&book.id)`, the same value `book_id<Base, Quote>`
+  returns). Not caller-controllable; always the book's real identity.
+- `enclosing_object_id: ID` — the id supplied to `new`'s mandatory
+  `enclosing_object_id: &UID` parameter at construction (§2). Fixed for the
+  book's lifetime, but caller-supplied and therefore potentially unrelated
+  to the book's true identity — never use it for authentication or as
+  proof of which book emitted the event; use `book_id` for that instead.
+
+An off-chain consumer that wants to index by the book's real identity
+should read `book_id`; one that wants whatever identity the integrator's
+wrapping object chose to be indexed by should read `enclosing_object_id`.
+Reading both together lets a consumer cross-check the caller-supplied value
+against the book's unforgeable one, closing the spoofing gap a
+`enclosing_object_id`-only event stream would otherwise leave open.
+
 | Event | Fields |
 |---|---|
-| `BookVersionUpgraded` | `order_book_id: ID`, `from: u64`, `to: u64` |
-| `Paused` | `order_book_id: ID` |
-| `Unpaused` | `order_book_id: ID` |
-| `TakerFeeSet` | `order_book_id: ID`, `rate_bps: u64` |
-| `MakerFeeSet` | `order_book_id: ID`, `rate_bps: u64` |
-| `FeesClaimed` | `claimant: address`, `order_book_id: ID`, `base_amount: u64`, `quote_amount: u64` |
-| `PriceBandFactorSet` | `order_book_id: ID`, `factor: Option<u64>` |
-| `LastPriceSet` | `order_book_id: ID`, `last_price: u64`, `setter: address` |
-| `OrderCancelled` | `order_id: u64`, `order_book_id: ID`, `trader: address` |
-| `OrderBookRetired` | `order_book_id: ID` |
-| `OrderBookDeleted` | `order_book_id: ID`, `base: TypeName`, `quote: TypeName` |
-| `ClobAdminCapDiscarded` | `cap_id: ID`, `for_book: ID` |
-| `OrderPlaced` | `order_id: u64`, `order_book_id: ID`, `side: bool`, `price: u64`, `size: u64`, `trader: address`, `maker_fee_bps: u64` |
-| `OrderFilled` | `maker_order_id: u64`, `order_book_id: ID`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64` |
-| `OrderExecuted` | `order_book_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool`, `taker_fee_amount: u64` |
-| `MakerFeeSettled` | `order_id: u64`, `order_book_id: ID`, `maker: address`, `amount: u64` |
-| `ProceedsClaimed` | `claimant: address`, `order_book_id: ID`, `base_amount: u64`, `quote_amount: u64` |
-| `OrderOwnerUpdated` | `order_id: u64`, `order_book_id: ID`, `old_owner: address`, `new_owner: address` |
+| `BookVersionUpgraded` | `book_id: ID`, `enclosing_object_id: ID`, `from: u64`, `to: u64` |
+| `Paused` | `book_id: ID`, `enclosing_object_id: ID` |
+| `Unpaused` | `book_id: ID`, `enclosing_object_id: ID` |
+| `TakerFeeSet` | `book_id: ID`, `enclosing_object_id: ID`, `rate_bps: u64` |
+| `MakerFeeSet` | `book_id: ID`, `enclosing_object_id: ID`, `rate_bps: u64` |
+| `FeesClaimed` | `book_id: ID`, `enclosing_object_id: ID`, `claimant: address`, `base_amount: u64`, `quote_amount: u64` |
+| `PriceBandFactorSet` | `book_id: ID`, `enclosing_object_id: ID`, `factor: Option<u64>` |
+| `LastPriceSet` | `book_id: ID`, `enclosing_object_id: ID`, `last_price: u64`, `setter: address` |
+| `OrderCancelled` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `trader: address` |
+| `OrderBookRetired` | `book_id: ID`, `enclosing_object_id: ID` |
+| `OrderBookDeleted` | `book_id: ID`, `enclosing_object_id: ID`, `base: TypeName`, `quote: TypeName` |
+| `ClobAdminCapDiscarded` | `book_id: ID`, `enclosing_object_id: ID`, `cap_id: ID` |
+| `OrderPlaced` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `side: bool`, `price: u64`, `size: u64`, `trader: address`, `maker_fee_bps: u64` |
+| `OrderFilled` | `book_id: ID`, `enclosing_object_id: ID`, `maker_order_id: u64`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64` |
+| `OrderExecuted` | `book_id: ID`, `enclosing_object_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool`, `taker_fee_amount: u64` |
+| `MakerFeeSettled` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `maker: address`, `amount: u64` |
+| `ProceedsClaimed` | `book_id: ID`, `enclosing_object_id: ID`, `claimant: address`, `base_amount: u64`, `quote_amount: u64` |
+| `OrderOwnerUpdated` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `old_owner: address`, `new_owner: address` |
 
 `OrderPlaced.maker_fee_bps` is the maker-fee rate snapshotted into the
 resting order at placement time — permanent for the order's lifetime; later
@@ -999,6 +1036,7 @@ maker fee is actually paid in).
 | 28 | `EDecimalsTooLarge` |
 | 29 | `EPriceOverflow` |
 | 30 | `EMinExceedsMaxBaseOut` |
+| 31 | `EOrderStillResting` |
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 
@@ -1045,11 +1083,14 @@ maker fee is actually paid in).
   `0` strictly before the order's Base side is exhausted. This is distinct
   from `None` (not resting at all) and is not an error condition.
 - `bid_quote_escrow_at_price` is an exact, maintained aggregate, not a
-  re-derivation — unlike computing `bid_escrow_amount(book, price,
-  depth_at_price(book, bid(), price))`, which can over- or under-count the
+  re-derivation — unlike computing `bid_escrow_amount(book, price, size)`
+  with a `size` from some other source, which can over- or under-count the
   true live escrow by up to roughly one `Quote` atom per resting order at
   that price, in either direction, depending on each order's own fill
-  history.
+  history. (Feeding `bid_quote_escrow_at_price`'s own return value into
+  `bid_escrow_amount` as a `size` is a category error, not just rounding
+  dust — that value is already Quote-denominated, so `bid_escrow_amount`
+  would multiply by `price` a second time.)
 - A `place_limit_order_bid` call's unmatched remainder may rest at a
   smaller size than requested if leftover escrow cannot fully back it at
   the ceiling-rounded rate; the returned ticket is `option::none()` when
@@ -1072,12 +1113,13 @@ maker fee is actually paid in).
 - `clob_admin_cancel_order` and `clob_admin_finalize`'s emptiness checks are
   independent of any pooled proceeds for the removed/remaining orders —
   proceeds are refunded/paid separately from escrow.
-- `update_resting_order`'s pooled-proceeds owner sync only fires when it
-  finds the order still resting; if the order has already concluded
-  (fill-drained, `cancel_order`ed, `clob_admin_cancel_order`ed, or
-  `clob_admin_drain_step`-removed) but a pooled, unclaimed proceeds entry
-  for it still exists, the call returns `false` and leaves that entry's
-  recorded owner untouched. Relatedly, `cancel_order` sweeps and pays out
+- `update_resting_order`'s pooled-proceeds owner sync runs unconditionally,
+  regardless of whether it finds the order still resting — even if the
+  order has already concluded (fill-drained, `cancel_order`ed,
+  `clob_admin_cancel_order`ed, or `clob_admin_drain_step`-removed), a
+  pooled, unclaimed proceeds entry for it is still resynced to `new_owner`;
+  the `bool` return reflects only whether the resting order itself was
+  found and reassigned. Relatedly, `cancel_order` sweeps and pays out
   any pooled proceeds as part of the same call — to the caller
   (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
   while `clob_admin_cancel_order` deliberately does not — it refunds only the
@@ -1086,7 +1128,8 @@ maker fee is actually paid in).
 - `push_proceeds`'s payout destination is always the recorded `owner` for
   that order id, never caller-suppliable, even by the admin.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has
-  pooled, unclaimed proceeds attached to its order id.
+  pooled, unclaimed proceeds attached to its order id, or whose order is
+  still resting on the book.
   `destroy_ticket_unconditionally` has no such restriction and takes no
   `OrderBook` parameter — it is the only disposal path left once a
   ticket's book has already been deleted.

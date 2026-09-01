@@ -464,7 +464,7 @@ fun claim_proceeds_transfers_maker_proceeds() {
         book.claim_proceeds(ask_ticket, scenario.ctx());
     let claimed = event::events_by_type<ProceedsClaimed>();
     assert!(claimed.length() == 1, 0);
-    let (claimant, _, _base_amt, quote_amt) = claimed[0].proceeds_claimed_fields_for_testing();
+    let (_, _, claimant, _base_amt, quote_amt) = claimed[0].proceeds_claimed_fields_for_testing();
     assert!(claimant == admin(), 1);
     assert!(quote_amt == book.bid_escrow_amount(PLACEMENT_PRICE, PLACEMENT_SIZE), 2);
     claim_base.burn_for_testing();
@@ -579,10 +579,10 @@ fun place_limit_order_bid_max_fills_exact_match_does_not_falsely_report_stopped(
     assert!(ticket_opt.is_some(), 3);
     let ticket = ticket_opt.destroy_some();
     // The level was genuinely, fully drained.
-    assert!(book.depth_at_price(tiny_clob::ask(), OPT_PRICE) == 0, 4);
+    assert!(book.ask_base_escrow_at_price(OPT_PRICE) == 0, 4);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 5);
     assert!(unmatched_size == 100, 6);
@@ -632,10 +632,10 @@ fun place_limit_order_bid_max_fills_one_more_than_needed_does_not_report_stopped
     assert!(cb.burn_for_testing() == 0, 4);
     assert!(cq.burn_for_testing() == book.bid_escrow_amount(OPT_PRICE, 100), 5);
     // The level is equally, fully drained in this case too.
-    assert!(book.depth_at_price(tiny_clob::ask(), OPT_PRICE) == 0, 6);
+    assert!(book.ask_base_escrow_at_price(OPT_PRICE) == 0, 6);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 7);
     assert!(unmatched_size == 100, 8);
@@ -793,10 +793,10 @@ fun place_limit_order_ask_max_fills_exact_match_does_not_falsely_report_stopped(
     assert!(ticket_opt.is_some(), 3);
     let ticket = ticket_opt.destroy_some();
     // The bid side was genuinely, fully drained.
-    assert!(book.depth_at_price(tiny_clob::bid(), OPT_PRICE) == 0, 4);
+    assert!(book.bid_quote_escrow_at_price(OPT_PRICE) == 0, 4);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 5);
     assert!(unmatched_size == 100, 6);
@@ -872,31 +872,37 @@ fun place_limit_order_ask_zero_price_aborts() {
 }
 
 // =====================================================================
-// `ESizeBelowMinSize` on `place_market_order_ask`: `size ==
-// min(payment.value(), max_base_in)` genuinely nonzero but below `min_size`
-// must abort, distinguishing this from the already-covered `size == 0`
-// no-op skip case (`place_market_order_ask_max_base_in_zero_is_real_cap_and_
-// no_ops` in `quote_native_bid_fairness_tests.move`). `validate_size` runs
-// unconditionally whenever `size != 0`, before any matching, so no resting
-// book depth is needed to isolate this abort.
+// `place_market_order_ask` deliberately has NO `min_size` check at all
+// (unlike the limit-order path above) -- neither market side ever rests an
+// order, so neither can ever create sub-`min_size` dust on the book, and
+// `validate_size`'s entire purpose is bounding what can rest. This test
+// demonstrates that absence directly, rather than merely not testing for
+// it: selling a sub-`min_size` amount of Base via `place_market_order_ask`
+// must succeed cleanly, mirroring `place_market_order_bid_below_min_size_
+// succeeds` below.
 // =====================================================================
 
 #[test]
-#[expected_failure(abort_code = 12, location = tiny_clob)] // ESizeBelowMinSize
-fun place_market_order_ask_size_below_min_size_aborts() {
+fun place_market_order_ask_below_min_size_succeeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
-    // `max_base_in == min_size() - 1` with a `payment` at least that large
-    // makes `size == min(payment.value(), max_base_in) == min_size() - 1 ==
-    // 99` -- genuinely nonzero (so the `size == 0` skip in
-    // `place_market_order_ask` does not apply) yet strictly below `min_size`
-    // (100), so `validate_size` is the only thing this fixture can abort on.
+    let price = default_price();
+    // Resting bid depth (100) comfortably covers the sub-min_size sell below.
+    let bid_ticket = rest_bid(&mut book, price, default_size(), 20, scenario.ctx());
+
+    scenario.next_tx(taker());
+    // Strictly below `min_size` (100) but > 0 -- if `place_market_order_ask`
+    // had a `validate_size`/`min_size` guard (it deliberately does not),
+    // this fixture would be exactly the case that guard would reject.
     let max_base_in = min_size() - 1;
     let payment = coin::mint_for_testing<BTC>(max_base_in, scenario.ctx());
-    let (leftover_base, matched_quote, _) =
+    let (leftover_base, matched_quote, stopped) =
         book.place_market_order_ask(payment, 10, 0, max_base_in, scenario.ctx());
-    unit_test::destroy(leftover_base);
+    assert!(!stopped, 0);
+    assert!(leftover_base.burn_for_testing() == 0, 1);
     unit_test::destroy(matched_quote);
+
+    unit_test::destroy(bid_ticket);
     destroy_book_and_cap(book, cap);
     scenario.end();
 }

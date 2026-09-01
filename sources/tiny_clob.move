@@ -47,7 +47,7 @@ const EProceedsNotEmpty: u64 = 19;
 /// A book's declared `base_decimals`/`quote_decimals`/`precision`/`exponent`
 /// admit no valid `price_scale` at all (`scale_lo > scale_hi`), or the
 /// tightest valid `price_scale` (`scale_lo`) itself cannot fit in a `u64` —
-/// see `new_impl`.
+/// see `new`.
 const EPriceRangeInfeasible: u64 = 20;
 /// A `price` fell below the book's declared minimum representable true
 /// price.
@@ -68,8 +68,7 @@ const EResetPriceBelowBestBid: u64 = 26;
 /// `set_last_price` was called with a value above the book's
 /// current best ask.
 const EResetPriceAboveBestAsk: u64 = 27;
-/// A decimals/precision/exponent argument to `new`/`new_with_event_id_override`
-/// exceeded `MAX_DECIMALS`.
+/// A decimals/precision/exponent argument to `new` exceeded `MAX_DECIMALS`.
 const EDecimalsTooLarge: u64 = 28;
 /// A `price` derived from `payment.value()`/`expected_base_output` (in
 /// `place_limit_order_bid`) or from `expected_quote_output`/`size` (in
@@ -84,6 +83,12 @@ const EPriceOverflow: u64 = 29;
 /// unconditionally up front rather than left to abort later, confusingly,
 /// as a spurious `ESlippageExceeded`.
 const EMinExceedsMaxBaseOut: u64 = 30;
+/// `destroy_orphaned_ticket` was called for a ticket whose order is still
+/// resting on the book -- destroying it would give up the ticket holder's
+/// only self-service path back to that order's escrow while the order and
+/// the book both still exist to reach it through. `destroy_ticket_unconditionally`
+/// remains available once the book itself is gone (see its own doc comment).
+const EOrderStillResting: u64 = 31;
 
 /// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
 /// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
@@ -106,7 +111,7 @@ const U64_MAX: u128 = 0xFFFFFFFFFFFFFFFF;
 /// `price * pow_base * pow_prec` at `u64::MAX * 10^38 * 10^19`); 10^39
 /// squared does not. IMPORTANT: this bound is safe ONLY in combination with
 /// `assert_price_in_declared_range`'s independent enforcement (via the
-/// `scale_lo`/`scale_hi` feasibility check in `new_impl`) that
+/// `scale_lo`/`scale_hi` feasibility check in `new`) that
 /// `precision + exponent` is effectively bounded well below `MAX_DECIMALS`
 /// for any book that can actually be constructed — `MAX_DECIMALS = 38` alone,
 /// without that coupling, would NOT be a safe bound against `u256` overflow
@@ -121,13 +126,23 @@ const MAX_DECIMALS: u8 = 38;
 /// is instead AHEAD of this constant, it means this package build doesn't
 /// yet understand a `version` the book already carries (see
 /// `assert_book_version`).
-const CURRENT_VERSION: u64 = 1;
+///
+/// Bumped from 1 to 2 for the `event_id` -> `enclosing_object_id` rename plus
+/// the addition of a `book_id` field to every emitted event: a wire-format
+/// change to every event this module emits (a field renamed and a field
+/// added simultaneously), even though no `OrderBook` on-chain data actually
+/// needed converting -- both stamped ids are derived fresh at emit time from
+/// fields that already existed on `OrderBook` (the renamed field itself, and
+/// the book's own `id`), so this bump is a marker only, and
+/// `assert_book_version`'s existing no-migration self-heal still applies
+/// unchanged.
+const CURRENT_VERSION: u64 = 2;
 
 // === Side convention ===
 
 /// `side == true` means the bid side, `side == false` means the ask side.
 /// Every `side: bool` parameter and struct field in this module (e.g.
-/// `depth_at_price`'s `side`, `OrderTicket.side`, `OrderPlaced.side`)
+/// `resting_order_escrow`'s `side`, `OrderTicket.side`, `OrderPlaced.side`)
 /// follows this convention. `bid`/`ask` below are purely additive — they let
 /// an external integrator write a self-documenting `tiny_clob::bid()` /
 /// `tiny_clob::ask()` call site instead of a bare `true`/`false` if they
@@ -273,7 +288,7 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     taker_fee_bps: u64,
     maker_fee_bps: u64,
     fee_accumulator: FeeAccumulator<Base, Quote>,
-    /// Derived at construction (see `new_impl`) from the book's declared
+    /// Derived at construction (see `new`) from the book's declared
     /// `base_decimals`/`quote_decimals`/`precision`/`exponent`: the true
     /// price is `price / price_scale * 10^(base_decimals - quote_decimals)`.
     /// Chosen as the smallest value that guarantees resolution at least as
@@ -306,36 +321,38 @@ public struct OrderBook<phantom Base, phantom Quote> has store {
     /// known, accepted limitation (permissionless, capital-free griefing of
     /// this band's position on an empty book).
     price_band_factor: Option<u64>,
-    /// The id every event this module emits stamps as `order_book_id`.
-    /// Write-once: fixed at construction time (defaults to the book's own
-    /// internal id via plain `new`, or to a caller-supplied override via
-    /// `new_with_event_id_override`) and never mutable afterward. A
-    /// wrapping object whose own outer id is what external
-    /// callers/indexers actually query by should use
-    /// `new_with_event_id_override`, passing a borrow of that object's own
-    /// `UID`, instead of plain `new`.
+    /// The id every event this module emits stamps as `enclosing_object_id`.
+    /// Write-once: fixed at construction time — always caller-supplied via
+    /// `new`'s mandatory `enclosing_object_id: &UID` parameter — and never
+    /// mutable afterward. A wrapping object whose own outer id is what
+    /// external callers/indexers actually query by should pass a borrow of
+    /// that object's own `UID` to `new`.
     ///
     /// This field exists SOLELY to be stamped on emitted events. Because
-    /// `new_with_event_id_override` requires a live `&UID` reference rather
-    /// than a bare `ID` value, a caller can no longer forge this to an
-    /// arbitrary id merely copied off a public event or explorer — that no
-    /// longer compiles. This does NOT, however, guarantee the caller
-    /// controls the referenced object: any object that is genuinely shared
-    /// and whose module exposes a public `&UID` accessor (e.g.
-    /// `sui::kiosk::uid(&Kiosk)`, `sui::transfer_policy::uid(&TransferPolicy)`)
-    /// can have its `&UID` borrowed by any address, not just its owner, so
-    /// `event_id` can in principle still be pointed at an id the caller
-    /// doesn't own when such an accessor exists. This narrows the attack
-    /// surface; it does not eliminate it. Regardless, `event_id` is NEVER
-    /// used for authentication anywhere in this module and must never be
-    /// relied on for any authentication/identity check — the residual risk
-    /// above is scoped strictly to event/indexer spoofing (an off-chain
-    /// consumer trusting `order_book_id` without independently verifying its
+    /// `new` takes a live `&UID` reference rather than a bare `ID` value, a
+    /// caller can no longer forge this to an arbitrary id merely copied off
+    /// a public event or explorer — that no longer compiles. This does NOT,
+    /// however, guarantee the caller controls the referenced object: any
+    /// object that is genuinely shared and whose module exposes a public
+    /// `&UID` accessor (e.g. `sui::kiosk::uid(&Kiosk)`,
+    /// `sui::transfer_policy::uid(&TransferPolicy)`) can have its `&UID`
+    /// borrowed by any address, not just its owner, so
+    /// `enclosing_object_id` can in principle still be pointed at an id the
+    /// caller doesn't own when such an accessor exists. This narrows the
+    /// attack surface; it does not eliminate it. Regardless,
+    /// `enclosing_object_id` is always caller-supplied, and therefore always
+    /// potentially unrelated to the book's true identity — it is NEVER used
+    /// for authentication anywhere in this module and must never be relied
+    /// on for any authentication/identity check — the residual risk above is
+    /// scoped strictly to event/indexer spoofing (an off-chain consumer
+    /// trusting `enclosing_object_id` without independently verifying its
     /// true origin), never fund safety or access control. The book's own
     /// object id (`id: UID` above, via `object::uid_to_inner(&book.id)`) is
     /// what's unforgeable and must be used for authentication instead (see
-    /// `OrderTicket.order_book_id`).
-    event_id: ID,
+    /// `OrderTicket.order_book_id`) — and is also stamped directly on every
+    /// emitted event as `book_id`, so an off-chain consumer can independently
+    /// cross-check the two rather than trusting `enclosing_object_id` alone.
+    enclosing_object_id: ID,
 }
 
 // === ClobAdminCap ===
@@ -354,8 +371,22 @@ public struct ClobAdminCap has store {
 }
 
 public struct ClobAdminCapDiscarded has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     cap_id: ID,
-    for_book: ID,
+}
+
+/// Small helper struct bundling both ids stamped on every event
+/// (`book_id`, the book's true, unforgeable id, and `enclosing_object_id`,
+/// the caller-supplied id — see `OrderBook.enclosing_object_id`'s doc
+/// comment). Used to thread both ids into the handful of helper functions
+/// (`conclude_order_fee`, `fold_maker_fee_slack`, `drain_side`,
+/// `drain_proceeds`) that don't have `&OrderBook` in scope: passing a
+/// single `BookIds` value instead of two bare, same-typed `ID` parameters
+/// side by side avoids a silent-argument-swap hazard at every call site.
+public struct BookIds has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
 }
 
 // === Price scaling helpers ===
@@ -378,7 +409,7 @@ fun u64_max_as_u256(): u256 { U64_MAX as u256 }
 /// `precision`/`exponent` guarantee is representable: true price must be at
 /// least `10^-precision` and at most `10^exponent`. Raw scalars only —
 /// deliberately NOT `&OrderBook` — reused unmodified across 4 call sites in
-/// 3 categories: construction (`new_impl`), `set_last_price`, and
+/// 3 categories: construction (`new`), `set_last_price`, and
 /// order placement (`place_limit_order_bid`/`_ask`), the
 /// first of which has no live book reference to borrow yet.
 fun assert_price_in_declared_range(
@@ -404,9 +435,46 @@ fun assert_price_in_declared_range(
 /// Callable by any address — no capability is required to create a book,
 /// and it is never registered anywhere by this call.
 ///
-/// The book's `event_id` (stamped on every emitted event) defaults to the
-/// book's own object id. Use `new_with_event_id_override` instead of this
-/// function if a wrapping object's own id should be stamped there instead.
+/// `enclosing_object_id` is a MANDATORY `&UID` parameter, not an optional
+/// one, because `OrderBook`/`ClobAdminCap` are both `store`-only, never
+/// `key` (see their own doc comments) — this book can never exist as a
+/// top-level object in its own right, only ever embedded as a field inside
+/// some enclosing object. Requiring that enclosing object's live `&UID` at
+/// construction time is therefore not an artificial burden; it reflects how
+/// this type is actually used. The book's own `enclosing_object_id` field
+/// (stamped on every emitted event, alongside the book's true id as
+/// `book_id` — see `OrderBook.enclosing_object_id`'s doc comment) is set to
+/// `object::uid_to_inner(enclosing_object_id)`.
+///
+/// `enclosing_object_id` is a borrowed `&UID` rather than a bare `ID`
+/// specifically to rule out the naive attack of pointing
+/// `enclosing_object_id` at an arbitrary id (e.g. copied off a public event
+/// for an unrelated book) that the caller merely knows but doesn't hold a
+/// live reference to — passing a bare `ID` copied that way does not
+/// compile. This does NOT fully guarantee the caller controls the
+/// referenced object: any object that is genuinely shared and whose module
+/// exposes a public `&UID` accessor (e.g. `sui::kiosk::uid(&Kiosk)`,
+/// `sui::transfer_policy::uid(&TransferPolicy)`) can have its `&UID`
+/// borrowed by any address, not just its owner — so a caller can still
+/// legitimately obtain and pass in a live `&UID` for an object they don't
+/// own if such an accessor exists for it. This narrows the attack surface;
+/// it does not eliminate id spoofing outright. As documented on
+/// `OrderBook.enclosing_object_id`, this is never a fund-safety or
+/// authentication concern — `enclosing_object_id` is never used for
+/// authentication anywhere in this module — only an event/indexer spoofing
+/// concern, and one an off-chain consumer can now independently detect by
+/// cross-checking the event's own `book_id` field.
+///
+/// A caller with no real wrapper object handy may legitimately mint a
+/// throwaway `UID` via `object::new(ctx)`, pass a borrow of it here, and
+/// delete it immediately afterward (`that_uid.delete()`) — this is a
+/// supported pattern, not a workaround: what actually matters for the
+/// indexer-cross-check use case this field exists for is the id's
+/// uniqueness, not whether the referenced object is still live at read
+/// time. In the same spirit, if an enclosing object is later deleted and a
+/// new `OrderBook` constructed to replace it, deliberately reusing that same
+/// (now-dead) enclosing id across the transition is a useful capability for
+/// indexer continuity, not a misuse of this parameter.
 ///
 /// `min_size` bounds order-placement size only, not post-fill remainder
 /// size — see `validate_size_raw`'s doc comment for the full caveat about
@@ -433,65 +501,7 @@ public fun new<Base, Quote>(
     precision: u8,
     exponent: u8,
     initial_last_price: u64,
-    ctx: &mut TxContext,
-): (OrderBook<Base, Quote>, ClobAdminCap) {
-    new_impl(min_size, base_decimals, quote_decimals, precision, exponent, initial_last_price, option::none(), ctx)
-}
-
-/// Same as `new`, except the book's `event_id` (stamped on every emitted
-/// event) is set to `object::uid_to_inner(event_id_override)` instead of
-/// defaulting to the book's own id — for a wrapping object whose own outer
-/// id is what external callers/indexers actually query by.
-///
-/// `event_id_override` is a borrowed `&UID` rather than a bare `ID`
-/// specifically to rule out the naive attack of pointing `event_id` at an
-/// arbitrary id (e.g. copied off a public event for an unrelated book) that
-/// the caller merely knows but doesn't hold a live reference to — passing a
-/// bare `ID` copied that way no longer compiles. This does NOT fully
-/// guarantee the caller controls the referenced object: any object that is
-/// genuinely shared and whose module exposes a public `&UID` accessor (e.g.
-/// `sui::kiosk::uid(&Kiosk)`, `sui::transfer_policy::uid(&TransferPolicy)`)
-/// can have its `&UID` borrowed by any address, not just its owner — so a
-/// caller can still legitimately obtain and pass in a live `&UID` for an
-/// object they don't own if such an accessor exists for it. This narrows
-/// the attack surface; it does not eliminate id spoofing outright. As
-/// documented on `OrderBook.event_id`, this is never a fund-safety or
-/// authentication concern — `event_id` is never used for authentication
-/// anywhere in this module — only an event/indexer spoofing concern. Note:
-/// `Option<&UID>` is not a legal Move type (generic type parameters,
-/// including `Option`'s, cannot be references), which is why this is a
-/// separate function rather than an `Option<&UID>` parameter on `new`
-/// itself.
-///
-/// `min_size` carries the same order-placement-size-only caveat documented
-/// on `new` (see `validate_size_raw`'s doc comment).
-///
-/// `base_decimals`/`quote_decimals`/`precision`/`exponent`/`initial_last_price`
-/// carry the same meaning documented on `new`.
-public fun new_with_event_id_override<Base, Quote>(
-    min_size: u64,
-    base_decimals: u8,
-    quote_decimals: u8,
-    precision: u8,
-    exponent: u8,
-    initial_last_price: u64,
-    event_id_override: &UID,
-    ctx: &mut TxContext,
-): (OrderBook<Base, Quote>, ClobAdminCap) {
-    new_impl(
-        min_size, base_decimals, quote_decimals, precision, exponent, initial_last_price,
-        option::some(object::uid_to_inner(event_id_override)), ctx,
-    )
-}
-
-fun new_impl<Base, Quote>(
-    min_size: u64,
-    base_decimals: u8,
-    quote_decimals: u8,
-    precision: u8,
-    exponent: u8,
-    initial_last_price: u64,
-    event_id_override: Option<ID>,
+    enclosing_object_id: &UID,
     ctx: &mut TxContext,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
     assert!(min_size != 0, EZeroMinSize);
@@ -520,15 +530,9 @@ fun new_impl<Base, Quote>(
     assert_price_in_declared_range(initial_last_price, price_scale, base_decimals, quote_decimals, precision, exponent);
 
     let book_uid = object::new(ctx);
-    let book_id = object::uid_to_inner(&book_uid);
     let cap = ClobAdminCap { id: object::new(ctx) };
     let cap_id = object::uid_to_inner(&cap.id);
-    let event_id = if (event_id_override.is_some()) {
-        event_id_override.destroy_some()
-    } else {
-        event_id_override.destroy_none();
-        book_id
-    };
+    let enclosing_object_id = object::uid_to_inner(enclosing_object_id);
 
     let book = OrderBook<Base, Quote> {
         id: book_uid,
@@ -551,7 +555,7 @@ fun new_impl<Base, Quote>(
         quote_decimals,
         last_price: initial_last_price,
         price_band_factor: option::none(),
-        event_id,
+        enclosing_object_id,
     };
     (book, cap)
 }
@@ -603,7 +607,8 @@ fun claim_maker_balance<Base, Quote>(
 }
 
 public struct BookVersionUpgraded has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     from: u64,
     to: u64,
 }
@@ -623,10 +628,11 @@ public struct BookVersionUpgraded has copy, drop {
 /// IMPORTANT — this silent, no-migration self-healing is a placeholder
 /// policy, valid only because no version bump to date has ever required
 /// actual per-book data migration (`CURRENT_VERSION` has only ever moved
-/// from 0 to 1, a bookkeeping-only change). The day `CURRENT_VERSION` is
-/// bumped for a change that DOES require converting a book's existing
-/// on-chain data, this silent auto-bump behavior must be replaced — before
-/// that version ships, not after — with an explicit, cap-gated migration
+/// from 0 to 1 and then from 1 to 2, each a bookkeeping-only change). The
+/// day `CURRENT_VERSION` is bumped for a change that DOES require
+/// converting a book's existing on-chain data, this silent auto-bump
+/// behavior must be replaced — before that version ships, not after —
+/// with an explicit, cap-gated migration
 /// function and a strict version-equality assert here, so an un-migrated
 /// book can no longer silently self-heal into a version whose data layout it
 /// doesn't actually have yet.
@@ -636,7 +642,8 @@ public fun assert_book_version<Base, Quote>(book: &mut OrderBook<Base, Quote>) {
         let from = book.version;
         book.version = CURRENT_VERSION;
         event::emit(BookVersionUpgraded {
-            order_book_id: book.event_id,
+            book_id: object::uid_to_inner(&book.id),
+            enclosing_object_id: book.enclosing_object_id,
             from,
             to: CURRENT_VERSION,
         });
@@ -646,10 +653,12 @@ public fun assert_book_version<Base, Quote>(book: &mut OrderBook<Base, Quote>) {
 // === Public view functions (no version-guard assertion) ===
 
 /// The book's own immutable object id — what `OrderTicket.order_book_id` is
-/// bound to (see `OrderTicket`'s doc comment). NOT the same as `event_id`,
-/// which is caller-overridable at construction and used only for event
-/// stamping; this is the actual, unforgeable identity `cancel_order` and
-/// `update_resting_order` authenticate tickets against.
+/// bound to (see `OrderTicket`'s doc comment). NOT the same as
+/// `enclosing_object_id`, which is caller-supplied at construction and used
+/// only for event stamping; this is the actual, unforgeable identity
+/// `cancel_order` and `update_resting_order` authenticate tickets against.
+/// This is also the value stamped as `book_id` on every emitted event,
+/// alongside the event's own `enclosing_object_id`.
 public fun book_id<Base, Quote>(book: &OrderBook<Base, Quote>): ID {
     object::uid_to_inner(&book.id)
 }
@@ -697,23 +706,24 @@ public fun best_ask<Base, Quote>(book: &OrderBook<Base, Quote>): Option<u64> {
     }
 }
 
-/// For an ASK price level (`side == false`), the returned depth is
-/// Base-denominated (the sum of every resting ask's remaining Base
-/// quantity at `price`).
-///
-/// For a BID price level (`side == true`), the returned depth is
-/// QUOTE-denominated instead (the sum of every resting bid's remaining
-/// Quote buying-power at `price` -- see `order::Order.remaining_size`'s doc
-/// comment). This is identical to `bid_quote_escrow_at_price(book, price)`
-/// for the same `price` -- both are the same maintained aggregate.
-public fun depth_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, side: bool, price: u64): u64 {
-    let tree = if (side) &book.bids else &book.asks;
-    let found = tree.find(price);
+/// The exact, maintained total Base quantity resting across every ASK order
+/// at `price` -- `0` if no ask level exists there. This function is
+/// deliberately ask-only, not `side`-parameterized: a bid level's own
+/// natural aggregate is Quote-denominated (its resting orders escrow Quote,
+/// not Base -- see `order::Order.remaining_size`'s doc comment), so a single
+/// `u64`-returning function silently switching denomination based on a
+/// boolean `side` argument was a real integration hazard (a caller reading
+/// only the type signature had no way to know the units differed by side,
+/// and the two units are the same numeric type). Callers wanting a bid
+/// level's aggregate should call `bid_quote_escrow_at_price` instead, which
+/// is honest about being Quote-denominated in its own name.
+public fun ask_base_escrow_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, price: u64): u64 {
+    let found = book.asks.find(price);
     if (found.is_none()) {
         return 0
     };
     let leaf_ptr = found.destroy_some();
-    let level = tree.borrow(leaf_ptr);
+    let level = book.asks.borrow(leaf_ptr);
     level.level_total_size()
 }
 
@@ -724,15 +734,20 @@ public fun depth_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, side: bool
 /// level exists at `price`.
 ///
 /// This is an O(1) running aggregate maintained at the same mutation points
-/// as `depth_at_price`'s underlying total, so it always equals the true sum
-/// of live per-order escrow -- unlike a re-derivation via
-/// `bid_escrow_amount(book, price, depth_at_price(book, bid(), price))`,
-/// which can be off in EITHER direction: a re-derivation over- or
+/// as `ask_base_escrow_at_price`'s underlying total (the bid-side twin of
+/// the same per-level bookkeeping), so it always equals the true sum of
+/// live per-order escrow -- unlike a re-derivation via
+/// `bid_escrow_amount(book, price, size)` fed a size from some OTHER
+/// source, which can be off in EITHER direction: a re-derivation over- or
 /// under-counts by up to roughly one Quote atom per resting order at that
 /// price, in either direction, depending on each order's own fill history.
+/// (Feeding this function's own OWN return value into `bid_escrow_amount`
+/// as a "size" is additionally a straightforward category error, not just a
+/// rounding-dust discrepancy -- this value is already Quote-denominated, so
+/// `bid_escrow_amount` would multiply by `price` a second time.)
 ///
 /// Ask levels hold no Quote escrow at all (an ask escrows Base, exactly
-/// equal to `depth_at_price(book, ask(), price)`), which is why this
+/// equal to `ask_base_escrow_at_price(book, price)`), which is why this
 /// function is deliberately bid-only rather than taking a `side` parameter.
 public fun bid_quote_escrow_at_price<Base, Quote>(book: &OrderBook<Base, Quote>, price: u64): u64 {
     let found = book.bids.find(price);
@@ -850,45 +865,52 @@ fun assert_clob_admin<Base, Quote>(cap: &ClobAdminCap, book: &OrderBook<Base, Qu
 // === Local pause/unpause ===
 
 public struct Paused has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
 }
 
 public struct Unpaused has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
 }
 
 public fun clob_admin_pause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.paused = true;
-    event::emit(Paused { order_book_id: event_book_id });
+    event::emit(Paused { book_id, enclosing_object_id });
 }
 
 public fun clob_admin_unpause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
     assert!(!book.retiring, EBookRetiring);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.paused = false;
-    event::emit(Unpaused { order_book_id: event_book_id });
+    event::emit(Unpaused { book_id, enclosing_object_id });
 }
 
 // === Fee setters and claim_fees ===
 
 public struct TakerFeeSet has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     rate_bps: u64,
 }
 
 public struct MakerFeeSet has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     rate_bps: u64,
 }
 
 public struct FeesClaimed has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     claimant: address,
-    order_book_id: ID,
     base_amount: u64,
     quote_amount: u64,
 }
@@ -901,9 +923,10 @@ public fun clob_admin_set_taker_fee<Base, Quote>(
     assert_book_version(book);
     assert_clob_admin(cap, book);
     assert!(rate_bps <= MAX_TAKER_FEE_BPS, ETakerFeeRateTooHigh);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.taker_fee_bps = rate_bps;
-    event::emit(TakerFeeSet { order_book_id: event_book_id, rate_bps });
+    event::emit(TakerFeeSet { book_id, enclosing_object_id, rate_bps });
 }
 
 public fun clob_admin_set_maker_fee<Base, Quote>(
@@ -914,13 +937,15 @@ public fun clob_admin_set_maker_fee<Base, Quote>(
     assert_book_version(book);
     assert_clob_admin(cap, book);
     assert!(rate_bps <= MAX_MAKER_FEE_BPS, EMakerFeeRateTooHigh);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.maker_fee_bps = rate_bps;
-    event::emit(MakerFeeSet { order_book_id: event_book_id, rate_bps });
+    event::emit(MakerFeeSet { book_id, enclosing_object_id, rate_bps });
 }
 
 public struct PriceBandFactorSet has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     factor: Option<u64>,
 }
 
@@ -939,13 +964,15 @@ public fun clob_admin_set_price_band_factor<Base, Quote>(
     if (factor.is_some()) {
         assert!(*factor.borrow() >= 1, EZeroPriceBandFactor);
     };
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.price_band_factor = factor;
-    event::emit(PriceBandFactorSet { order_book_id: event_book_id, factor });
+    event::emit(PriceBandFactorSet { book_id, enclosing_object_id, factor });
 }
 
 public struct LastPriceSet has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     last_price: u64,
     setter: address,
 }
@@ -1015,9 +1042,10 @@ public fun set_last_price<Base, Quote>(
         assert!(new_last_price <= *ask_opt.borrow(), EResetPriceAboveBestAsk);
     };
     if (new_last_price != book.last_price) {
-        let event_book_id = book.event_id;
+        let book_id = object::uid_to_inner(&book.id);
+        let enclosing_object_id = book.enclosing_object_id;
         book.last_price = new_last_price;
-        event::emit(LastPriceSet { order_book_id: event_book_id, last_price: new_last_price, setter: ctx.sender() });
+        event::emit(LastPriceSet { book_id, enclosing_object_id, last_price: new_last_price, setter: ctx.sender() });
     };
 }
 
@@ -1028,7 +1056,8 @@ public fun clob_admin_claim_fees<Base, Quote>(
 ): (Coin<Base>, Coin<Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let claimant = ctx.sender();
     let (base, quote) = withdraw_fee_accumulator(book);
     let base_amount = base.value();
@@ -1038,7 +1067,7 @@ public fun clob_admin_claim_fees<Base, Quote>(
     let quote_coin = coin_or_zero(quote, ctx);
 
     if (base_amount != 0 || quote_amount != 0) {
-        event::emit(FeesClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
+        event::emit(FeesClaimed { book_id, enclosing_object_id, claimant, base_amount, quote_amount });
     };
     (base_coin, quote_coin)
 }
@@ -1046,8 +1075,9 @@ public fun clob_admin_claim_fees<Base, Quote>(
 // === Force-cancel ===
 
 public struct OrderCancelled has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     order_id: u64,
-    order_book_id: ID,
     trader: address,
 }
 
@@ -1061,7 +1091,9 @@ public fun clob_admin_cancel_order<Base, Quote>(
 ) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
+    let ids = BookIds { book_id, enclosing_object_id };
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
     let order_opt = tree.find_and_remove_order(price, order_id);
@@ -1072,21 +1104,23 @@ public fun clob_admin_cancel_order<Base, Quote>(
     let mfee_bps = live_order.maker_fee_bps();
     let (escrow_base, escrow_quote, frb, frq) = live_order.destroy();
     let (escrow_base, escrow_quote) = fold_maker_fee_slack(
-        escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, owner,
+        escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, ids, owner,
         &mut book.fee_accumulator,
     );
     refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
-    event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
+    event::emit(OrderCancelled { book_id, enclosing_object_id, order_id, trader: owner });
 }
 
 // === Deletion lifecycle: clob_admin_retire/clob_admin_drain_step/clob_admin_finalize ===
 
 public struct OrderBookRetired has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
 }
 
 public struct OrderBookDeleted has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     base: TypeName,
     quote: TypeName,
 }
@@ -1103,10 +1137,11 @@ public struct OrderBookDeleted has copy, drop {
 public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBook<Base, Quote>) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     book.paused = true;
     book.retiring = true;
-    event::emit(OrderBookRetired { order_book_id: event_book_id });
+    event::emit(OrderBookRetired { book_id, enclosing_object_id });
 }
 
 /// Note: this function emits up to TWO events per drained resting order (one
@@ -1144,19 +1179,19 @@ public fun clob_admin_drain_step<Base, Quote>(
     assert_book_version(book);
     assert_clob_admin(cap, book);
     assert!(book.retiring, ENotRetiring);
-    let event_book_id = book.event_id;
+    let ids = BookIds { book_id: object::uid_to_inner(&book.id), enclosing_object_id: book.enclosing_object_id };
     let mut remaining = max_items;
     let fees = &mut book.fee_accumulator;
-    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, event_book_id, fees, ctx);
-    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, event_book_id, fees, ctx);
-    drain_proceeds(&mut book.proceeds, &mut remaining, event_book_id, ctx);
+    drain_side(&mut book.bids, &mut remaining, /* want_max */ true, ids, fees, ctx);
+    drain_side(&mut book.asks, &mut remaining, /* want_max */ false, ids, fees, ctx);
+    drain_proceeds(&mut book.proceeds, &mut remaining, ids, ctx);
 }
 
 fun drain_side<Base, Quote>(
     tree: &mut PriceTree<PriceLevel<Base, Quote>>,
     remaining: &mut u64,
     want_max: bool,
-    event_book_id: ID,
+    ids: BookIds,
     fees: &mut FeeAccumulator<Base, Quote>,
     ctx: &mut TxContext,
 ) {
@@ -1176,10 +1211,12 @@ fun drain_side<Base, Quote>(
                 let mfee_bps = order.maker_fee_bps();
                 let (escrow_base, escrow_quote, frb, frq) = order.destroy();
                 let (escrow_base, escrow_quote) = fold_maker_fee_slack(
-                    escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, owner, fees,
+                    escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, ids, owner, fees,
                 );
                 refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
-                event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader: owner });
+                event::emit(OrderCancelled {
+                    book_id: ids.book_id, enclosing_object_id: ids.enclosing_object_id, order_id, trader: owner,
+                });
                 *remaining = *remaining - 1;
             };
             is_empty_now = level.level_is_empty();
@@ -1237,7 +1274,7 @@ fun refund_order_escrow<Base, Quote>(
 fun drain_proceeds<Base, Quote>(
     proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
     remaining: &mut u64,
-    event_book_id: ID,
+    ids: BookIds,
     ctx: &mut TxContext,
 ) {
     while (*remaining > 0 && !proceeds.is_empty()) {
@@ -1248,20 +1285,25 @@ fun drain_proceeds<Base, Quote>(
         transfer_or_destroy_zero(base, owner, ctx);
         transfer_or_destroy_zero(quote, owner, ctx);
         if (base_amount != 0 || quote_amount != 0) {
-            event::emit(ProceedsClaimed { claimant: owner, order_book_id: event_book_id, base_amount, quote_amount });
+            event::emit(ProceedsClaimed {
+                book_id: ids.book_id, enclosing_object_id: ids.enclosing_object_id,
+                claimant: owner, base_amount, quote_amount,
+            });
         };
         *remaining = *remaining - 1;
     };
 }
 
 /// Returns the book's true, unforgeable object id
-/// (`object::uid_to_inner(&book.id)`) — NOT `book.event_id`. This is
-/// distinct from the emitted `OrderBookDeleted` event's `order_book_id`
-/// field, which stamps `event_id` and may differ if the book was
-/// constructed with an `event_id_override`. A caller that relies on this
-/// return value for indexing/bookkeeping gets the book's authoritative
-/// identity, unlike `event_id`, which is caller-controllable at
-/// construction time and must never be trusted for that purpose.
+/// (`object::uid_to_inner(&book.id)`) — NOT `book.enclosing_object_id`. This
+/// is distinct from the emitted `OrderBookDeleted` event's
+/// `enclosing_object_id` field, which stamps the book's caller-supplied
+/// `enclosing_object_id` and may differ from the book's true identity (that
+/// same event's own `book_id` field carries the true id, for comparison). A
+/// caller that relies on this return value for indexing/bookkeeping gets the
+/// book's authoritative identity, unlike `enclosing_object_id`, which is
+/// caller-controllable at construction time and must never be trusted for
+/// that purpose.
 ///
 /// The emptiness check below includes the fee accumulator
 /// (`fee_base == 0 && fee_quote == 0`), not just resting orders and pooled
@@ -1295,9 +1337,8 @@ public fun clob_admin_finalize<Base, Quote>(
         paused: _, retiring: _, next_order_id: _, clob_admin_cap_id: _, version: _,
         taker_fee_bps: _, maker_fee_bps: _, fee_accumulator,
         price_scale: _, precision: _, exponent: _, base_decimals: _, quote_decimals: _,
-        last_price: _, price_band_factor: _, event_id,
+        last_price: _, price_band_factor: _, enclosing_object_id,
     } = book;
-    let event_book_id = event_id;
     let true_book_id = object::uid_to_inner(&id);
     bids.destroy_empty();
     asks.destroy_empty();
@@ -1308,7 +1349,8 @@ public fun clob_admin_finalize<Base, Quote>(
     object::delete(id);
 
     event::emit(OrderBookDeleted {
-        order_book_id: event_book_id,
+        book_id: true_book_id,
+        enclosing_object_id,
         base: type_name::with_defining_ids<Base>(),
         quote: type_name::with_defining_ids<Quote>(),
     });
@@ -1316,7 +1358,7 @@ public fun clob_admin_finalize<Base, Quote>(
     let ClobAdminCap { id: cap_id_uid } = cap;
     let cap_id = object::uid_to_inner(&cap_id_uid);
     object::delete(cap_id_uid);
-    event::emit(ClobAdminCapDiscarded { cap_id, for_book: event_book_id });
+    event::emit(ClobAdminCapDiscarded { book_id: true_book_id, enclosing_object_id, cap_id });
 
     true_book_id
 }
@@ -1335,8 +1377,9 @@ public fun clob_admin_finalize<Base, Quote>(
 /// size` recomputation) and may differ by rounding from `ceil(price * size /
 /// price_scale)` — this is expected.
 public struct OrderFilled has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     maker_order_id: u64,
-    order_book_id: ID,
     price: u64,
     size: u64,
     maker: address,
@@ -1362,8 +1405,9 @@ public struct OrderFilled has copy, drop {
 /// accumulator) indefinitely along with it — the fee isn't lost, just not
 /// yet finalized, exactly like the order's own escrow/proceeds.
 public struct MakerFeeSettled has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     order_id: u64,
-    order_book_id: ID,
     maker: address,
     amount: u64,
 }
@@ -1396,6 +1440,33 @@ fun scaled_ceil_mul_div(price: u64, size: u64, price_scale: u64): u64 {
 /// exploit where floor division let many small fills each collect zero fee.
 fun fee_amount(receive_amount: u64, rate_bps: u64): u64 {
     (((receive_amount as u128) * (rate_bps as u128) + (BPS_DENOM as u128) - 1) / (BPS_DENOM as u128)) as u64
+}
+
+/// Inverse of `fee_amount`: the smallest gross size `G` such that, if fully
+/// matched, `G - fee_amount(G, rate_bps) >= net_cap` -- i.e. the GROSS
+/// matching bound to feed `match_bid` so that the resulting NET (post-fee)
+/// delivered amount never exceeds `net_cap`. This exists because
+/// `match_bid` only ever sees the gross size it is matching against --
+/// `taker_fee_amount` is computed and deducted only after matching
+/// completes -- so a NET-denominated cap like `max_base_out` must be
+/// converted to an equivalent GROSS bound up front.
+///
+/// `rate_bps == 0` returns `net_cap` unchanged (no fee, gross == net).
+/// Otherwise this is `ceil(net_cap * BPS_DENOM / (BPS_DENOM - rate_bps))`,
+/// computed via a `u128` intermediate; `rate_bps` is bounds-checked to at
+/// most `MAX_TAKER_FEE_BPS` before it can ever reach this function, so
+/// `BPS_DENOM - rate_bps` is never zero.
+///
+/// `net_cap == u64::MAX` (the "unbounded" sentinel -- see
+/// `place_market_order_bid`'s doc comment) is handled by clamping: the
+/// inflated value would itself overflow `u64`, but an unbounded net cap
+/// needs no inflation to remain unbounded, so any overflow just clamps back
+/// to `u64::MAX`.
+fun gross_size_bound_for_net_cap(net_cap: u64, rate_bps: u64): u64 {
+    if (rate_bps == 0) { return net_cap };
+    let denom = (BPS_DENOM - rate_bps) as u128;
+    let gross = ((net_cap as u128) * (BPS_DENOM as u128) + denom - 1) / denom;
+    if (gross > U64_MAX) { U64_MAX as u64 } else { gross as u64 }
 }
 
 /// `min_size` bounds order-placement size only — it is enforced here, once,
@@ -1483,12 +1554,15 @@ fun conclude_order_fee<T>(
     fee_basis_accumulated: u64,
     maker_fee_bps: u64,
     order_id: u64,
-    event_book_id: ID,
+    ids: BookIds,
     owner: address,
 ): (Balance<T>, Balance<T>) {
     let correct_total_fee = fee_amount(fee_basis_accumulated, maker_fee_bps);
     let to_accumulator = reserve.split(correct_total_fee);
-    event::emit(MakerFeeSettled { order_id, order_book_id: event_book_id, maker: owner, amount: correct_total_fee });
+    event::emit(MakerFeeSettled {
+        book_id: ids.book_id, enclosing_object_id: ids.enclosing_object_id,
+        order_id, maker: owner, amount: correct_total_fee,
+    });
     (reserve, to_accumulator)
 }
 
@@ -1532,14 +1606,14 @@ fun fold_maker_fee_slack<Base, Quote>(
     fee_basis_accumulated: u64,
     maker_fee_bps: u64,
     order_id: u64,
-    event_book_id: ID,
+    ids: BookIds,
     owner: address,
     fees: &mut FeeAccumulator<Base, Quote>,
 ): (Option<Balance<Base>>, Option<Balance<Quote>>) {
     if (fee_reserve_base.is_some()) {
         fee_reserve_quote.destroy_none();
         let reserve = fee_reserve_base.destroy_some();
-        let (slack, fee_collected) = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, order_id, event_book_id, owner);
+        let (slack, fee_collected) = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, order_id, ids, owner);
         fees.base.join(fee_collected);
         if (escrow_base.is_some()) {
             escrow_base.borrow_mut().join(slack);
@@ -1550,7 +1624,7 @@ fun fold_maker_fee_slack<Base, Quote>(
     } else {
         fee_reserve_base.destroy_none();
         let reserve = fee_reserve_quote.destroy_some();
-        let (slack, fee_collected) = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, order_id, event_book_id, owner);
+        let (slack, fee_collected) = conclude_order_fee(reserve, fee_basis_accumulated, maker_fee_bps, order_id, ids, owner);
         fees.quote.join(fee_collected);
         if (escrow_quote.is_some()) {
             escrow_quote.borrow_mut().join(slack);
@@ -1586,7 +1660,7 @@ fun fill_level_bid<Base, Quote>(
     fills_consumed: &mut u64,
     max_fills: u64,
 ): (bool, bool) {
-    let event_book_id = book.event_id;
+    let ids = BookIds { book_id: object::uid_to_inner(&book.id), enclosing_object_id: book.enclosing_object_id };
     let price_scale = book.price_scale;
     let mut budget_exhausted = false;
     let mut hit_max_fills = false;
@@ -1676,8 +1750,9 @@ fun fill_level_bid<Base, Quote>(
             let maker_remaining_after = maker_order.remaining_size();
 
             event::emit(OrderFilled {
+                book_id: ids.book_id,
+                enclosing_object_id: ids.enclosing_object_id,
                 maker_order_id,
-                order_book_id: event_book_id,
                 price: best_price,
                 size: fill_qty,
                 maker: maker_addr,
@@ -1696,7 +1771,7 @@ fun fill_level_bid<Base, Quote>(
                 destroy_drained_ask_escrow(eb, eq);
                 let reserve_quote = extract_drained_ask_fee_reserve(frb, frq);
                 let (slack_quote, fee_quote_collected) = conclude_order_fee(
-                    reserve_quote, fee_basis, mfee_bps, maker_order_id, event_book_id, maker_addr,
+                    reserve_quote, fee_basis, mfee_bps, maker_order_id, ids, maker_addr,
                 );
                 quote_payment.join(slack_quote);
                 book.fee_accumulator.quote.join(fee_quote_collected);
@@ -1776,7 +1851,7 @@ fun fill_level_ask<Base, Quote>(
     fills_consumed: &mut u64,
     max_fills: u64,
 ): (bool, bool) {
-    let event_book_id = book.event_id;
+    let ids = BookIds { book_id: object::uid_to_inner(&book.id), enclosing_object_id: book.enclosing_object_id };
     // Note: unlike `fill_level_bid`, this function no longer reads
     // `book.price_scale` at all -- a resting bid's own `total_reserved`/
     // `original_size` ratio already fixes its price (every fill against a
@@ -1897,8 +1972,9 @@ fun fill_level_ask<Base, Quote>(
             let maker_remaining_after = original_size - maker_order.fee_basis_accumulated();
 
             event::emit(OrderFilled {
+                book_id: ids.book_id,
+                enclosing_object_id: ids.enclosing_object_id,
                 maker_order_id,
-                order_book_id: event_book_id,
                 price: best_price,
                 size: fill_qty,
                 maker: maker_addr,
@@ -1917,7 +1993,7 @@ fun fill_level_ask<Base, Quote>(
                 destroy_drained_bid_escrow(eb, eq);
                 let reserve_base = extract_drained_bid_fee_reserve(frb, frq);
                 let (slack_base, fee_base_collected) = conclude_order_fee(
-                    reserve_base, fee_basis, mfee_bps, maker_order_id, event_book_id, maker_addr,
+                    reserve_base, fee_basis, mfee_bps, maker_order_id, ids, maker_addr,
                 );
                 base_payment.join(slack_base);
                 book.fee_accumulator.base.join(fee_base_collected);
@@ -1988,10 +2064,10 @@ fun match_ask<Base, Quote>(
 public struct OrderTicket has store {
     order_id: u64,
     /// Bound at minting time to the book's own immutable object id
-    /// (`object::uid_to_inner(&book.id)`), NOT to `book.event_id`. This
-    /// makes it unforgeable regardless of what `event_id_override` a book
-    /// was constructed with — `event_id` is caller-controllable and must
-    /// never be used to authenticate a ticket. `cancel_order` and
+    /// (`object::uid_to_inner(&book.id)`), NOT to `book.enclosing_object_id`.
+    /// This makes it unforgeable regardless of what `enclosing_object_id` a
+    /// book was constructed with — `enclosing_object_id` is caller-supplied
+    /// and must never be used to authenticate a ticket. `cancel_order` and
     /// `update_resting_order` check this field against
     /// `object::uid_to_inner(&book.id)` to reject a ticket minted by a
     /// different book.
@@ -2029,20 +2105,27 @@ public(package) fun destroy_orphaned_ticket_unchecked(ticket: OrderTicket) {
 }
 
 /// Guarded disposal: aborts with `EWrongBook` if `ticket` wasn't minted by
-/// `book`, and with `EProceedsNotEmpty` if `book.proceeds` still holds an
-/// entry for this ticket's `order_id` — destroying the ticket in that case
-/// would permanently strand those pooled funds, since nothing else can ever
-/// reference that `order_id` again. Deliberately does NOT check whether the
-/// order is still resting: destroying a ticket for a still-resting order
-/// with zero pooled proceeds is a legitimate caller choice (e.g. abandoning
-/// a dust order); the only actual safety invariant is "would this strand
-/// funds."
+/// `book`, with `EProceedsNotEmpty` if `book.proceeds` still holds an entry
+/// for this ticket's `order_id` — destroying the ticket in that case would
+/// permanently strand those pooled funds, since nothing else can ever
+/// reference that `order_id` again — and with `EOrderStillResting` if the
+/// order is still resting on `book`. While the order and the book both
+/// still exist, this ticket remains the only self-service path back to
+/// that order's escrow (`cancel_order` requires it by value); destroying it
+/// here would give that up for no reason a caller couldn't achieve just as
+/// well by calling `cancel_order` instead. Use `destroy_ticket_unconditionally`
+/// once the book itself is gone — see that function's own doc comment for
+/// why a live-book check has no answer at that point.
 public fun destroy_orphaned_ticket<Base, Quote>(
     book: &OrderBook<Base, Quote>,
     ticket: OrderTicket,
 ) {
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
     assert!(!book.proceeds.contains(ticket.order_id), EProceedsNotEmpty);
+    assert!(
+        resting_order_escrow(book, ticket.side, ticket.price, ticket.order_id).is_none(),
+        EOrderStillResting,
+    );
     destroy_orphaned_ticket_unchecked(ticket);
 }
 
@@ -2076,8 +2159,9 @@ public fun destroy_ticket_unconditionally(ticket: OrderTicket) {
 // === Order placement, cancellation, and proceeds claiming ===
 
 public struct OrderPlaced has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     order_id: u64,
-    order_book_id: ID,
     side: bool,
     price: u64,
     size: u64,
@@ -2086,8 +2170,9 @@ public struct OrderPlaced has copy, drop {
 }
 
 public struct ProceedsClaimed has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     claimant: address,
-    order_book_id: ID,
     base_amount: u64,
     quote_amount: u64,
 }
@@ -2104,7 +2189,8 @@ public struct ProceedsClaimed has copy, drop {
 /// relies on this within-transaction ordering (Sui's event ordering within a
 /// transaction's effects is deterministic).
 public struct OrderExecuted has copy, drop {
-    order_book_id: ID,
+    book_id: ID,
+    enclosing_object_id: ID,
     taker: address,
     taker_side: bool,
     /// 0 = place_limit_order_bid, 1 = place_limit_order_ask,
@@ -2225,7 +2311,8 @@ public fun place_limit_order_bid<Base, Quote>(
     let escrow_amount = bid_escrow_amount(book, price, size);
     let mut escrow = payment.split(escrow_amount, ctx).into_balance();
 
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (mut matched_base, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
@@ -2275,8 +2362,9 @@ public fun place_limit_order_bid<Base, Quote>(
         );
         insert_resting_order(book, true, price, resting, ctx);
         event::emit(OrderPlaced {
+            book_id,
+            enclosing_object_id,
             order_id,
-            order_book_id: event_book_id,
             side: true,
             price,
             size: actual_resting_size,
@@ -2297,7 +2385,8 @@ public fun place_limit_order_bid<Base, Quote>(
     let rested_size = if (should_rest) actual_resting_size else 0;
     let rested_order_id = if (should_rest) option::some(order_id) else option::none();
     event::emit(OrderExecuted {
-        order_book_id: event_book_id,
+        book_id,
+        enclosing_object_id,
         taker,
         taker_side: true,
         entry_point: 0,
@@ -2380,7 +2469,8 @@ public fun place_limit_order_ask<Base, Quote>(
 
     let escrow_base = payment.split(size, ctx).into_balance();
 
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (mut matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
@@ -2406,8 +2496,9 @@ public fun place_limit_order_ask<Base, Quote>(
         );
         insert_resting_order(book, false, price, resting, ctx);
         event::emit(OrderPlaced {
+            book_id,
+            enclosing_object_id,
             order_id,
-            order_book_id: event_book_id,
             side: false,
             price,
             size: remaining_size,
@@ -2428,7 +2519,8 @@ public fun place_limit_order_ask<Base, Quote>(
     let rested_size = if (should_rest) remaining_size else 0;
     let rested_order_id = if (should_rest) option::some(order_id) else option::none();
     event::emit(OrderExecuted {
-        order_book_id: event_book_id,
+        book_id,
+        enclosing_object_id,
         taker,
         taker_side: false,
         entry_point: 1,
@@ -2456,7 +2548,13 @@ public fun place_limit_order_ask<Base, Quote>(
 /// - `max_base_out` (`u64`, `0` = a real zero cap that immediately no-ops
 ///   with nothing matched; `u64::MAX` = unbounded) replaces the old,
 ///   mandatory `size` parameter -- it caps how much Base this call will ever
-///   try to buy.
+///   deliver. Like `min_base_out`, this is a NET (post-fee) cap: it bounds
+///   the Base the taker actually receives, after the taker fee is deducted,
+///   not the gross amount matched against the book. Internally, the GROSS
+///   bound fed to matching is inflated from `max_base_out` (via
+///   `gross_size_bound_for_net_cap`) so that the post-fee net delivered
+///   amount never exceeds it -- so `min_base_out == max_base_out` is always
+///   satisfiable when fully filled, regardless of `taker_fee_bps`.
 /// - `max_quote_in` (`u64`, same `0`-is-real / `u64::MAX`-is-unbounded
 ///   convention) replaces the old `budget` parameter AND the old
 ///   `max_quote_in: Option<u64>` slippage guard in one: unlike the old
@@ -2501,13 +2599,18 @@ public fun place_market_order_bid<Base, Quote>(
     // its own, so no separate unbounded-case logic is needed here.
     assert!(min_base_out <= max_base_out, EMinExceedsMaxBaseOut);
 
-    let size_bound = max_base_out;
     let budget = std::u64::min(payment.value(), max_quote_in);
     let budget_balance = payment.split(budget, ctx).into_balance();
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
-    let (mut matched_base, remaining_budget, remaining_size, stopped_on_max_fills_while_crossing) =
+    // `max_base_out` is a NET (post-fee) cap -- see this function's doc
+    // comment -- but `match_bid` matches against a GROSS bound and the fee
+    // is only known/deducted afterward, so it is inflated here to the
+    // equivalent gross bound via `gross_size_bound_for_net_cap`.
+    let size_bound = gross_size_bound_for_net_cap(max_base_out, taker_fee_bps);
+    let (mut matched_base, remaining_budget, _remaining_size, stopped_on_max_fills_while_crossing) =
         match_bid(book, option::none(), size_bound, budget_balance, taker, max_fills);
     let taker_fee_amount = fee_amount(matched_base.value(), taker_fee_bps);
     let taker_fee_balance = matched_base.split(taker_fee_amount);
@@ -2519,14 +2622,25 @@ public fun place_market_order_bid<Base, Quote>(
 
     payment.join(remaining_budget.into_coin(ctx));
 
+    // `remaining_size` from `match_bid` is GROSS, relative to the inflated
+    // `size_bound`, not to `max_base_out` -- so it is not reported directly.
+    // Instead, the NET shortfall against the caller's actual (NET) request
+    // is `max_base_out - matched_base.value()`, which never underflows:
+    // `matched_base.value() <= max_base_out` always holds, since `size_bound`
+    // was chosen (via `gross_size_bound_for_net_cap`) so that fully matching
+    // it nets out to exactly `max_base_out`, and net is monotonic
+    // non-decreasing in the gross amount matched.
+    let base_unmatched = max_base_out - matched_base.value();
+
     event::emit(OrderExecuted {
-        order_book_id: event_book_id,
+        book_id,
+        enclosing_object_id,
         taker,
         taker_side: true,
         entry_point: 2,
         limit_price: option::none(),
-        requested_size: size_bound,
-        unmatched_size: remaining_size,
+        requested_size: max_base_out,
+        unmatched_size: base_unmatched,
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
@@ -2547,6 +2661,11 @@ public fun place_market_order_bid<Base, Quote>(
 /// beyond the cap itself, which is now enforced up front by construction
 /// (via the `min(payment.value(), max_base_in)` clamp below) rather than
 /// checked after the fact.
+///
+/// Like `place_market_order_bid`, there is deliberately no `validate_size`
+/// call against `max_base_in`/`min_size` here: a market ask never rests an
+/// order (any unmatched remainder is simply returned), so it can never
+/// create a sub-`min_size` dust order on the book.
 public fun place_market_order_ask<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
     mut payment: Coin<Base>,
@@ -2559,18 +2678,9 @@ public fun place_market_order_ask<Base, Quote>(
     assert!(!is_paused(book), EBookPaused);
 
     let size = std::u64::min(payment.value(), max_base_in);
-    // A genuine `size == 0` (either `payment` itself is empty, or
-    // `max_base_in == 0`, a real zero cap -- see this function's doc
-    // comment) must no-op cleanly rather than abort: `validate_size` exists
-    // to gate a real resting/matching order size against the book's
-    // `min_size` floor, not to reject an intentional zero-size no-op, so it
-    // is skipped entirely in that case (matching then trivially produces
-    // zero fills without it, since `match_ask` breaks its loop immediately
-    // on `remaining_size == 0`).
-    if (size != 0) { validate_size(book, size); };
-
     let escrow_base = payment.split(size, ctx).into_balance();
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let taker = ctx.sender();
     let taker_fee_bps = taker_fee_bps(book);
     let (mut matched_quote, remaining_escrow, remaining_size, stopped_on_max_fills_while_crossing) =
@@ -2586,7 +2696,8 @@ public fun place_market_order_ask<Base, Quote>(
     payment.join(remaining_escrow.into_coin(ctx));
 
     event::emit(OrderExecuted {
-        order_book_id: event_book_id,
+        book_id,
+        enclosing_object_id,
         taker,
         taker_side: false,
         entry_point: 3,
@@ -2612,7 +2723,9 @@ public fun cancel_order<Base, Quote>(
 ): (Coin<Base>, Coin<Quote>) {
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
+    let ids = BookIds { book_id, enclosing_object_id };
     let OrderTicket { order_id, order_book_id: _, side, price } = ticket;
 
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
@@ -2629,9 +2742,9 @@ public fun cancel_order<Base, Quote>(
         let mfee_bps = live_order.maker_fee_bps();
         let (eb, eq, frb, frq) = live_order.destroy();
         let (eb, eq) = fold_maker_fee_slack(
-            eb, eq, frb, frq, fee_basis, mfee_bps, order_id, event_book_id, trader, &mut book.fee_accumulator,
+            eb, eq, frb, frq, fee_basis, mfee_bps, order_id, ids, trader, &mut book.fee_accumulator,
         );
-        event::emit(OrderCancelled { order_id, order_book_id: event_book_id, trader });
+        event::emit(OrderCancelled { book_id, enclosing_object_id, order_id, trader });
         (eb, eq)
     };
 
@@ -2661,8 +2774,9 @@ public fun cancel_order<Base, Quote>(
 
     if (proceeds_base_amount != 0 || proceeds_quote_amount != 0) {
         event::emit(ProceedsClaimed {
+            book_id,
+            enclosing_object_id,
             claimant: ctx.sender(),
-            order_book_id: event_book_id,
             base_amount: proceeds_base_amount,
             quote_amount: proceeds_quote_amount,
         });
@@ -2674,8 +2788,9 @@ public fun cancel_order<Base, Quote>(
 }
 
 public struct OrderOwnerUpdated has copy, drop {
+    book_id: ID,
+    enclosing_object_id: ID,
     order_id: u64,
-    order_book_id: ID,
     old_owner: address,
     new_owner: address,
 }
@@ -2685,7 +2800,7 @@ public struct OrderOwnerUpdated has copy, drop {
 /// updated, `false` if the price level or the order itself doesn't exist (a
 /// no-op, mirroring `cancel_order`'s own not-found-is-a-no-op handling).
 ///
-/// Emits `OrderOwnerUpdated { order_id, order_book_id, old_owner, new_owner }`
+/// Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
 /// whenever an order is actually found and reassigned — including when
 /// `new_owner` equals the order's current owner, since the reassignment
 /// (and its unconditional proceeds-owner sync, see below) still runs in
@@ -2705,37 +2820,24 @@ public struct OrderOwnerUpdated has copy, drop {
 /// it with the same care as `push_proceeds`. Proceeds are pooled per
 /// `order_id` in a single maker-table ledger entry, and `credit_maker_table`
 /// re-stamps that entry's payout `owner` on every credit, not just the
-/// first. Whenever this function finds the order still resting (the only
-/// case that returns `true`), it also immediately and unconditionally syncs
-/// the `owner` of any already-pooled `MakerBalance` entry for this
-/// `order_id` (via `sync_maker_balance_owner`) at the moment of
-/// reassignment — not merely on a future fill. That means, for a still-
-/// resting order, this function's reassignment reaches the order's *entire*
-/// currently-pooled unclaimed proceeds balance for that `order_id` — both
-/// proceeds already credited before the reassignment and any credited
-/// afterward — immediately, whether or not the order is ever filled again:
-/// `push_proceeds` / `drain_proceeds` always pay whoever is currently
-/// stamped as owner, which this function keeps current in that case. This
-/// is intentional, since it remains the ticket holder's own choice about
-/// their own order's funds.
-///
-/// Known limitation, accepted as documented rather than fixed: the pooled-
-/// proceeds sync above only runs when the order is found still resting.
-/// If the order has already concluded by the time this is called — fully
-/// filled and drained, `cancel_order`ed, force-cancelled via
-/// `clob_admin_cancel_order`, or removed by `clob_admin_drain_step` — but a
-/// pooled, unclaimed `MakerBalance` entry for its `order_id` still exists,
-/// this function returns `false` (no resting order found) and does *not*
-/// touch that entry's recorded owner at all; it stays at whatever it was
-/// last synced to (or the original placing owner, if never reassigned).
-/// This does not strand the funds: that pooled amount remains fully
-/// claimable either way, via `push_proceeds`/`drain_proceeds` (which pay
-/// the last-recorded owner) or via `claim_proceeds` through the order's own
-/// `OrderTicket` (which pays the ticket holder/caller regardless of the
-/// recorded owner — see `claim_proceeds`'s own doc comment for that
-/// ticket-possession authority model), whichever happens first. Nor is it a
-/// fund-misdirection risk — `push_proceeds`/`drain_proceeds` can only ever
-/// pay the recorded owner, never a caller-supplied address. There is also a
+/// first. This function ALWAYS immediately and unconditionally syncs the
+/// `owner` of any already-pooled `MakerBalance` entry for this `order_id`
+/// (via `sync_maker_balance_owner`, a safe no-op if no such entry exists)
+/// at the moment of reassignment — not merely on a future fill, and
+/// regardless of whether the order itself is found still resting (the
+/// `bool` this function returns reflects only whether the RESTING order
+/// was found and reassigned; the pooled-proceeds sync is unconditional on
+/// that outcome). That means this function's reassignment reaches the
+/// order's *entire* currently-pooled unclaimed proceeds balance for that
+/// `order_id` — both proceeds already credited before the reassignment and
+/// any credited afterward — immediately, whether or not the order is ever
+/// filled again, and whether or not the order has already concluded by the
+/// time this is called (fully filled and drained, `cancel_order`ed,
+/// force-cancelled via `clob_admin_cancel_order`, or removed by
+/// `clob_admin_drain_step`): `push_proceeds` / `drain_proceeds` always pay
+/// whoever is currently stamped as owner, which this function keeps
+/// current either way. This is intentional, since it remains the ticket
+/// holder's own choice about their own order's funds. There is also a
 /// secondary asymmetry worth noting here: `cancel_order` sweeps and pays
 /// out any pooled proceeds as part of the same call — to the caller
 /// (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
@@ -2756,15 +2858,26 @@ public struct OrderOwnerUpdated has copy, drop {
 /// current holder if custody changed by other means.
 public fun update_resting_order<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    ticket: &OrderTicket,
+    ticket: &mut OrderTicket,
     new_owner: address,
 ): bool {
     assert_book_version(book);
     assert!(ticket.order_book_id == object::uid_to_inner(&book.id), EWrongBook);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let side = ticket.side;
     let price = ticket.price;
     let order_id = ticket.order_id;
+
+    // Resync any already-pooled proceeds for this order_id to the new
+    // owner unconditionally -- regardless of whether the order itself is
+    // still resting. A pooled balance for a concluded order is exactly as
+    // claimable as one for a still-resting order, and must not be left
+    // silently pointed at the previous owner just because the order is
+    // gone; `sync_maker_balance_owner` is already a safe no-op when no
+    // pooled entry exists.
+    sync_maker_balance_owner(&mut book.proceeds, order_id, new_owner);
+
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
     let leaf_opt = tree.find(price);
@@ -2784,8 +2897,7 @@ public fun update_resting_order<Base, Quote>(
     };
     if (old_owner_opt.is_some()) {
         let old_owner = old_owner_opt.destroy_some();
-        sync_maker_balance_owner(&mut book.proceeds, order_id, new_owner);
-        event::emit(OrderOwnerUpdated { order_id, order_book_id: event_book_id, old_owner, new_owner });
+        event::emit(OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner });
         true
     } else {
         old_owner_opt.destroy_none();
@@ -2817,7 +2929,8 @@ public fun claim_proceeds<Base, Quote>(
     let price = ticket.price;
 
     let claimant = ctx.sender();
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let (_owner, base, quote) = claim_maker_balance(book, order_id);
     let base_amount = base.value();
     let quote_amount = quote.value();
@@ -2826,7 +2939,7 @@ public fun claim_proceeds<Base, Quote>(
     let quote_coin = coin_or_zero(quote, ctx);
 
     if (base_amount != 0 || quote_amount != 0) {
-        event::emit(ProceedsClaimed { claimant, order_book_id: event_book_id, base_amount, quote_amount });
+        event::emit(ProceedsClaimed { book_id, enclosing_object_id, claimant, base_amount, quote_amount });
     };
 
     let tree: &PriceTree<PriceLevel<Base, Quote>> = if (side) &book.bids else &book.asks;
@@ -2862,7 +2975,8 @@ public fun push_proceeds<Base, Quote>(
 ) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    let event_book_id = book.event_id;
+    let book_id = object::uid_to_inner(&book.id);
+    let enclosing_object_id = book.enclosing_object_id;
     let (owner, base, quote) = claim_maker_balance(book, order_id);
     let base_amount = base.value();
     let quote_amount = quote.value();
@@ -2873,7 +2987,7 @@ public fun push_proceeds<Base, Quote>(
     };
     transfer_or_destroy_zero(base, owner, ctx);
     transfer_or_destroy_zero(quote, owner, ctx);
-    event::emit(ProceedsClaimed { claimant: owner, order_book_id: event_book_id, base_amount, quote_amount });
+    event::emit(ProceedsClaimed { book_id, enclosing_object_id, claimant: owner, base_amount, quote_amount });
 }
 
 // === Test-only accessors ===
@@ -2924,66 +3038,79 @@ public fun proceeds_contains_for_testing<Base, Quote>(book: &OrderBook<Base, Quo
 }
 
 #[test_only]
-public fun clob_admin_cap_discarded_fields_for_testing(e: &ClobAdminCapDiscarded): (ID, ID) {
-    (e.cap_id, e.for_book)
+public fun clob_admin_cap_discarded_fields_for_testing(e: &ClobAdminCapDiscarded): (ID, ID, ID) {
+    (e.book_id, e.enclosing_object_id, e.cap_id)
 }
 
 #[test_only]
-public fun paused_fields_for_testing(e: &Paused): ID { e.order_book_id }
+public fun paused_fields_for_testing(e: &Paused): (ID, ID) { (e.book_id, e.enclosing_object_id) }
 
 #[test_only]
-public fun unpaused_fields_for_testing(e: &Unpaused): ID { e.order_book_id }
+public fun unpaused_fields_for_testing(e: &Unpaused): (ID, ID) { (e.book_id, e.enclosing_object_id) }
 
 #[test_only]
-public fun taker_fee_set_fields_for_testing(e: &TakerFeeSet): (ID, u64) { (e.order_book_id, e.rate_bps) }
-
-#[test_only]
-public fun maker_fee_set_fields_for_testing(e: &MakerFeeSet): (ID, u64) { (e.order_book_id, e.rate_bps) }
-
-#[test_only]
-public fun last_price_set_fields_for_testing(e: &LastPriceSet): (ID, u64, address) {
-    (e.order_book_id, e.last_price, e.setter)
+public fun taker_fee_set_fields_for_testing(e: &TakerFeeSet): (ID, ID, u64) {
+    (e.book_id, e.enclosing_object_id, e.rate_bps)
 }
 
 #[test_only]
-public fun event_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID { book.event_id }
-
-#[test_only]
-public fun book_version_upgraded_fields_for_testing(e: &BookVersionUpgraded): (ID, u64, u64) {
-    (e.order_book_id, e.from, e.to)
+public fun maker_fee_set_fields_for_testing(e: &MakerFeeSet): (ID, ID, u64) {
+    (e.book_id, e.enclosing_object_id, e.rate_bps)
 }
 
 #[test_only]
-public fun fees_claimed_fields_for_testing(e: &FeesClaimed): (address, ID, u64, u64) {
-    (e.claimant, e.order_book_id, e.base_amount, e.quote_amount)
+public fun price_band_factor_set_fields_for_testing(e: &PriceBandFactorSet): (ID, ID, Option<u64>) {
+    (e.book_id, e.enclosing_object_id, e.factor)
 }
 
 #[test_only]
-public fun order_cancelled_fields_for_testing(e: &OrderCancelled): (u64, ID, address) {
-    (e.order_id, e.order_book_id, e.trader)
+public fun last_price_set_fields_for_testing(e: &LastPriceSet): (ID, ID, u64, address) {
+    (e.book_id, e.enclosing_object_id, e.last_price, e.setter)
 }
 
 #[test_only]
-public fun order_owner_updated_fields_for_testing(e: &OrderOwnerUpdated): (u64, ID, address, address) {
-    (e.order_id, e.order_book_id, e.old_owner, e.new_owner)
+public fun enclosing_object_id_for_testing<Base, Quote>(book: &OrderBook<Base, Quote>): ID {
+    book.enclosing_object_id
 }
 
 #[test_only]
-public fun order_placed_fields_for_testing(e: &OrderPlaced): (u64, ID, bool, u64, u64, address, u64) {
-    (e.order_id, e.order_book_id, e.side, e.price, e.size, e.trader, e.maker_fee_bps)
+public fun book_version_upgraded_fields_for_testing(e: &BookVersionUpgraded): (ID, ID, u64, u64) {
+    (e.book_id, e.enclosing_object_id, e.from, e.to)
 }
 
 #[test_only]
-public fun proceeds_claimed_fields_for_testing(e: &ProceedsClaimed): (address, ID, u64, u64) {
-    (e.claimant, e.order_book_id, e.base_amount, e.quote_amount)
+public fun fees_claimed_fields_for_testing(e: &FeesClaimed): (ID, ID, address, u64, u64) {
+    (e.book_id, e.enclosing_object_id, e.claimant, e.base_amount, e.quote_amount)
 }
 
 #[test_only]
-public fun order_book_retired_fields_for_testing(e: &OrderBookRetired): ID { e.order_book_id }
+public fun order_cancelled_fields_for_testing(e: &OrderCancelled): (ID, ID, u64, address) {
+    (e.book_id, e.enclosing_object_id, e.order_id, e.trader)
+}
 
 #[test_only]
-public fun order_book_deleted_fields_for_testing(e: &OrderBookDeleted): (ID, TypeName, TypeName) {
-    (e.order_book_id, e.base, e.quote)
+public fun order_owner_updated_fields_for_testing(e: &OrderOwnerUpdated): (ID, ID, u64, address, address) {
+    (e.book_id, e.enclosing_object_id, e.order_id, e.old_owner, e.new_owner)
+}
+
+#[test_only]
+public fun order_placed_fields_for_testing(e: &OrderPlaced): (ID, ID, u64, bool, u64, u64, address, u64) {
+    (e.book_id, e.enclosing_object_id, e.order_id, e.side, e.price, e.size, e.trader, e.maker_fee_bps)
+}
+
+#[test_only]
+public fun proceeds_claimed_fields_for_testing(e: &ProceedsClaimed): (ID, ID, address, u64, u64) {
+    (e.book_id, e.enclosing_object_id, e.claimant, e.base_amount, e.quote_amount)
+}
+
+#[test_only]
+public fun order_book_retired_fields_for_testing(e: &OrderBookRetired): (ID, ID) {
+    (e.book_id, e.enclosing_object_id)
+}
+
+#[test_only]
+public fun order_book_deleted_fields_for_testing(e: &OrderBookDeleted): (ID, ID, TypeName, TypeName) {
+    (e.book_id, e.enclosing_object_id, e.base, e.quote)
 }
 
 /// Test-only constructor: lets a test build an `OrderTicket` directly for
@@ -2996,10 +3123,9 @@ public fun order_book_deleted_fields_for_testing(e: &OrderBookDeleted): (ID, Typ
 /// id. In production, every `OrderTicket`'s `order_book_id` is always
 /// exactly the book's own object id (`object::uid_to_inner(&book.id)`),
 /// fixed forever at the moment the ticket is minted — independent of
-/// `event_id`/`event_id_override`, which is caller-controllable and used
-/// solely for event stamping. Do not read this constructor's freedom to
-/// pass an arbitrary id as evidence that production tickets can carry one
-/// too.
+/// `enclosing_object_id`, which is caller-supplied and used solely for
+/// event stamping. Do not read this constructor's freedom to pass an
+/// arbitrary id as evidence that production tickets can carry one too.
 #[test_only]
 public fun new_ticket_for_testing(
     order_id: u64,
@@ -3011,8 +3137,8 @@ public fun new_ticket_for_testing(
 }
 
 #[test_only]
-public fun order_filled_fields_for_testing(e: &OrderFilled): (u64, ID, u64, u64, address, address) {
-    (e.maker_order_id, e.order_book_id, e.price, e.size, e.maker, e.taker)
+public fun order_filled_fields_for_testing(e: &OrderFilled): (ID, ID, u64, u64, u64, address, address) {
+    (e.book_id, e.enclosing_object_id, e.maker_order_id, e.price, e.size, e.maker, e.taker)
 }
 
 #[test_only]
@@ -3021,12 +3147,12 @@ public fun order_filled_side_and_quote_fields_for_testing(e: &OrderFilled): (boo
 }
 
 #[test_only]
-public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool, u64) {
-    (e.order_book_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing, e.taker_fee_amount)
+public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool, u64) {
+    (e.book_id, e.enclosing_object_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing, e.taker_fee_amount)
 }
 
 #[test_only]
-public fun maker_fee_settled_fields_for_testing(e: &MakerFeeSettled): (u64, ID, address, u64) {
-    (e.order_id, e.order_book_id, e.maker, e.amount)
+public fun maker_fee_settled_fields_for_testing(e: &MakerFeeSettled): (ID, ID, u64, address, u64) {
+    (e.book_id, e.enclosing_object_id, e.order_id, e.maker, e.amount)
 }
 

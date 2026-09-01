@@ -58,11 +58,17 @@ public(package) fun realistic_decimals_book<Base, Quote>(
     min_size: u64,
     scenario: &mut ts::Scenario,
 ): (OrderBook<Base, Quote>, ClobAdminCap) {
-    tiny_clob::new<Base, Quote>(min_size, 8, 6, 0, 19, 100 * 497, scenario.ctx())
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<Base, Quote>(min_size, 8, 6, 0, 19, 100 * 497, &wrapper_uid, scenario.ctx());
+    wrapper_uid.delete();
+    (book, cap)
 }
 
 public(package) fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
-    tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 19, 1, scenario.ctx())
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    wrapper_uid.delete();
+    (book, cap)
 }
 
 public(package) fun destroy_book_and_cap(book: OrderBook<BTC, USDC>, cap: ClobAdminCap) {
@@ -185,7 +191,7 @@ public(package) fun rest_ask(
 //
 // Book: base_decimals=0, quote_decimals=0, precision=1, exponent=18 =>
 // price_scale = ceil(10^0 * 10^1 / 10^0) = 10 exactly (the smallest value
-// guaranteeing resolution at least as fine as 10^-1 — see `new_impl`'s doc
+// guaranteeing resolution at least as fine as 10^-1 — see `new`'s doc
 // comment). See the topic file using this fixture for the full worked-out
 // rounding-shortfall scenario.
 //
@@ -202,7 +208,9 @@ const SHORTFALL_PRICE: u64 = 5;
 public(package) fun shortfall_price(): u64 { SHORTFALL_PRICE }
 
 public(package) fun shortfall_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
-    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 1, 18, SHORTFALL_PRICE, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 1, 18, SHORTFALL_PRICE, &wrapper_uid, scenario.ctx());
+    wrapper_uid.delete();
     assert!(book.price_scale() == SHORTFALL_PRICE_SCALE, 0);
     (book, cap)
 }
@@ -228,9 +236,11 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     expected_scale: u64,
     scenario: &mut ts::Scenario,
 ) {
+    let wrapper_uid = object::new(scenario.ctx());
     let (mut book, cap) = tiny_clob::new<Base, Quote>(
-        MIN_SIZE, base_decimals, quote_decimals, precision, exponent, p_mid, scenario.ctx(),
+        MIN_SIZE, base_decimals, quote_decimals, precision, exponent, p_mid, &wrapper_uid, scenario.ctx(),
     );
+    wrapper_uid.delete();
     let scale = book.price_scale();
     assert!(scale == expected_scale, 0);
 
@@ -256,9 +266,9 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(!min_stopped, 1);
     assert!(min_matched.burn_for_testing() == 0, 2);
     assert!(min_leftover.burn_for_testing() == 0, 3);
-    // Quote-denominated for a bid (see `depth_at_price`'s doc comment) --
-    // equal to the escrow reserved, not the Base `size`.
-    assert!(book.depth_at_price(tiny_clob::bid(), p_min) == min_escrow, 4);
+    // Quote-denominated for a bid (see `bid_quote_escrow_at_price`'s doc
+    // comment) -- equal to the escrow reserved, not the Base `size`.
+    assert!(book.bid_quote_escrow_at_price(p_min) == min_escrow, 4);
     let (min_b, min_q) = book.cancel_order(min_ticket_opt.destroy_some(), scenario.ctx());
     assert!(min_b.burn_for_testing() == 0, 5);
     assert!(min_q.burn_for_testing() == min_escrow, 6);
@@ -271,7 +281,7 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(!max_stopped, 7);
     assert!(max_matched.burn_for_testing() == 0, 8);
     assert!(max_leftover.burn_for_testing() == 0, 9);
-    assert!(book.depth_at_price(tiny_clob::bid(), p_max) == max_escrow, 10);
+    assert!(book.bid_quote_escrow_at_price(p_max) == max_escrow, 10);
     let (max_b, max_q) = book.cancel_order(max_ticket_opt.destroy_some(), scenario.ctx());
     assert!(max_b.burn_for_testing() == 0, 11);
     assert!(max_q.burn_for_testing() == max_escrow, 12);
@@ -299,8 +309,8 @@ public(package) fun assert_extremes_and_adjacent_ticks<Base, Quote>(
     assert!(mid_next_matched.burn_for_testing() == 0, 17);
     assert!(mid_next_leftover.burn_for_testing() == 0, 18);
 
-    assert!(book.depth_at_price(tiny_clob::bid(), p_mid) == mid_escrow, 19);
-    assert!(book.depth_at_price(tiny_clob::bid(), p_mid_next) == mid_next_escrow, 20);
+    assert!(book.bid_quote_escrow_at_price(p_mid) == mid_escrow, 19);
+    assert!(book.bid_quote_escrow_at_price(p_mid_next) == mid_next_escrow, 20);
     assert!(p_mid != p_mid_next, 21);
 
     unit_test::destroy(mid_ticket_opt.destroy_some());

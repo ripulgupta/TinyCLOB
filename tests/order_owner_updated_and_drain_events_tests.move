@@ -23,19 +23,20 @@ fun update_resting_order_reassign_emits_order_owner_updated_with_correct_fields(
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
     let book_id = book.book_id();
 
-    let found = book.update_resting_order(&bid_ticket, other());
+    let found = book.update_resting_order(&mut bid_ticket, other());
     assert!(found, 0);
 
     let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
     assert!(events.length() == 1, 1);
-    let (ev_order_id, ev_book_id, ev_old_owner, ev_new_owner) =
+    let (ev_book_id, ev_enclosing_id, ev_order_id, ev_old_owner, ev_new_owner) =
         events[0].order_owner_updated_fields_for_testing();
     assert!(ev_order_id == order_id, 2);
     assert!(ev_book_id == book_id, 3);
+    assert!(ev_enclosing_id == book.enclosing_object_id_for_testing(), 6);
     assert!(ev_old_owner == admin(), 4); // scenario sender at rest_bid time
     assert!(ev_new_owner == other(), 5);
 
@@ -49,18 +50,18 @@ fun update_resting_order_reassign_to_same_address_still_emits() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
 
     // Reassigning to the SAME owner (admin(), unchanged) must still fire the
     // event -- the write is unconditional on the found branch, regardless
     // of whether the address actually changes.
-    let found = book.update_resting_order(&bid_ticket, admin());
+    let found = book.update_resting_order(&mut bid_ticket, admin());
     assert!(found, 0);
 
     let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
     assert!(events.length() == 1, 1);
-    let (ev_order_id, _, ev_old_owner, ev_new_owner) =
+    let (_, _, ev_order_id, ev_old_owner, ev_new_owner) =
         events[0].order_owner_updated_fields_for_testing();
     assert!(ev_order_id == order_id, 2);
     assert!(ev_old_owner == admin(), 3);
@@ -78,9 +79,9 @@ fun update_resting_order_not_found_paths_emit_no_event() {
 
     // Empty-book path: no price level exists at all.
     let book_id = book.book_id();
-    let empty_book_ticket =
+    let mut empty_book_ticket =
         tiny_clob::new_ticket_for_testing(0, book_id, tiny_clob::bid(), default_price());
-    let found_empty = book.update_resting_order(&empty_book_ticket, other());
+    let found_empty = book.update_resting_order(&mut empty_book_ticket, other());
     assert!(!found_empty, 0);
     unit_test::destroy(empty_book_ticket);
 
@@ -89,8 +90,8 @@ fun update_resting_order_not_found_paths_emit_no_event() {
     let order_id = bid_ticket.ticket_order_id();
     let side = bid_ticket.ticket_side();
     let price = bid_ticket.ticket_price();
-    let wrong_id_ticket = tiny_clob::new_ticket_for_testing(order_id + 1, book_id, side, price);
-    let found_wrong_id = book.update_resting_order(&wrong_id_ticket, other());
+    let mut wrong_id_ticket = tiny_clob::new_ticket_for_testing(order_id + 1, book_id, side, price);
+    let found_wrong_id = book.update_resting_order(&mut wrong_id_ticket, other());
     assert!(!found_wrong_id, 1);
     unit_test::destroy(wrong_id_ticket);
 
@@ -106,14 +107,14 @@ fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
-    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let mut bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
 
-    let found = book.update_resting_order(&bid_ticket, other());
+    let found = book.update_resting_order(&mut bid_ticket, other());
     assert!(found, 0);
     let events = event::events_by_type<tiny_clob::OrderOwnerUpdated>();
     assert!(events.length() == 1, 1);
-    let (_, _, ev_old_owner, ev_new_owner) = events[0].order_owner_updated_fields_for_testing();
+    let (_, _, _, ev_old_owner, ev_new_owner) = events[0].order_owner_updated_fields_for_testing();
     assert!(ev_old_owner == admin(), 2);
     assert!(ev_new_owner == other(), 3);
     unit_test::destroy(bid_ticket);
@@ -130,7 +131,7 @@ fun update_resting_order_reassign_emits_event_and_syncs_pooled_proceeds() {
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 4);
-    let (ev_claimant, _, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
+    let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
     assert!(ev_claimant == other(), 5);
 
     destroy_book_and_cap(book, cap);
@@ -196,7 +197,7 @@ fun clob_admin_drain_step_emits_proceeds_claimed_only_for_the_nonzero_order() {
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
-    let (ev_claimant, _, ev_base, ev_quote) = claimed_events[0].proceeds_claimed_fields_for_testing();
+    let (_, _, ev_claimant, ev_base, ev_quote) = claimed_events[0].proceeds_claimed_fields_for_testing();
     assert!(ev_claimant == maker_b(), 3);
     assert!(ev_base == size_normal, 4);
     assert!(ev_quote == 0, 5);
@@ -242,10 +243,10 @@ fun clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders()
     assert!(events.length() == 4, 0);
     // FIFO order within the bid side: A, B, C were inserted in that order at
     // the same price; the ask D drains only after the whole bid side does.
-    let (ev_id_a, _, ev_trader_a) = events[0].order_cancelled_fields_for_testing();
-    let (ev_id_b, _, ev_trader_b) = events[1].order_cancelled_fields_for_testing();
-    let (ev_id_c, _, ev_trader_c) = events[2].order_cancelled_fields_for_testing();
-    let (ev_id_d, _, ev_trader_d) = events[3].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_a, ev_trader_a) = events[0].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_b, ev_trader_b) = events[1].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_c, ev_trader_c) = events[2].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_d, ev_trader_d) = events[3].order_cancelled_fields_for_testing();
     assert!(ev_id_a == id_a && ev_trader_a == maker_a(), 1);
     assert!(ev_id_b == id_b && ev_trader_b == maker_b(), 2);
     assert!(ev_id_c == id_c && ev_trader_c == maker_c(), 3);
@@ -383,16 +384,16 @@ fun clob_admin_drain_step_maker_fee_settled_events_carry_correct_per_order_amoun
     // same deterministic ordering as
     // `clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders`
     // above.
-    let (ev_id_a, ev_book_a, ev_maker_a, ev_amount_a) = settled[0].maker_fee_settled_fields_for_testing();
-    let (ev_id_b, _, ev_maker_b, ev_amount_b) = settled[1].maker_fee_settled_fields_for_testing();
-    let (ev_id_c, _, ev_maker_c, ev_amount_c) = settled[2].maker_fee_settled_fields_for_testing();
-    let (ev_id_d, _, ev_maker_d, ev_amount_d) = settled[3].maker_fee_settled_fields_for_testing();
+    let (ev_book_a, _, ev_id_a, ev_maker_a, ev_amount_a) = settled[0].maker_fee_settled_fields_for_testing();
+    let (_, _, ev_id_b, ev_maker_b, ev_amount_b) = settled[1].maker_fee_settled_fields_for_testing();
+    let (_, _, ev_id_c, ev_maker_c, ev_amount_c) = settled[2].maker_fee_settled_fields_for_testing();
+    let (_, _, ev_id_d, ev_maker_d, ev_amount_d) = settled[3].maker_fee_settled_fields_for_testing();
 
     assert!(ev_id_a == id_a && ev_maker_a == maker_a() && ev_amount_a == 1, 3);
     assert!(ev_id_b == id_b && ev_maker_b == maker_b() && ev_amount_b == 0, 4);
     assert!(ev_id_c == id_c && ev_maker_c == maker_c() && ev_amount_c == 0, 5);
     assert!(ev_id_d == id_d && ev_maker_d == other() && ev_amount_d == 2_507, 6);
-    assert!(ev_book_a == book.event_id_for_testing(), 7);
+    assert!(ev_book_a == book.book_id(), 7);
 
     unit_test::destroy(ticket_a);
     unit_test::destroy(ticket_b);
@@ -498,7 +499,7 @@ fun clob_admin_drain_step_maker_fee_settled_events_sum_matches_accumulator_delta
     let mut ev_amount_d = 0;
     let mut i = 0;
     while (i < settled.length()) {
-        let (ev_order_id, _, _, ev_amount) = settled[i].maker_fee_settled_fields_for_testing();
+        let (_, _, ev_order_id, _, ev_amount) = settled[i].maker_fee_settled_fields_for_testing();
         if (ev_order_id == order_id_a) { ev_amount_a = ev_amount }
         else if (ev_order_id == order_id_b) { ev_amount_b = ev_amount }
         else if (ev_order_id == order_id_c) { ev_amount_c = ev_amount }
@@ -572,7 +573,7 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
-    let (ev_claimant, _, ev_base, ev_quote) = claimed_events[0].proceeds_claimed_fields_for_testing();
+    let (_, _, ev_claimant, ev_base, ev_quote) = claimed_events[0].proceeds_claimed_fields_for_testing();
     assert!(ev_claimant == admin(), 3); // rest_bid's caller here (no next_tx before it)
     assert!(ev_base == fill_size, 4);
     assert!(ev_quote == 0, 5);
@@ -782,8 +783,8 @@ fun clob_admin_drain_step_carries_remaining_budget_across_bid_ask_proceeds_bound
     assert!(book.bids_size_for_testing() == 1, 4);
     let cancelled_1 = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_1.length() == 2, 5);
-    let (ev_id_0, _, ev_trader_0) = cancelled_1[0].order_cancelled_fields_for_testing();
-    let (ev_id_1, _, ev_trader_1) = cancelled_1[1].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_0, ev_trader_0) = cancelled_1[0].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_1, ev_trader_1) = cancelled_1[1].order_cancelled_fields_for_testing();
     assert!(ev_id_0 == order_id_c && ev_trader_0 == maker_c(), 6);
     assert!(ev_id_1 == order_id_b && ev_trader_1 == maker_b(), 7);
     assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 0, 8);
@@ -800,10 +801,10 @@ fun clob_admin_drain_step_carries_remaining_budget_across_bid_ask_proceeds_bound
     assert!(book.bids_size_for_testing() == 0, 11);
     let cancelled_2 = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_2.length() == 6, 12);
-    let (ev_id_2, _, ev_trader_2) = cancelled_2[2].order_cancelled_fields_for_testing();
-    let (ev_id_3, _, ev_trader_3) = cancelled_2[3].order_cancelled_fields_for_testing();
-    let (ev_id_4, _, ev_trader_4) = cancelled_2[4].order_cancelled_fields_for_testing();
-    let (ev_id_5, _, ev_trader_5) = cancelled_2[5].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_2, ev_trader_2) = cancelled_2[2].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_3, ev_trader_3) = cancelled_2[3].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_4, ev_trader_4) = cancelled_2[4].order_cancelled_fields_for_testing();
+    let (_, _, ev_id_5, ev_trader_5) = cancelled_2[5].order_cancelled_fields_for_testing();
     assert!(ev_id_2 == order_id_a && ev_trader_2 == maker_a(), 13);
     assert!(ev_id_3 == order_id_d && ev_trader_3 == admin(), 14);
     assert!(ev_id_4 == order_id_e && ev_trader_4 == other(), 15);
@@ -821,8 +822,8 @@ fun clob_admin_drain_step_carries_remaining_budget_across_bid_ask_proceeds_bound
     assert!(event::events_by_type<tiny_clob::OrderCancelled>().length() == 6, 20);
     let claimed = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed.length() == 2, 21);
-    let (ev_claimant_0, _, ev_base_0, ev_quote_0) = claimed[0].proceeds_claimed_fields_for_testing();
-    let (ev_claimant_1, _, ev_base_1, ev_quote_1) = claimed[1].proceeds_claimed_fields_for_testing();
+    let (_, _, ev_claimant_0, ev_base_0, ev_quote_0) = claimed[0].proceeds_claimed_fields_for_testing();
+    let (_, _, ev_claimant_1, ev_base_1, ev_quote_1) = claimed[1].proceeds_claimed_fields_for_testing();
     assert!(ev_claimant_0 == maker_a() && ev_base_0 == size && ev_quote_0 == 0, 22);
     assert!(ev_claimant_1 == maker_b() && ev_base_1 == size && ev_quote_1 == 0, 23);
     assert!(!book.proceeds_contains_for_testing(order_id_p1), 24);

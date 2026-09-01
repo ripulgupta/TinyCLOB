@@ -13,7 +13,7 @@
 ///     WAL/SUI (9/9 decimals) book with a deliberately different
 ///     precision/exponent shape. `price_scale` is derived from
 ///     `ceil(10^base_decimals * 10^precision / 10^quote_decimals)` (see
-///     `new_impl`'s doc comment), which doesn't depend on `exponent` at
+///     `new`'s doc comment), which doesn't depend on `exponent` at
 ///     all -- so despite the different precision/exponent shape here, this
 ///     book's `price_scale` (100) happens to coincide with the BTC/USDC
 ///     book's above; the two books are still genuinely different
@@ -82,7 +82,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
         book.place_limit_order_bid(bid1_payment, bid1_size, 10, scenario.ctx());
     assert!(bid1_matched.burn_for_testing() == 0, 4);
     assert!(bid1_leftover.burn_for_testing() == 0, 5);
-    let bid1_ticket = bid1_ticket_opt.destroy_some();
+    let mut bid1_ticket = bid1_ticket_opt.destroy_some();
     let bid1_order_id = bid1_ticket.ticket_order_id();
 
     // A third maker rests a bid below the other two, at a still-lower
@@ -113,7 +113,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(cross1_ticket_opt.is_none(), 13); // taker's own order fully filled, doesn't rest
     cross1_ticket_opt.destroy_none();
     // ask1 now has 269 - 113 = 156 remaining, pooling 70_399 quote for maker_a().
-    assert!(book.depth_at_price(tiny_clob::ask(), ask1_price) == 156, 14);
+    assert!(book.ask_base_escrow_at_price(ask1_price) == 156, 14);
 
     // --- A market-order taker partially crosses bid1 (the higher of the ---
     // --- two resting bids; fees still 0).                              ---
@@ -126,12 +126,12 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(cross2_leftover.burn_for_testing() == 0, 16);
     assert!(cross2_matched.burn_for_testing() == 601 * 214, 17); // = 128_614, exact, fee 0
     // bid1 now has 401 - 214 = 187 Base remaining, pooling 214 base for
-    // maker_b(). `depth_at_price` for a bid is Quote-denominated -- since
+    // maker_b(). `bid_quote_escrow_at_price` for a bid is Quote-denominated -- since
     // `bid1_price` is an exact multiple of `price_scale`, the escrow charge
     // divides out exactly with zero rounding slop at any cumulative fill
     // count, so the remaining Quote escrow is exactly `601 * 187 = 112_387`
     // (i.e. `bid_escrow_amount(bid1_price, 187)`, exactly), not `187`.
-    assert!(book.depth_at_price(tiny_clob::bid(), bid1_price) == 601 * 187, 18);
+    assert!(book.bid_quote_escrow_at_price(bid1_price) == 601 * 187, 18);
 
     // --- Fees change mid-lifecycle. ---
     scenario.next_tx(admin());
@@ -139,7 +139,7 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     cap.clob_admin_set_maker_fee(&mut book, 3);
 
     // --- Reassign bid1's remaining 187 to maker_c(), mid-fill-history. ---
-    let reassigned = book.update_resting_order(&bid1_ticket, maker_c());
+    let reassigned = book.update_resting_order(&mut bid1_ticket, maker_c());
     assert!(reassigned, 19);
 
     // --- A market ask fully drains bid1's remaining 187. ---
@@ -256,8 +256,8 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 49);
-    let (deleted_order_book_id, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(deleted_order_book_id == deleted_id, 50);
+    let (ev_book_id, _, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
+    assert!(ev_book_id == deleted_id, 50);
 
     scenario.end();
 }
@@ -276,7 +276,9 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     // (scale_hi = floor(u64::MAX * 10^9 / (10^9 * 10^16)) = 1_844,
     // comfortably above scale_lo, so the feasibility check passes ->
     // price_scale = 100.)
-    let (mut book, cap) = tiny_clob::new<WAL, SUI>(41, 9, 9, 2, 16, 100 * 211, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let wrapper_id = wrapper_uid.uid_to_inner();
+    let (mut book, cap) = tiny_clob::new<WAL, SUI>(41, 9, 9, 2, 16, 100 * 211, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 100, 0);
 
     // No fee changes in this scenario -- taker/maker fees stay 0 throughout,
@@ -303,7 +305,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
         book.place_limit_order_bid(bid_payment, bid_size, 10, scenario.ctx());
     assert!(bid_matched.burn_for_testing() == 0, 4);
     assert!(bid_leftover.burn_for_testing() == 0, 5);
-    let bid_ticket = bid_ticket_opt.destroy_some();
+    let mut bid_ticket = bid_ticket_opt.destroy_some();
 
     // A limit-order taker partially crosses the ask.
     scenario.next_tx(taker());
@@ -318,7 +320,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     assert!(cross1_ticket_opt.is_none(), 9);
     cross1_ticket_opt.destroy_none();
     // ask now has 173 - 59 = 114 remaining.
-    assert!(book.depth_at_price(tiny_clob::ask(), ask_price) == 114, 10);
+    assert!(book.ask_base_escrow_at_price(ask_price) == 114, 10);
 
     // A market-order taker partially crosses the bid.
     scenario.next_tx(taker());
@@ -329,17 +331,17 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     assert!(cross2_leftover.burn_for_testing() == 0, 11);
     assert!(cross2_matched.burn_for_testing() == 289 * 41, 12); // = 11_849, exact
     // bid now has 97 - 41 = 56 remaining, pooling 41 base for maker_c().
-    // bid now has 97 - 41 = 56 Base remaining. `depth_at_price` for a bid is
+    // bid now has 97 - 41 = 56 Base remaining. `bid_quote_escrow_at_price` for a bid is
     // Quote-denominated; `bid_price` is an exact multiple of `price_scale`,
     // so the remaining escrow divides out exactly to `289 * 56 = 16_184`
     // (`bid_escrow_amount(bid_price, 56)`, exactly), not `56`.
-    assert!(book.depth_at_price(tiny_clob::bid(), bid_price) == 289 * 56, 13);
+    assert!(book.bid_quote_escrow_at_price(bid_price) == 289 * 56, 13);
 
     // Reassign the remaining 56 of the bid to maker_a() -- left resting
     // (untouched) until the retire/drain finale below, to prove force-drain
     // still pays out to the REASSIGNED owner, not the original one.
     scenario.next_tx(maker_c());
-    let reassigned = book.update_resting_order(&bid_ticket, maker_a());
+    let reassigned = book.update_resting_order(&mut bid_ticket, maker_a());
     assert!(reassigned, 14);
 
     // A market bid fully drains the remaining 114 of the ask.
@@ -383,7 +385,7 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 1, 28);
-    let (_, _, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
+    let (_, _, _, ev_trader) = cancelled_events[0].order_cancelled_fields_for_testing();
     assert!(ev_trader == maker_a(), 29); // force-drain paid the REASSIGNED owner
 
     // bid's total escrow (28_033) minus what cross2 already charged
@@ -399,9 +401,11 @@ fun full_lifecycle_wal_sui_distinct_price_scale_shape() {
     let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 32);
-    let (deleted_order_book_id, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(deleted_order_book_id == deleted_id, 33);
+    let (ev_book_id, ev_enclosing_id, _, _) = deleted_events[0].order_book_deleted_fields_for_testing();
+    assert!(ev_book_id == deleted_id, 33);
+    assert!(ev_enclosing_id == wrapper_id, 34);
 
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -476,9 +480,10 @@ fun full_lifecycle_maker_fee_snapshot_survives_nonzero_to_nonzero_change() {
 
     let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
     assert!(settled.length() == 1, 13);
-    let (ev_order_id, ev_book_id, ev_maker, ev_amount) = settled[0].maker_fee_settled_fields_for_testing();
+    let (ev_true_book_id, ev_book_id, ev_order_id, ev_maker, ev_amount) = settled[0].maker_fee_settled_fields_for_testing();
     assert!(ev_order_id == bid_order_id, 14);
-    assert!(ev_book_id == book.event_id_for_testing(), 15);
+    assert!(ev_book_id == book.enclosing_object_id_for_testing(), 15);
+    assert!(ev_true_book_id == book.book_id(), 100);
     assert!(ev_maker == maker_a(), 16);
     assert!(ev_amount == original_rate_fee, 17); // = 1, NOT wrong_live_rate_fee's 2
 

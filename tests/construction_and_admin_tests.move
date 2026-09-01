@@ -84,8 +84,10 @@ fun new_succeeds_with_no_capability_argument_and_no_registry_interaction() {
 #[expected_failure(abort_code = 1, location = tiny_clob)] // tiny_clob::EZeroMinSize
 fun new_zero_min_size_aborts() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(0, 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(0, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -93,17 +95,21 @@ fun new_zero_min_size_aborts() {
 #[expected_failure(abort_code = 3, location = tiny_clob)] // tiny_clob::EMinSizeTooLarge
 fun new_min_size_too_large_aborts() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size() + 1, 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size() + 1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
 #[test]
 fun new_size_at_max_boundary_succeeds() {
     let mut scenario = ts::begin(admin());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size(), 0, 0, 0, 19, 1, scenario.ctx());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
     assert!(book.min_size() == max_min_size(), 0);
     destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
     scenario.end();
 }
 
@@ -145,7 +151,7 @@ fun clob_admin_cap_store_and_discard() {
     // `clob_admin_finalize` — there is no standalone discard function
     // anymore. Run a full retire -> drain -> clob_admin_finalize sequence and
     // confirm `ClobAdminCapDiscarded` fires from inside `clob_admin_finalize`
-    // with the correct `cap_id`/`for_book`.
+    // with the correct `cap_id`/`book_id`.
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
     let deleted_id = cap.clob_admin_finalize(book);
@@ -153,9 +159,10 @@ fun clob_admin_cap_store_and_discard() {
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
     assert!(discarded_events.length() == 1, 0);
-    let (event_cap_id, event_for_book) = discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
+    let (event_book_id, _event_enclosing_id, event_cap_id) =
+        discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
     assert!(event_cap_id == cap_id, 1);
-    assert!(event_for_book == book_id, 2);
+    assert!(event_book_id == book_id, 2);
 
     scenario.end();
 }
@@ -202,14 +209,14 @@ fun version_auto_upgrades_when_stale_lower_than_current() {
     // and emits a BookVersionUpgraded observability event at the moment of
     // the bump.
     cap.clob_admin_pause_book(&mut book);
-    assert!(book.book_version() == 1, 0);
+    assert!(book.book_version() == 2, 0);
 
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 1, 1);
-    let (ev_book_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
+    let (ev_book_id, _ev_enclosing_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
     assert!(ev_book_id == book_id, 2);
     assert!(ev_from == 0, 3);
-    assert!(ev_to == 1, 4);
+    assert!(ev_to == 2, 4);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -246,14 +253,14 @@ fun version_auto_upgrades_through_cancel_order() {
     let (refund_base, refund_quote) = book.cancel_order(ticket, scenario.ctx());
     refund_base.burn_for_testing();
     refund_quote.burn_for_testing();
-    assert!(book.book_version() == 1, 0);
+    assert!(book.book_version() == 2, 0);
 
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 1, 1);
-    let (ev_book_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
+    let (ev_book_id, _ev_enclosing_id, ev_from, ev_to) = upgraded_events[0].book_version_upgraded_fields_for_testing();
     assert!(ev_book_id == book_id, 2);
     assert!(ev_from == 0, 3);
-    assert!(ev_to == 1, 4);
+    assert!(ev_to == 2, 4);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -327,11 +334,13 @@ fun fee_setters_bounds_and_events() {
     let maker_events = event::events_by_type<tiny_clob::MakerFeeSet>();
     assert!(taker_events.length() == 1, 2);
     assert!(maker_events.length() == 1, 3);
-    let (ev_book, ev_rate) = taker_events[0].taker_fee_set_fields_for_testing();
-    assert!(ev_book == book.event_id_for_testing(), 4);
+    let (ev_book_id, ev_enclosing_id, ev_rate) = taker_events[0].taker_fee_set_fields_for_testing();
+    assert!(ev_book_id == book.book_id(), 40);
+    assert!(ev_enclosing_id == book.enclosing_object_id_for_testing(), 4);
     assert!(ev_rate == 10, 5);
-    let (ev_maker_book, ev_maker_rate) = maker_events[0].maker_fee_set_fields_for_testing();
-    assert!(ev_maker_book == book.event_id_for_testing(), 6);
+    let (ev_maker_book_id, ev_maker_enclosing_id, ev_maker_rate) = maker_events[0].maker_fee_set_fields_for_testing();
+    assert!(ev_maker_book_id == book.book_id(), 60);
+    assert!(ev_maker_enclosing_id == book.enclosing_object_id_for_testing(), 6);
     assert!(ev_maker_rate == 5, 7);
 
     destroy_book_and_cap(book, cap);
@@ -478,8 +487,9 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     cap.clob_admin_retire(&mut book);
     let retired_events = event::events_by_type<tiny_clob::OrderBookRetired>();
     assert!(retired_events.length() == 1, 0);
-    let ev_retired_book_id = retired_events[0].order_book_retired_fields_for_testing();
-    assert!(ev_retired_book_id == book.event_id_for_testing(), 10);
+    let (ev_retired_book_id, ev_retired_enclosing_id) = retired_events[0].order_book_retired_fields_for_testing();
+    assert!(ev_retired_book_id == book.book_id(), 10);
+    assert!(ev_retired_enclosing_id == book.enclosing_object_id_for_testing(), 11);
 
     // Repeatable, bounded max_items — one call with max_items = 0 is a no-op.
     cap.clob_admin_drain_step(&mut book, 0, scenario.ctx());
@@ -490,9 +500,9 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
     let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 3);
-    let (deleted_order_book_id, deleted_base, deleted_quote) =
+    let (deleted_book_id, _deleted_enclosing_id, deleted_base, deleted_quote) =
         deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(deleted_order_book_id == deleted_id, 4);
+    assert!(deleted_book_id == deleted_id, 4);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 40);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 41);
 
@@ -501,23 +511,26 @@ fun deletion_lifecycle_retire_drain_finalize_succeeds() {
 
 // `clob_admin_finalize`'s return value must be the book's true,
 // unforgeable object id (`object::uid_to_inner(&book.id)`), NOT
-// `event_id` — which is caller-controllable via `event_id_override` and
+// `enclosing_object_id` — which is caller-supplied at construction and
 // must never be trusted for identifying which book was just deleted.
-// This test constructs a book with an override that differs from its own
-// id, then confirms the two are correctly decoupled: the function's
-// return value tracks the book's true id, while the emitted
-// `OrderBookDeleted` event's `order_book_id` field tracks the override.
+// This test constructs a book with a foreign `enclosing_object_id` that
+// differs from its own id, then confirms the two are correctly decoupled:
+// the function's return value tracks the book's true id, and the emitted
+// `OrderBookDeleted` event now carries BOTH — its own `book_id` field
+// tracks the true id (matching the function's return value) while its
+// `enclosing_object_id` field tracks the caller-supplied foreign id,
+// confirming neither is accidentally populated with the other's value.
 #[test]
-fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
+fun clob_admin_finalize_returns_true_book_id_not_enclosing_object_id() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let override_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
+    let foreign_id = wrapper_uid.uid_to_inner();
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(
         min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
     );
 
     let true_book_id = book.book_id();
-    assert!(true_book_id != override_id, 0);
+    assert!(true_book_id != foreign_id, 0);
 
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
@@ -527,39 +540,42 @@ fun clob_admin_finalize_returns_true_book_id_not_event_id_override() {
 
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 2);
-    let (deleted_order_book_id, _, _) =
+    let (deleted_book_id, deleted_enclosing_id, _, _) =
         deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(deleted_order_book_id == override_id, 3);
-    assert!(deleted_order_book_id != deleted_id, 4);
+    assert!(deleted_book_id == deleted_id, 3);
+    assert!(deleted_enclosing_id == foreign_id, 4);
+    assert!(deleted_book_id != deleted_enclosing_id, 5);
 
     wrapper_uid.delete();
     scenario.end();
 }
 
-// `BookVersionUpgraded.book_id` and `ClobAdminCapDiscarded.for_book` used to
-// stamp the book's true, unforgeable id while every other event in this
-// module stamps `event_id` -- an inconsistency that broke correlation for
-// any indexer joining on `order_book_id`/`for_book` for a book constructed
-// with an override. Both now stamp `event_id` like every other event.
+// `BookVersionUpgraded`/`ClobAdminCapDiscarded` now both carry the same
+// two-field id prefix as every other event: a `book_id` (the book's true,
+// unforgeable id) and an `enclosing_object_id` (the caller-supplied id from
+// construction). This test confirms both fields are correctly, independently
+// populated on both events for a book constructed with a foreign
+// `enclosing_object_id` — catching a copy-paste swap of the two fields at
+// either emit site, which would otherwise compile cleanly (both are `ID`).
 #[test]
-fun book_version_upgraded_and_cap_discarded_stamp_event_id_override_not_true_id() {
+fun book_version_upgraded_and_cap_discarded_stamp_both_book_id_and_enclosing_object_id() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let override_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new_with_event_id_override<BTC, USDC>(
+    let foreign_id = wrapper_uid.uid_to_inner();
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(
         min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
     );
     let true_book_id = book.book_id();
-    assert!(true_book_id != override_id, 0);
+    assert!(true_book_id != foreign_id, 0);
 
     book.set_book_version_for_testing(0);
     cap.clob_admin_pause_book(&mut book);
 
     let upgraded_events = event::events_by_type<tiny_clob::BookVersionUpgraded>();
     assert!(upgraded_events.length() == 1, 1);
-    let (ev_book_id, _, _) = upgraded_events[0].book_version_upgraded_fields_for_testing();
-    assert!(ev_book_id == override_id, 2);
-    assert!(ev_book_id != true_book_id, 3);
+    let (ev_book_id, ev_enclosing_id, _, _) = upgraded_events[0].book_version_upgraded_fields_for_testing();
+    assert!(ev_book_id == true_book_id, 2);
+    assert!(ev_enclosing_id == foreign_id, 3);
 
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
@@ -568,10 +584,128 @@ fun book_version_upgraded_and_cap_discarded_stamp_event_id_override_not_true_id(
 
     let discarded_events = event::events_by_type<tiny_clob::ClobAdminCapDiscarded>();
     assert!(discarded_events.length() == 1, 5);
-    let (_, ev_for_book) = discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
-    assert!(ev_for_book == override_id, 6);
-    assert!(ev_for_book != true_book_id, 7);
+    let (ev_discard_book_id, ev_discard_enclosing_id, _) =
+        discarded_events[0].clob_admin_cap_discarded_fields_for_testing();
+    assert!(ev_discard_book_id == true_book_id, 6);
+    assert!(ev_discard_enclosing_id == foreign_id, 7);
 
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+// Required correctness gate: `book_id` (the book's true, unforgeable id)
+// and `enclosing_object_id` (the caller-supplied id from construction) must
+// be independently correct on every event this module emits — not merely
+// "some `ID` value present", but specifically the RIGHT one in the RIGHT
+// field. Both fields share the same type (`ID`), so a copy-paste swap of
+// the two at any single `event::emit` call site would compile cleanly and
+// pass every OTHER test that only ever checks one of the two fields in
+// isolation. This test constructs one book with a deliberately foreign
+// `enclosing_object_id`, then drives a broad spread of distinct event
+// types from it and asserts BOTH fields on each: `book_id == book.book_id()`
+// (unaffected by the foreign id) and `enclosing_object_id == foreign_id`
+// (the wrapper this test controls, never the book's own true id).
+#[test]
+fun every_event_type_stamps_true_book_id_and_foreign_enclosing_object_id_independently() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let foreign_id = wrapper_uid.uid_to_inner();
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let true_book_id = book.book_id();
+    assert!(true_book_id != foreign_id, 0);
+
+    // TakerFeeSet / MakerFeeSet
+    cap.clob_admin_set_taker_fee(&mut book, 10);
+    cap.clob_admin_set_maker_fee(&mut book, 5);
+    let taker_events = event::events_by_type<tiny_clob::TakerFeeSet>();
+    let (tb, te, _) = taker_events[0].taker_fee_set_fields_for_testing();
+    assert!(tb == true_book_id, 1);
+    assert!(te == foreign_id, 2);
+    let maker_events = event::events_by_type<tiny_clob::MakerFeeSet>();
+    let (mb, me, _) = maker_events[0].maker_fee_set_fields_for_testing();
+    assert!(mb == true_book_id, 3);
+    assert!(me == foreign_id, 4);
+
+    // PriceBandFactorSet
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(1000));
+    let band_events = event::events_by_type<tiny_clob::PriceBandFactorSet>();
+    let (bb, be, _) = band_events[0].price_band_factor_set_fields_for_testing();
+    assert!(bb == true_book_id, 5);
+    assert!(be == foreign_id, 6);
+
+    // Paused / Unpaused
+    cap.clob_admin_pause_book(&mut book);
+    let paused_events = event::events_by_type<tiny_clob::Paused>();
+    let (pb, pe) = paused_events[0].paused_fields_for_testing();
+    assert!(pb == true_book_id, 7);
+    assert!(pe == foreign_id, 8);
+
+    cap.clob_admin_unpause_book(&mut book);
+    let unpaused_events = event::events_by_type<tiny_clob::Unpaused>();
+    let (ub, ue) = unpaused_events[0].unpaused_fields_for_testing();
+    assert!(ub == true_book_id, 9);
+    assert!(ue == foreign_id, 10);
+
+    // OrderPlaced / OrderExecuted -- rest an ask (nothing to cross yet).
+    let ask_size = 100;
+    let ask_expected_quote_output = test_utils::ask_expected_output_for_price(&book, 1, ask_size);
+    let ask_payment = coin::mint_for_testing<BTC>(ask_size, scenario.ctx());
+    let (ask_ticket_opt, ask_leftover_base, ask_matched_quote, _) =
+        book.place_limit_order_ask(ask_payment, ask_expected_quote_output, 1_000_000_000, scenario.ctx());
+    ask_leftover_base.burn_for_testing();
+    ask_matched_quote.burn_for_testing();
+    let ask_ticket = ask_ticket_opt.destroy_some();
+
+    let placed_events = event::events_by_type<tiny_clob::OrderPlaced>();
+    let (plb, ple, _, _, _, _, _, _) = placed_events[0].order_placed_fields_for_testing();
+    assert!(plb == true_book_id, 11);
+    assert!(ple == foreign_id, 12);
+
+    let executed_events = event::events_by_type<tiny_clob::OrderExecuted>();
+    let (exb, exe, _, _, _, _, _, _, _, _, _, _) = executed_events[0].order_executed_fields_for_testing();
+    assert!(exb == true_book_id, 13);
+    assert!(exe == foreign_id, 14);
+
+    // OrderFilled / MakerFeeSettled -- a bid crosses the resting ask fully.
+    let bid_payment_amount = test_utils::bid_payment_for_price(&book, 1, ask_size);
+    let bid_payment = coin::mint_for_testing<USDC>(bid_payment_amount, scenario.ctx());
+    let (bid_ticket_opt, bid_matched_base, bid_leftover_quote, _) =
+        book.place_limit_order_bid(bid_payment, ask_size, 1_000_000_000, scenario.ctx());
+    bid_ticket_opt.destroy_none();
+    bid_matched_base.burn_for_testing();
+    bid_leftover_quote.burn_for_testing();
+
+    let filled_events = event::events_by_type<tiny_clob::OrderFilled>();
+    let (flb, fle, _, _, _, _, _) = filled_events[0].order_filled_fields_for_testing();
+    assert!(flb == true_book_id, 15);
+    assert!(fle == foreign_id, 16);
+
+    let settled_events = event::events_by_type<tiny_clob::MakerFeeSettled>();
+    let (stb, ste, _, _, _) = settled_events[0].maker_fee_settled_fields_for_testing();
+    assert!(stb == true_book_id, 17);
+    assert!(ste == foreign_id, 18);
+
+    // OrderCancelled -- a second, never-filled resting ask, cancelled directly.
+    let ask2_size = 50;
+    let ask2_expected_quote_output = test_utils::ask_expected_output_for_price(&book, 1, ask2_size);
+    let ask2_payment = coin::mint_for_testing<BTC>(ask2_size, scenario.ctx());
+    let (ask2_ticket_opt, ask2_leftover_base, ask2_matched_quote, _) =
+        book.place_limit_order_ask(ask2_payment, ask2_expected_quote_output, 1_000_000_000, scenario.ctx());
+    ask2_leftover_base.burn_for_testing();
+    ask2_matched_quote.burn_for_testing();
+    let ask2_ticket = ask2_ticket_opt.destroy_some();
+
+    let (cancel_base, cancel_quote) = book.cancel_order(ask2_ticket, scenario.ctx());
+    cancel_base.burn_for_testing();
+    cancel_quote.burn_for_testing();
+
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    let (clb, cle, _, _) = cancelled_events[0].order_cancelled_fields_for_testing();
+    assert!(clb == true_book_id, 19);
+    assert!(cle == foreign_id, 20);
+
+    unit_test::destroy(ask_ticket);
+    destroy_book_and_cap(book, cap);
     wrapper_uid.delete();
     scenario.end();
 }
@@ -620,9 +754,9 @@ fun finalize_succeeds_after_fees_claimed() {
     let deleted_id = cap.clob_admin_finalize(book);
     let deleted_events = event::events_by_type<tiny_clob::OrderBookDeleted>();
     assert!(deleted_events.length() == 1, 5);
-    let (deleted_order_book_id, deleted_base, deleted_quote) =
+    let (deleted_book_id, _deleted_enclosing_id, deleted_base, deleted_quote) =
         deleted_events[0].order_book_deleted_fields_for_testing();
-    assert!(deleted_order_book_id == deleted_id, 6);
+    assert!(deleted_book_id == deleted_id, 6);
     assert!(deleted_base == std::type_name::with_defining_ids<BTC>(), 60);
     assert!(deleted_quote == std::type_name::with_defining_ids<USDC>(), 61);
 
@@ -857,16 +991,18 @@ fun pause_then_unpause_emit_paused_and_unpaused_events() {
 
     let paused_events = event::events_by_type<tiny_clob::Paused>();
     assert!(paused_events.length() == 1, 1);
-    let ev_paused_book_id = paused_events[0].paused_fields_for_testing();
-    assert!(ev_paused_book_id == book.event_id_for_testing(), 2);
+    let (ev_paused_book_id, ev_paused_enclosing_id) = paused_events[0].paused_fields_for_testing();
+    assert!(ev_paused_book_id == book.book_id(), 20);
+    assert!(ev_paused_enclosing_id == book.enclosing_object_id_for_testing(), 2);
 
     cap.clob_admin_unpause_book(&mut book);
     assert!(!book.is_paused(), 3);
 
     let unpaused_events = event::events_by_type<tiny_clob::Unpaused>();
     assert!(unpaused_events.length() == 1, 4);
-    let ev_unpaused_book_id = unpaused_events[0].unpaused_fields_for_testing();
-    assert!(ev_unpaused_book_id == book.event_id_for_testing(), 5);
+    let (ev_unpaused_book_id, ev_unpaused_enclosing_id) = unpaused_events[0].unpaused_fields_for_testing();
+    assert!(ev_unpaused_book_id == book.book_id(), 50);
+    assert!(ev_unpaused_enclosing_id == book.enclosing_object_id_for_testing(), 5);
 
     destroy_book_and_cap(book, cap);
     scenario.end();
@@ -964,10 +1100,11 @@ fun claim_fees_drains_full_accumulator() {
 
     let claimed_events = event::events_by_type<tiny_clob::FeesClaimed>();
     assert!(claimed_events.length() == 1, 6);
-    let (ev_claimant, ev_book_id, ev_base_amount, ev_quote_amount) =
+    let (ev_book_id, ev_enclosing_id, ev_claimant, ev_base_amount, ev_quote_amount) =
         claimed_events[0].fees_claimed_fields_for_testing();
     assert!(ev_claimant == admin(), 7);
-    assert!(ev_book_id == book.event_id_for_testing(), 8);
+    assert!(ev_book_id == book.book_id(), 80);
+    assert!(ev_enclosing_id == book.enclosing_object_id_for_testing(), 8);
     assert!(ev_base_amount == expected_base_fee, 9);
     assert!(ev_quote_amount == expected_quote_fee, 10);
 
