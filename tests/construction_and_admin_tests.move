@@ -1354,6 +1354,52 @@ fun cancel_order_on_nonexistent_order_is_silent_noop() {
     scenario.end();
 }
 
+// `find_and_remove_order`'s "level exists but this order_id isn't in it"
+// branch (sources/price_tree.move) is never exercised by the no-op test
+// above, since that test's price level doesn't exist at all. Here two other
+// makers' bids genuinely rest at the target price, so a bug that
+// unconditionally removed the tree leaf (instead of gating removal on
+// whether the order was actually found) would delete a price level still
+// holding two live escrowed orders.
+#[test]
+fun cancel_order_on_nonexistent_order_id_at_live_price_level_is_silent_noop() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let ticket_a = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+    scenario.next_tx(maker_b());
+    let ticket_b = rest_bid(&mut book, default_price(), default_size(), 10, scenario.ctx());
+
+    assert!(book.bids_size_for_testing() == 1, 0);
+    let order_id_a = ticket_a.ticket_order_id();
+    let order_id_b = ticket_b.ticket_order_id();
+    let escrow_a_before = book.resting_order_escrow(true, default_price(), order_id_a);
+    let escrow_b_before = book.resting_order_escrow(true, default_price(), order_id_b);
+    assert!(escrow_a_before.is_some(), 1);
+    assert!(escrow_b_before.is_some(), 2);
+
+    // 9999 is neither `order_id_a` nor `order_id_b`, but `default_price()`
+    // is a genuine, live price level.
+    cap.clob_admin_cancel_order(&mut book, true, default_price(), 9999, scenario.ctx());
+
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled_events.length() == 0, 3);
+    let settled_events = event::events_by_type<tiny_clob::MakerFeeSettled>();
+    assert!(settled_events.length() == 0, 4);
+
+    // The price level must still exist, untouched, with both original
+    // orders still resting and findable.
+    assert!(book.bids_size_for_testing() == 1, 5);
+    assert!(book.resting_order_escrow(true, default_price(), order_id_a).is_some(), 6);
+    assert!(book.resting_order_escrow(true, default_price(), order_id_b).is_some(), 7);
+
+    unit_test::destroy(ticket_a);
+    unit_test::destroy(ticket_b);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 #[test]
 fun push_proceeds_with_no_pooled_entry_is_silent_noop() {
     let mut scenario = ts::begin(admin());

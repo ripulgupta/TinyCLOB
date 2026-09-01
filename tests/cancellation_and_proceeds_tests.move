@@ -1569,3 +1569,109 @@ fun update_resting_order_after_full_fill_still_syncs_pooled_proceeds_owner() {
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
+
+// === Owner-sync getters vs. actual drain/push payouts ===
+//
+// `resting_order_owner`/`resting_order_owner_by_ticket` and
+// `proceeds_owner`/`proceeds_owner_by_ticket` are so far only exercised in
+// isolation (escrow_value_queries_tests.move), checked against a known
+// address but never against what `drain_side`/`push_proceeds` actually pay
+// in the SAME test. This closes that gap end-to-end: predict via the
+// getters first, then drain/push and confirm the real payout lands exactly
+// where predicted.
+#[test]
+fun owner_sync_getters_predict_actual_drain_and_push_payouts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    // maker_a() rests a bid big enough to be partially filled, leaving it
+    // still resting (with locked escrow) AND creating a pooled proceeds
+    // entry -- so both getter families have something live to predict.
+    scenario.next_tx(maker_a());
+    let size = 200;
+    let fill_size = 100;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
+    );
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+
+    // Before any drain: the getters predict maker_a() for both the still-
+    // resting order's escrow and the pooled proceeds -- via the raw lookups
+    // and the ticket-based wrappers.
+    assert!(book.resting_order_owner(true, default_price(), order_id).destroy_some() == maker_a(), 0);
+    assert!(book.resting_order_owner_by_ticket(&bid_ticket).destroy_some() == maker_a(), 1);
+    assert!(book.proceeds_owner(order_id).destroy_some() == maker_a(), 2);
+    assert!(book.proceeds_owner_by_ticket(&bid_ticket).destroy_some() == maker_a(), 3);
+
+    let remaining_size = size - fill_size;
+    let expected_escrow_refund = book.bid_escrow_amount(default_price(), remaining_size);
+    unit_test::destroy(bid_ticket);
+
+    // Retire and force-drain: this exercises BOTH the remaining resting
+    // order's escrow (drain_side) and the pooled proceeds entry
+    // (drain_proceeds) in the same call.
+    scenario.next_tx(admin());
+    cap.clob_admin_retire(&mut book);
+    cap.clob_admin_drain_step(&mut book, 100, scenario.ctx());
+
+    // The actual payouts land exactly where the getters predicted: maker_a().
+    scenario.next_tx(maker_a());
+    let escrow_refund = scenario.take_from_address<coin::Coin<USDC>>(maker_a());
+    assert!(escrow_refund.value() == expected_escrow_refund, 4);
+    escrow_refund.burn_for_testing();
+
+    let proceeds_payout = scenario.take_from_address<coin::Coin<BTC>>(maker_a());
+    assert!(proceeds_payout.value() == fill_size, 5);
+    proceeds_payout.burn_for_testing();
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// The custody-drift scenario the getters exist to help detect: an order is
+// placed by maker_a(), custody notionally changes hands off-chain (e.g. a
+// wrapper reassigns the ticket internally), but `update_resting_order` is
+// deliberately never called to sync that on-chain. `resting_order_owner`
+// must keep reporting the RECORDED owner (maker_a()), correctly predicting
+// that a subsequent force-cancel will pay maker_a() -- not whoever the
+// ticket notionally belongs to off-chain, since the contract has no way to
+// know that without an explicit `update_resting_order` call.
+#[test]
+fun resting_order_owner_predicts_stale_payout_when_update_resting_order_is_skipped() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    let (side, price) = (bid_ticket.ticket_side(), bid_ticket.ticket_price());
+
+    // update_resting_order is deliberately never called here. The getter
+    // still (correctly) predicts the stale recorded owner, maker_a().
+    assert!(book.resting_order_owner(side, price, order_id).destroy_some() == maker_a(), 0);
+    assert!(book.resting_order_owner_by_ticket(&bid_ticket).destroy_some() == maker_a(), 1);
+
+    let expected_refund = book.bid_escrow_amount(default_price(), default_size());
+    unit_test::destroy(bid_ticket);
+
+    scenario.next_tx(admin());
+    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+
+    // The force-cancel pays exactly the address the getter predicted --
+    // maker_a(), the last address recorded on-chain -- and nothing at all
+    // goes to maker_b(), the notional "new" ticket holder that custody
+    // would have moved to had update_resting_order actually been called.
+    scenario.next_tx(maker_a());
+    let refund = scenario.take_from_address<coin::Coin<USDC>>(maker_a());
+    assert!(refund.value() == expected_refund, 2);
+    refund.burn_for_testing();
+    assert!(!ts::has_most_recent_for_address<coin::Coin<USDC>>(maker_b()), 3);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}

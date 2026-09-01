@@ -595,3 +595,79 @@ fun place_market_order_bid_min_exceeds_max_base_out_aborts() {
     unit_test::destroy(cap);
     scenario.end();
 }
+
+/// `gross_size_bound_for_net_cap`'s `u64::MAX` clamp arm (the
+/// `if (gross > U64_MAX) { U64_MAX as u64 }` branch in `tiny_clob.move`) is
+/// only reached when `max_base_out == u64::MAX` (the "unbounded" sentinel)
+/// is combined with a NONZERO `taker_fee_bps` -- every other
+/// `max_base_out == u64_max()` test call site in this suite uses a book with
+/// `taker_fee_bps == 0`, which takes the early `if (rate_bps == 0) { return
+/// net_cap }` return and never reaches the clamp at all. Without the clamp,
+/// inflating `u64::MAX` by `BPS_DENOM / (BPS_DENOM - rate_bps)` would
+/// overflow the `u128 -> u64` narrowing cast and ABORT, breaking every
+/// unbounded market bid whenever a nonzero taker fee is configured -- the
+/// normal production case. This test's real assertion is simply that the
+/// call below does not abort; the liquidity/fee bookkeeping is checked too,
+/// to also confirm the resulting match is correct, not just non-aborting.
+#[test]
+fun place_market_order_bid_unbounded_cap_with_nonzero_taker_fee_does_not_abort() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let price = default_price();
+    let size = default_size(); // 100
+    cap.clob_admin_set_taker_fee(&mut book, 10); // 10 bps
+    let ask_ticket = rest_ask(&mut book, price, size, 20, scenario.ctx());
+
+    scenario.next_tx(taker());
+    let budget = book.bid_escrow_amount(price, size);
+    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    // max_base_out = u64_max() (unbounded) with a nonzero taker fee: this is
+    // exactly the combination that used to be entirely untested and would
+    // abort without the clamp.
+    let (matched_base, leftover_quote, stopped) =
+        book.place_market_order_bid(bid_payment, 20, 0, u64_max(), u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    // Gross matched = the full 100-unit resting ask (nothing else caps it).
+    // taker_fee_amount = ceil(100 * 10 / 10_000) = ceil(0.1) = 1.
+    // Net delivered = 100 - 1 = 99.
+    assert!(matched_base.burn_for_testing() == 99, 1);
+    leftover_quote.burn_for_testing();
+
+    unit_test::destroy(ask_ticket);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
+    scenario.end();
+}
+
+/// Success-path boundary coverage for `place_market_order_ask`'s
+/// `min_quote_out` slippage guard: every existing test either disables the
+/// check (`min_quote_out == 0`) or exercises the FAILING direction
+/// (`place_market_order_ask_min_quote_out_slippage_bound_aborts` above, at
+/// `expected_quote + 1`), leaving the success-path continuation after the
+/// `assert!(matched_quote.value() >= min_quote_out, ...)` check entirely
+/// uncovered. This hits the exact boundary from the other side --
+/// `min_quote_out == expected_quote` exactly -- proving the guard is
+/// `>=`, not `>`: if the code used a strict `>` here, this call would abort
+/// instead of succeeding.
+#[test]
+fun place_market_order_ask_min_quote_out_exact_boundary_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    let price = default_price();
+    let size = default_size();
+    let bid_ticket = rest_bid(&mut book, price, size, 20, scenario.ctx());
+
+    scenario.next_tx(taker());
+    let expected_quote = book.bid_escrow_amount(price, size);
+    let ask_payment = coin::mint_for_testing<BTC>(size, scenario.ctx());
+    let (leftover_base, matched_quote, stopped) =
+        book.place_market_order_ask(ask_payment, 20, expected_quote, u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    assert!(leftover_base.burn_for_testing() == 0, 1);
+    assert!(matched_quote.burn_for_testing() == expected_quote, 2);
+
+    unit_test::destroy(bid_ticket);
+    unit_test::destroy(book);
+    unit_test::destroy(cap);
+    scenario.end();
+}

@@ -678,3 +678,70 @@ fun band_active_zero_price_derivation_aborts_zero_price_before_band_check() {
     destroy_book_and_cap(book, cap);
     scenario.end();
 }
+
+/// Establishes the band is genuinely enforced at price 4000 (the same price
+/// used, band-cleared, in
+/// `clob_admin_set_price_band_factor_none_clears_band_and_price_now_succeeds`
+/// below) before that test clears the band and reuses the exact same price
+/// to prove the clear is real.
+#[test]
+#[expected_failure(abort_code = 24, location = tiny_clob)] // EPriceAboveBand
+fun clob_admin_set_price_band_factor_band_active_rejects_price_4000() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    // band: [1000/2, 1000*2] = [500, 2000] -- 4000 is above it.
+    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(4000, min_size()), scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, _) =
+        book.place_limit_order_bid(payment, min_size(), 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(matched_base);
+    unit_test::destroy(leftover_quote);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+/// `clob_admin_set_price_band_factor(option::none())` has never been
+/// successfully called in any prior test -- the one existing `none()` call
+/// site (`set_price_band_factor_rejects_wrong_cap`) aborts on the wrong-cap
+/// check before ever reaching the field write, so the "turn the band off"
+/// path, and the `PriceBandFactorSet.factor` event field, have zero
+/// coverage. This sets a band, confirms it's enforced (a bid at 4000 aborts
+/// while the [500, 2000] band is active), clears it with `option::none()`,
+/// confirms the field write AND the emitted event's `factor` are genuinely
+/// `None`, then confirms the exact same previously-rejected price of 4000
+/// now succeeds -- proving the band is really off, not just internally
+/// marked off while still somehow enforced.
+#[test]
+fun clob_admin_set_price_band_factor_none_clears_band_and_price_now_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+    book.set_last_price(1000, scenario.ctx());
+    cap.clob_admin_set_price_band_factor(&mut book, option::some(2));
+    assert!(book.price_band_factor() == option::some(2), 0);
+
+    // Clear the band with option::none() -- does not abort.
+    cap.clob_admin_set_price_band_factor(&mut book, option::none());
+    assert!(book.price_band_factor().is_none(), 1);
+
+    // The emitted event's `factor` field is genuinely None for this second
+    // call, not just the field write on the book.
+    let events = event::events_by_type<tiny_clob::PriceBandFactorSet>();
+    assert!(events.length() == 2, 2);
+    let (_, _, ev_factor) = events[1].price_band_factor_set_fields_for_testing();
+    assert!(ev_factor.is_none(), 3);
+
+    // The same raw price of 4000, which would have aborted EPriceAboveBand
+    // while the band was active, now succeeds cleanly -- proving the band is
+    // genuinely off, not merely marked off while still somehow enforced.
+    let payment = coin::mint_for_testing<USDC>(book.bid_escrow_amount(4000, min_size()), scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, _) =
+        book.place_limit_order_bid(payment, min_size(), 10, scenario.ctx());
+    unit_test::destroy(ticket_opt);
+    unit_test::destroy(matched_base);
+    unit_test::destroy(leftover_quote);
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}

@@ -462,6 +462,69 @@ fun order_executed_taker_fee_amount_matches_aggregate_across_many_small_fills() 
     scenario.end();
 }
 
+/// Ample-liquidity mirror of
+/// `order_executed_taker_fee_amount_matches_aggregate_across_many_small_fills`
+/// above: that test is liquidity-LIMITED (only 10 gross units of resting
+/// liquidity are available, one short of the 11 gross units the net cap of
+/// 10 would need, so the net cap never actually binds). Here there are 20
+/// resting units -- MORE than the taker will ever need -- so the `max_base_out`
+/// NET cap itself is the binding constraint, not the book. This also
+/// exercises `min_base_out == max_base_out != 0` with a nonzero taker fee,
+/// which the doc comment on `place_market_order_bid` explicitly promises is
+/// "always satisfiable when fully filled, regardless of `taker_fee_bps`" --
+/// under the OLD gross-cap semantics this combination would have aborted
+/// with `ESlippageExceeded`, since the net delivered from a gross cap of 10
+/// would have been `10 - fee(10) = 9 < min_base_out (10)`.
+#[test]
+fun place_market_order_bid_net_cap_binds_with_ample_liquidity_and_equal_min_max() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let taker_fee_bps = 10; // MAX_TAKER_FEE_BPS
+    cap.clob_admin_set_taker_fee(&mut book, taker_fee_bps);
+
+    let num_resting = 20;
+    let mut i = 0;
+    while (i < num_resting) {
+        let order_id = book.next_order_id();
+        let escrow = balance::create_for_testing<BTC>(1);
+        let ask = order::new<BTC, USDC>(order_id, other(), 1, option::some(escrow), option::none(), 0);
+        book.insert_resting_order_for_testing(false, PRICE, ask, scenario.ctx());
+        i = i + 1;
+    };
+
+    let net_cap = 10;
+    let budget = PRICE * num_resting; // plenty -- more than any gross bound below could need
+    let payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base, leftover_payment, stopped) =
+        book.place_market_order_bid(payment, 1_000_000, net_cap, net_cap, u64_max(), scenario.ctx());
+    assert!(!stopped, 0);
+    let matched_base_val = matched_base.burn_for_testing();
+    leftover_payment.burn_for_testing();
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 1);
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(requested_size == net_cap, 2);
+    // `gross_size_bound_for_net_cap(10, 10) == ceil(10 * 10_000 / 9_990) ==
+    // ceil(10.01001...) == 11`. 20 units of resting liquidity is more than
+    // enough to fully match this 11-unit gross bound, so the cap (not the
+    // book) is the binding constraint here.
+    // `taker_fee_amount = ceil(11 * 10 / 10_000) = ceil(0.011) = 1`.
+    // Net delivered = `11 - 1 = 10 == max_base_out` exactly.
+    assert!(taker_fee_amount == 1, 3);
+    assert!(matched_base_val == net_cap, 4);
+    assert!(unmatched_size == 0, 5);
+
+    let (fee_base_after, _fee_quote_after) = book.fee_accumulator_balances();
+    assert!(fee_base_after == taker_fee_amount, 6);
+
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
 /// Taker-side aggregation (Part D), ask-side mirror of
 /// `taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_fills`
 /// above: that bid-side test's taker fee is Base-denominated, so

@@ -74,6 +74,65 @@ fun partial_cross_then_rest_clamps_resting_escrow_to_available() {
     scenario.end();
 }
 
+// `place_limit_order_bid`'s `actual_resting_size` clamp
+// (`if (remaining_size_u128 < max_size_available_can_back_u128) {
+// remaining_size_u128 } else { max_size_available_can_back_u128 }`) has two
+// arms; the `remaining_size` (first) arm was never exercised by any existing
+// test -- everywhere else the two arms come out equal (exact division) or
+// the order fully fills. Here, with NO resting asks at all (so nothing
+// matches and the whole order goes to rest), `remaining_size == 7` while
+// the leftover escrow could actually back up to 10 units -- so the clamp
+// must pick 7, not 10. If the two arms were swapped or the comparison
+// inverted, the resting order would display size 10 while only backed by
+// enough escrow for 7 -- a silent overselling bug.
+//
+// Hand-derivation at `price = 2`, `price_scale = 10` (shortfall_book),
+// `size = 7`:
+//   escrow_amount = bid_escrow_amount(book, 2, 7) = ceil(2*7/10) = ceil(1.4) = 2
+//   max_size_available_can_back = floor(escrow.value() * price_scale / price)
+//                                = floor(2*10/2) = 10
+//   remaining_size (7) < max_size_available_can_back (10)
+//     => the `remaining_size` arm is taken: actual_resting_size = 7
+#[test]
+fun place_limit_order_bid_rests_remaining_size_arm_not_escrow_backed_max() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+
+    scenario.next_tx(taker());
+    let payment_amount = test_utils::bid_payment_for_price(&book, 2, 7);
+    assert!(payment_amount == 2, 0);
+    let payment = coin::mint_for_testing<USDC>(payment_amount, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, _) =
+        book.place_limit_order_bid(payment, 7, 10, scenario.ctx());
+
+    // Nothing to match: the whole order rests.
+    assert!(matched_base.burn_for_testing() == 0, 1);
+    assert!(leftover_quote.burn_for_testing() == 0, 2);
+    assert!(ticket_opt.is_some(), 3);
+    let bid_ticket = ticket_opt.destroy_some();
+
+    // The resting size must be exactly 7 (the `remaining_size` arm), not the
+    // inflated 10 that the leftover escrow could nominally back.
+    //
+    // Note: `resting_order_escrow`'s `remaining_size` field is NOT usable
+    // here to check the Base-denominated resting size directly -- for a
+    // BID-side order it is Quote-denominated (see `order::Order.remaining_size`'s
+    // doc comment: it equals `total_reserved`/the live Quote escrow value,
+    // not the Base quantity). The `OrderPlaced` event's `size` field is the
+    // actual Base-denominated `actual_resting_size` this test needs.
+    let placed_events = event::events_by_type<tiny_clob::OrderPlaced>();
+    assert!(placed_events.length() == 1, 5);
+    let (_, _, _, _, _, placed_size, _, _) = placed_events[0].order_placed_fields_for_testing();
+    assert!(placed_size == 7, 6);
+
+    // The escrow backing matches the ACTUAL size, not the inflated one.
+    assert!(book.bid_quote_escrow_at_price(2) == 2, 7);
+
+    unit_test::destroy(bid_ticket);
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
 // A partial-cross-then-rest order's resting SIZE is itself derived from what
 // the leftover escrow can actually back (Part J's fix), not the full
 // post-sweep `remaining_size`: here `remaining_size` after the sweep is 9,
