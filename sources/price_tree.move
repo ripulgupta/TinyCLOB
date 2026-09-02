@@ -149,6 +149,22 @@ public(package) fun level_borrow_order<Base, Quote>(level: &PriceLevel<Base, Quo
     level.orders.borrow(order_id)
 }
 
+/// Adds `order`'s contribution to `level`'s running totals — the single
+/// place `total_size`/`total_quote_escrow` are ever incremented, so the two
+/// fields (which move in lockstep for every order this level will ever
+/// hold) can never drift out of sync at one call site without the other.
+fun level_add_order_totals<Base, Quote>(level: &mut PriceLevel<Base, Quote>, order: &Order<Base, Quote>) {
+    level.total_size = level.total_size + order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow + order.escrow_quote_value();
+}
+
+/// Subtracts `order`'s contribution from `level`'s running totals — the
+/// single place either field is ever decremented. See `level_add_order_totals`.
+fun level_subtract_order_totals<Base, Quote>(level: &mut PriceLevel<Base, Quote>, order: &Order<Base, Quote>) {
+    level.total_size = level.total_size - order.remaining_size();
+    level.total_quote_escrow = level.total_quote_escrow - order.escrow_quote_value();
+}
+
 /// Inserts `order` into `level`'s FIFO queue and adds its `remaining_size`
 /// to `level.total_size` in the same call. For brand-new orders being
 /// rested for the first time — always correctly goes to the back.
@@ -157,8 +173,7 @@ public(package) fun level_insert_order<Base, Quote>(
     order_id: u64,
     order: Order<Base, Quote>,
 ) {
-    level.total_size = level.total_size + order.remaining_size();
-    level.total_quote_escrow = level.total_quote_escrow + order.escrow_quote_value();
+    level.level_add_order_totals(&order);
     level.orders.push_back(order_id, order);
 }
 
@@ -172,8 +187,7 @@ public(package) fun level_insert_order_front<Base, Quote>(
     order_id: u64,
     order: Order<Base, Quote>,
 ) {
-    level.total_size = level.total_size + order.remaining_size();
-    level.total_quote_escrow = level.total_quote_escrow + order.escrow_quote_value();
+    level.level_add_order_totals(&order);
     level.orders.push_front(order_id, order);
 }
 
@@ -187,8 +201,7 @@ public(package) fun level_remove_order<Base, Quote>(
     order_id: u64,
 ): Order<Base, Quote> {
     let order = level.orders.remove(order_id);
-    level.total_size = level.total_size - order.remaining_size();
-    level.total_quote_escrow = level.total_quote_escrow - order.escrow_quote_value();
+    level.level_subtract_order_totals(&order);
     order
 }
 
@@ -200,8 +213,7 @@ public(package) fun level_pop_front_order<Base, Quote>(
     level: &mut PriceLevel<Base, Quote>,
 ): (u64, Order<Base, Quote>) {
     let (order_id, order) = level.orders.pop_front();
-    level.total_size = level.total_size - order.remaining_size();
-    level.total_quote_escrow = level.total_quote_escrow - order.escrow_quote_value();
+    level.level_subtract_order_totals(&order);
     (order_id, order)
 }
 
