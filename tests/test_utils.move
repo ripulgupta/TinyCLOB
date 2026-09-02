@@ -64,9 +64,15 @@ public(package) fun realistic_decimals_book<Base, Quote>(
     (book, cap)
 }
 
+// exponent = 17, not 19: with `price_scale == 1` and `MIN_SIZE == 100`, the
+// payment needed to reach `10^exponent` at `MIN_SIZE` is
+// `10^exponent * 100`; at exponent 19 that's `10^21`, which overflows
+// `u64::MAX` and now trips `EMinSizeExceedsReachableRange` at construction.
+// exponent 17 keeps that minimum payment (`10^19`) comfortably under
+// `u64::MAX` (~1.8446744e19) while still exercising a wide declared range.
 public(package) fun new_book(scenario: &mut ts::Scenario): (OrderBook<BTC, USDC>, ClobAdminCap) {
     let wrapper_uid = object::new(scenario.ctx());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(MIN_SIZE, 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
     wrapper_uid.delete();
     (book, cap)
 }

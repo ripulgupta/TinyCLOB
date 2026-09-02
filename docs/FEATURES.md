@@ -98,6 +98,7 @@ See §3 (price representation).
 | `min_size > 1_000_000_000_000_000` | `EMinSizeTooLarge` (3) |
 | any of `base_decimals`, `quote_decimals`, `precision`, `exponent` `> 38` | `EDecimalsTooLarge` (28) |
 | no valid `price_scale` exists for the declared inputs (§3) | `EPriceRangeInfeasible` (20) |
+| `min_size` is too large relative to the declared price range — the smallest allowed order (`min_size`), priced at the book's declared maximum price, would require a `Quote` payment exceeding `u64::MAX`, so the top of the declared range could never actually be reached by any order (§3) | `EMinSizeExceedsReachableRange` (34) |
 | `initial_last_price == 0` | `EZeroPrice` (14) |
 | `initial_last_price` outside the book's declared representable range (§3) | `EPriceBelowDeclaredMin` (21) / `EPriceAboveDeclaredMax` (22) |
 | `enclosing_object_id` refers to the book's own `UID` (structurally unreachable — defensive-only, see the `EEnclosingIsSelf` constant doc comment) | `EEnclosingIsSelf` (32) |
@@ -136,6 +137,17 @@ feasibility bound: it guarantees `10^exponent` (the book's declared maximum
 true price) still decodes to a raw price that fits in a `u64` at the chosen
 `price_scale`. Construction aborts with `EPriceRangeInfeasible` (20) if
 `scale_lo > scale_hi`, or if `scale_lo` itself does not fit in a `u64`.
+
+`min_size` is separately checked for joint feasibility with the declared
+price range. For any fixed order size, reaching a higher price always
+requires at least as much `Quote` payment as reaching a lower one — which
+is why the minimum size (`min_size`) combined with the maximum price
+(`10^exponent`) is exactly where the least-forgiving, minimum-required
+payment occurs. Since no `Coin` payment can ever exceed `u64::MAX`,
+`min_size` must not be so large that even this minimum payment overflows
+`u64::MAX` — otherwise the top of the declared range could never actually
+be reached by any order, forever. Construction aborts with
+`EMinSizeExceedsReachableRange` (34) if it is.
 
 `precision` and `exponent` jointly declare the range of true price the book
 guarantees to represent: at least `10^-precision` and at most `10^exponent`.
@@ -1101,6 +1113,7 @@ maker fee is actually paid in).
 | 31 | `EOrderStillResting` |
 | 32 | `EEnclosingIsSelf` |
 | 33 | `EInvalidOwner` |
+| 34 | `EMinSizeExceedsReachableRange` |
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 

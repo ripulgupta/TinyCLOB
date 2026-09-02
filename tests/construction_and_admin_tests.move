@@ -104,7 +104,15 @@ fun new_min_size_too_large_aborts() {
 fun new_size_at_max_boundary_succeeds() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    // exponent = 4, not 19: with `price_scale == 1` and `min_size ==
+    // max_min_size() == 10^15`, the payment needed to reach `10^exponent` at
+    // `min_size` is `10^exponent * 10^15`; at exponent 19 that's `10^34`,
+    // far beyond `u64::MAX`, which would now trip
+    // `EMinSizeExceedsReachableRange` at construction (this test's own
+    // subject is the `min_size == max_min_size()` boundary, not the price
+    // range, so a modest exponent keeps that boundary reachable: `10^4 *
+    // 10^15 = 10^19`, comfortably under `u64::MAX`, ~1.8446744e19).
+    let (book, cap) = tiny_clob::new<BTC, USDC>(max_min_size(), 0, 0, 0, 4, 1, &wrapper_uid, scenario.ctx());
     assert!(book.min_size() == max_min_size(), 0);
     destroy_book_and_cap(book, cap);
     wrapper_uid.delete();
@@ -543,7 +551,7 @@ fun clob_admin_finalize_returns_true_book_id_not_enclosing_object_id() {
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
+        min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx(),
     );
 
     let true_book_id = book.book_id();
@@ -582,7 +590,7 @@ fun book_version_upgraded_and_cap_discarded_stamp_both_book_id_and_enclosing_obj
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
+        min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx(),
     );
     let true_book_id = book.book_id();
     assert!(true_book_id != foreign_id, 0);

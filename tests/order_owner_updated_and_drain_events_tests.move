@@ -200,7 +200,7 @@ fun clob_admin_drain_step_order_cancelled_events_carry_correct_ids_and_traders()
     // stamps BOTH id fields correctly -- previously unchecked anywhere.
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
     let true_book_id = book.book_id();
     assert!(true_book_id != foreign_id, 5);
 

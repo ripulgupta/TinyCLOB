@@ -131,7 +131,7 @@ fun fill_level_ask_order_filled_stamps_true_book_id_and_foreign_enclosing_id() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
     let true_book_id = book.book_id();
     assert!(true_book_id != foreign_id, 0);
 
@@ -177,7 +177,7 @@ fun new_enclosing_object_id_is_used_and_stable_across_placement_and_cancel() {
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(
-        min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx(),
+        min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx(),
     );
 
     // The caller-supplied `enclosing_object_id`, not the book's own internal
@@ -227,7 +227,7 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
     // `claim_proceeds` emit site independently, not just `book_id` alone.
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
     let book_id = book.book_id();
     assert!(book_id != foreign_id, 6);
 
@@ -284,7 +284,7 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     // the `push_proceeds` emit site too.
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
-    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 19, 1, &wrapper_uid, scenario.ctx());
+    let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
     let book_id = book.book_id();
     assert!(book_id != foreign_id, 6);
 

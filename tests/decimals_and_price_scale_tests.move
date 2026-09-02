@@ -752,14 +752,21 @@ fun bid_escrow_amount_zero_price_is_zero() {
 // `realistic_decimals_book` (base=8, quote=6, precision=0, exponent=19) has
 // `price_scale = 100` -- unlike every existing min_size-boundary test, which
 // uses `new_book` (`price_scale == 1`, no rounding to account for).
-// `REALISTIC_MIN_SIZE` (200, not the shared `min_size()` constant) is used
-// purely so both boundary values (200, 199) stay comfortably nonzero.
+// `REALISTIC_MIN_SIZE` (150, not the shared `min_size()` constant) is used
+// purely so both boundary values (150, 149) stay comfortably nonzero.
+// `REALISTIC_MIN_SIZE` is also bounded above by
+// `EMinSizeExceedsReachableRange` feasibility: this book's declared maximum
+// price (`dmax = 10^19`) requires a minimum payment of
+// `ceil(dmax * REALISTIC_MIN_SIZE / price_scale)` at construction, which
+// must stay under `u64::MAX` (~1.8446744e19) -- 200 would put that at
+// `2e19` and abort construction; 150 keeps it at `1.5e19`, comfortably
+// under.
 // `REALISTIC_BID_ASK_PRICE` is this book's own `initial_last_price`
 // (`100 * 497`, see `realistic_decimals_book`'s definition), guaranteed to
 // already be within the declared range and to round-trip exactly through
 // `bid_payment_for_price`/`ask_expected_output_for_price` at this size, since
-// `49_700 * 200` is an exact multiple of `price_scale` (100).
-const REALISTIC_MIN_SIZE: u64 = 200;
+// `49_700 * REALISTIC_MIN_SIZE` is an exact multiple of `price_scale` (100).
+const REALISTIC_MIN_SIZE: u64 = 150;
 const REALISTIC_BID_ASK_PRICE: u64 = 49_700;
 
 #[test]
@@ -868,11 +875,19 @@ fun realistic_decimals_book_ask_below_min_size_aborts() {
 // `price <= floor(10^exponent * scale * 10^quote_dec / 10^base_dec) =
 // floor(10^18 * 1 * 10 / 1) = 10^19` -- `initial_last_price = 10` (the
 // minimum) is used below.
+//
+// `dmax = 10^19` here is itself right at the edge of `u64::MAX`
+// (~1.8446744e19), so this test uses `min_size = 1` rather than the shared
+// `min_size()` (100): the minimum payment to reach `dmax` is `ceil(dmax *
+// min_size / price_scale)`, and at `min_size() == 100` that would be
+// `10^21`, which would trip `EMinSizeExceedsReachableRange` and mask the
+// `scale_lo == scale_hi` boundary this test means to exercise. At
+// `min_size == 1` it is `10^19`, comfortably under `u64::MAX`.
 #[test]
 fun price_range_infeasibility_boundary_scale_lo_equals_scale_hi_accepts() {
     let mut scenario = ts::begin(admin());
     let wrapper_uid = object::new(scenario.ctx());
-    let (book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 1, 0, 18, 10, &wrapper_uid, scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 0, 1, 0, 18, 10, &wrapper_uid, scenario.ctx());
     assert!(book.price_scale() == 1, 0);
     destroy_book_and_cap(book, cap);
     wrapper_uid.delete();
@@ -884,3 +899,47 @@ fun price_range_infeasibility_boundary_scale_lo_equals_scale_hi_accepts() {
 // `new`'s `enclosing_object_id` parameter is now mandatory on the single
 // remaining constructor, so there is no second construction path left to
 // compare against.
+
+// --- `EMinSizeExceedsReachableRange`: min_size vs. declared price range ---
+//
+// base_decimals=6, quote_decimals=18, precision=0, exponent=5:
+//   pow_base=10^6, pow_quote=10^18, pow_prec=1, pow_exp=10^5
+//   scale_lo = ceil(10^6 * 1 / 10^18) = 1
+//   scale_hi = floor(u64::MAX * 10^6 / (10^18 * 10^5)) = floor(u64::MAX / 10^17) = 184
+//   scale_lo (1) <= scale_hi (184) -> feasible; price_scale = 1.
+//
+//   dmax = floor(pow_exp * price_scale * pow_quote / pow_base)
+//        = floor(10^5 * 1 * 10^18 / 10^6) = 10^17
+//
+// With min_size = 1_000, the smallest payment that could ever reach dmax is:
+//   ceil(dmax * min_size / price_scale) = ceil(10^17 * 1_000 / 1) = 10^20
+// which exceeds u64::MAX (~1.8446744e19) by roughly 5x -- the declared
+// maximum price could never be reached by any order, no matter its payment,
+// so construction must abort with `EMinSizeExceedsReachableRange` instead of
+// silently producing an unreachable top of range.
+#[test]
+#[expected_failure(abort_code = 34, location = tiny_clob)] // EMinSizeExceedsReachableRange
+fun min_size_too_large_for_declared_max_price_aborts() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(1_000, 6, 18, 0, 5, 1_000_000_000_000, &wrapper_uid, scenario.ctx());
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}
+
+// Positive control for the above: identical decimals/precision/exponent (so
+// the same price_scale = 1 and dmax = 10^17 apply), but with a much smaller
+// min_size = 1. The smallest payment needed to reach dmax is then
+// ceil(10^17 * 1 / 1) = 10^17, comfortably under u64::MAX (~1.8446744e19),
+// so construction must succeed cleanly instead of aborting.
+#[test]
+fun min_size_feasible_for_declared_max_price_succeeds() {
+    let mut scenario = ts::begin(admin());
+    let wrapper_uid = object::new(scenario.ctx());
+    let (book, cap) = tiny_clob::new<BTC, USDC>(1, 6, 18, 0, 5, 1_000_000_000_000, &wrapper_uid, scenario.ctx());
+    assert!(book.price_scale() == 1, 0);
+    destroy_book_and_cap(book, cap);
+    wrapper_uid.delete();
+    scenario.end();
+}

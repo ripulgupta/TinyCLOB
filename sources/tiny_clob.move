@@ -103,6 +103,22 @@ const EEnclosingIsSelf: u64 = 32;
 /// burn to the zero address.
 const EInvalidOwner: u64 = 33;
 
+/// `min_size` is the smallest order size `new` will ever allow (see
+/// `EZeroMinSize`/`EMinSizeTooLarge`), and for any fixed order size, reaching
+/// a higher declared price always requires at least as much payment as
+/// reaching a lower one — which is why the minimum size (`min_size`)
+/// combined with the maximum price (`10^exponent`) is exactly where the
+/// least-forgiving, minimum-required payment occurs. So the payment needed
+/// to reach the book's declared maximum price (`10^exponent`, the same ceiling
+/// `assert_price_in_declared_range` enforces on every order via
+/// `EPriceAboveDeclaredMax`) at the smallest allowed size is the *least*
+/// payment ever required anywhere near the top of the declared range. A
+/// `Coin`'s value can never exceed `u64::MAX`, so if even that minimum
+/// payment overflows `u64::MAX`, the top of the declared range can never
+/// actually be reached by any order, ever — a silent, undetectable-until-
+/// someone-tries construction defect. `new` catches this immediately instead.
+const EMinSizeExceedsReachableRange: u64 = 34;
+
 /// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
 /// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
 /// consumed by its own fee (see `fee_amount`'s doc comment, and the project's
@@ -510,7 +526,13 @@ fun assert_price_in_declared_range(
 /// `10^exponent` must still fit within a `u64` raw price at that
 /// `price_scale` (a feasibility bound, `scale_hi`), and construction
 /// aborts with `EPriceRangeInfeasible` if no valid `price_scale` exists for
-/// the declared inputs. `initial_last_price` seeds the book's `last_price`
+/// the declared inputs. `min_size` is additionally checked for joint
+/// feasibility with the declared price range: construction aborts with
+/// `EMinSizeExceedsReachableRange` if the declared maximum price could never
+/// be reached by any order, because even the smallest allowed order size
+/// (`min_size`) priced at that maximum would require a payment exceeding
+/// `u64::MAX` (see `EMinSizeExceedsReachableRange`'s doc comment).
+/// `initial_last_price` seeds the book's `last_price`
 /// (see `set_last_price`), the reference point an optional
 /// `price_band_factor` bounds every placed order's `price` against; it must
 /// be nonzero and must itself decode to a true price within the declared
@@ -547,8 +569,18 @@ public fun new<Base, Quote>(
     assert!(scale_lo <= scale_hi && scale_lo <= u64_max, EPriceRangeInfeasible);
     let price_scale = scale_lo as u64;
 
+    // dmax, computed identically to assert_price_in_declared_range's own
+    // upper-bound formula -- this must be the literal value that will later
+    // be enforced as every order's price ceiling, not an approximation.
+    let dmax_u256 = (pow_exp * (price_scale as u256) * pow_quote) / pow_base;
+    // Smallest payment that could ever reach dmax, at the smallest allowed
+    // order size (min_size) -- ceiling division, since we need the smallest
+    // integer payment sufficient to reach at least dmax.
+    let min_payment_for_dmax = (dmax_u256 * (min_size as u256) + (price_scale as u256) - 1) / (price_scale as u256);
+
     assert!(initial_last_price != 0, EZeroPrice);
     assert_price_in_declared_range(initial_last_price, price_scale, base_decimals, quote_decimals, precision, exponent);
+    assert!(min_payment_for_dmax <= u64_max, EMinSizeExceedsReachableRange);
 
     let book_uid = object::new(ctx);
     let cap = ClobAdminCap { id: object::new(ctx) };
