@@ -33,10 +33,13 @@ const ADMIN: address = @0xA11CE;
 
 // === PriceLevel/Order test helpers (for `insert_or_append_order`) ===
 
-/// A minimal, fully self-contained resting order (no escrow) — the escrow
-/// legs are irrelevant to `price_tree`'s bookkeeping, so both are `none`.
+/// A minimal, fully self-contained resting order — the escrow legs are
+/// irrelevant to `price_tree`'s bookkeeping, so `escrow_base` is populated
+/// with a zero-valued balance (ask-side-shaped) rather than real value.
+/// `order::new` asserts exactly one of `escrow_base`/`escrow_quote` is
+/// populated (finding I-01), so it can no longer be `none` on both sides.
 fun mock_order(order_id: u64): Order<BTC, USDC> {
-    order::new<BTC, USDC>(order_id, ADMIN, 1, option::none(), option::none(), 0)
+    order::new<BTC, USDC>(order_id, ADMIN, 1, option::some(balance::zero()), option::none(), 0)
 }
 
 fun setup_levels(): (ts::Scenario, PriceTree<PriceLevel<BTC, USDC>>) {
@@ -57,12 +60,13 @@ fun destroy_level(mut level: PriceLevel<BTC, USDC>) {
     while (!level.level_is_empty()) {
         let (_id, order) = level.level_pop_front_order();
         let (escrow_base, escrow_quote, fee_reserve_base, fee_reserve_quote) = order.destroy();
-        escrow_base.destroy_none();
+        escrow_base.destroy_some().destroy_zero();
         escrow_quote.destroy_none();
-        // `mock_order` constructs orders with both escrow legs `none()`, so
-        // `order::new` treats them as ask-side (`fee_reserve_quote` — see
-        // its doc comment); `fee_reserve_base` is therefore always `none()`
-        // and `fee_reserve_quote` is always a zero-valued `Some`.
+        // `mock_order` constructs orders with only `escrow_base` populated
+        // (zero-valued), so `order::new` treats them as ask-side
+        // (`fee_reserve_quote` — see its doc comment); `fee_reserve_base` is
+        // therefore always `none()` and `fee_reserve_quote` is always a
+        // zero-valued `Some`.
         fee_reserve_base.destroy_none();
         fee_reserve_quote.destroy_some().destroy_zero();
     };

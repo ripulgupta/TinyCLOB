@@ -1203,6 +1203,13 @@ maker fee is actually paid in).
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 
+The table above enumerates `tiny_clob.move`'s own error constants only.
+Move error constants are module-private, so `order.move` defines its own
+tiny, separate namespace: `EEscrowMustBeExclusive` (0), which fires from
+`order::new` when `escrow_base`/`escrow_quote` are not exactly one `Some`
+one `None` (the invariant `new`'s doc comment already claimed but nothing
+enforced -- see finding I-01).
+
 ## 15. Border cases — consolidated list
 
 - `price == 0` is rejected everywhere it is checked (`EZeroPrice`): at

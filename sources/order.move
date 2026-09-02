@@ -24,6 +24,13 @@ module tiny_clob::order;
 
 use sui::balance::{Self, Balance};
 
+/// Fires when `new` is called with `escrow_base` and `escrow_quote` either
+/// both `Some` or both `None`, instead of exactly one populated. `new`'s
+/// doc comment claims every real call site populates exactly one of the
+/// two; this assert enforces that claim structurally rather than trusting
+/// caller discipline.
+const EEscrowMustBeExclusive: u64 = 0;
+
 public struct Order<phantom Base, phantom Quote> has store {
     order_id: u64,
     owner: address,
@@ -142,6 +149,9 @@ public(package) fun new<Base, Quote>(
     escrow_quote: Option<Balance<Quote>>,
     maker_fee_bps: u64,
 ): Order<Base, Quote> {
+    // Structural enforcement of the doc comment above: exactly one of
+    // `escrow_base`/`escrow_quote` must be populated, never both or neither.
+    assert!(escrow_base.is_some() != escrow_quote.is_some(), EEscrowMustBeExclusive);
     let total_reserved = if (escrow_quote.is_some()) {
         escrow_quote.borrow().value()
     } else {
