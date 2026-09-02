@@ -134,8 +134,8 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     // quote_cost=11 net of its own dust fee of 1) + 10 (fill 2's net-of-fee
     // quote_cost(10) - fee(1) = 9, plus the 1-unit slack folded in at
     // conclusion) = 20, not 19 (which is what over-collecting the naive
-    // per-fill sum would have left). `push_proceeds` now requires a
-    // retiring book.
+    // per-fill sum would have left). The retire call below is a harmless
+    // no-op setup step, not a requirement of push_proceeds itself.
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     scenario.next_tx(other());
@@ -274,8 +274,8 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
 
     // The 20 units of Quote proceeds pooled by the two fills (10 each, net
     // of their own per-fill dust fee) are untouched by the force-cancel and
-    // remain separately claimable. `push_proceeds` now requires a retiring
-    // book.
+    // remain separately claimable. The retire call below is a harmless
+    // no-op setup step, not a requirement of push_proceeds itself.
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
     scenario.next_tx(other());

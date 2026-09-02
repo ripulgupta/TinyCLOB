@@ -554,8 +554,9 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
     matched_quote.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 0);
 
-    // First push_proceeds: genuinely claims the pooled credit.
-    // `push_proceeds` now requires a retiring book.
+    // First push_proceeds: genuinely claims the pooled credit. The retire
+    // call below is a harmless no-op setup step, not a requirement of
+    // push_proceeds itself.
     scenario.next_tx(admin());
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());

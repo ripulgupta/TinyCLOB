@@ -305,8 +305,8 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     // here from other()'s transaction context (the cap authorizes the call
     // regardless of tx sender) — the payout still lands on admin(), the
     // address recorded as owner against this order_id at credit time, never
-    // on the caller or the cap holder. `push_proceeds` now requires a
-    // retiring book.
+    // on the caller or the cap holder. The retire call below is a harmless
+    // no-op setup step, not a requirement of push_proceeds itself.
     scenario.next_tx(other());
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
@@ -329,15 +329,14 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     scenario.end();
 }
 
-// `push_proceeds` is a retirement/drain-sequence tool, same as
-// `drain_proceeds` -- it must never be usable to sweep a maker's pooled
-// proceeds out from under `claim_proceeds` on a live, non-retiring book.
 // Mirrors `push_proceeds_matches_claim_proceeds_and_pays_recorded_owner`
 // above up through creating a genuine, nonzero pooled balance, but never
-// calls `clob_admin_retire`.
+// calls `clob_admin_retire`. `push_proceeds` is now an unconditional
+// admin-gated rescue path, parallel to `clob_admin_cancel_order` -- it must
+// succeed on a live, non-retiring book, paying the recorded owner, exactly
+// as it would after retirement.
 #[test]
-#[expected_failure(abort_code = 6, location = tiny_clob)] // tiny_clob::ENotRetiring
-fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_aborts() {
+fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_succeeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -352,10 +351,24 @@ fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_aborts() {
     matched_quote.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 0);
 
-    // `book.retiring` is still false here -- must abort, not silently sweep
-    // the pooled proceeds an admin has no business touching outside the
-    // retirement sequence.
+    // `book.retiring` is still false here -- push_proceeds must still
+    // succeed and pay out to the recorded owner (admin()), same as it would
+    // on a retiring book.
     cap.push_proceeds(&mut book, order_id, scenario.ctx());
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 1, 1);
+    let (_ev_book_id, _ev_enclosing_id, ev_claimant, ev_base, ev_quote) =
+        claimed_events[0].proceeds_claimed_fields_for_testing();
+    assert!(ev_claimant == admin(), 2);
+    assert!(ev_base == default_size(), 3);
+    assert!(ev_quote == 0, 4);
+    assert!(!book.proceeds_contains_for_testing(order_id), 5);
+
+    scenario.next_tx(admin());
+    let payout = scenario.take_from_address<coin::Coin<BTC>>(admin());
+    assert!(payout.value() == default_size(), 6);
+    payout.burn_for_testing();
 
     unit_test::destroy(book);
     unit_test::destroy(cap);
@@ -1698,8 +1711,8 @@ fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_cancel() {
 
     // The pooled entry is now gone: a subsequent push_proceeds pays nobody
     // (claim_maker_balance returns zero balances for a missing entry, so no
-    // transfer and no event fire). `push_proceeds` now requires a retiring
-    // book.
+    // transfer and no event fire). The retire call below is a harmless
+    // no-op setup step, not a requirement of push_proceeds itself.
     assert!(!book.proceeds_contains_for_testing(order_id), 10);
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, order_id, scenario.ctx());

@@ -1417,8 +1417,8 @@ fun push_proceeds_with_no_pooled_entry_is_silent_noop() {
     let (mut book, cap) = new_book(&mut scenario);
 
     // No order has ever been filled/credited on this book, so `order_id = 1`
-    // has no pooled proceeds entry whatsoever. `push_proceeds` now requires a
-    // retiring book.
+    // has no pooled proceeds entry whatsoever. The retire call below is a
+    // harmless no-op setup step, not a requirement of push_proceeds itself.
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, 1, scenario.ctx());
 

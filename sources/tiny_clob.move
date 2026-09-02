@@ -2256,24 +2256,23 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 /// does) therefore has no answer once the book is genuinely gone — this
 /// function exists specifically to dispose of a ticket in that situation.
 ///
-/// Calling it while the referenced book is still alive is safe for the
-/// order's escrow, but not unconditionally safe for its pooled proceeds.
-/// A ticket has never been the *only* path back to escrow:
-/// `clob_admin_cancel_order` force-cancels a still-resting order using
-/// just `(side, price, order_id)` — all public via `OrderPlaced` — with no
-/// ticket needed, live book or not. Pooled proceeds are different:
-/// `push_proceeds` and `clob_admin_drain_step` both require
-/// `book.retiring`, so on a still-live (non-retiring) book neither can
-/// reach an order's pooled proceeds by `order_id` alone. Destroying a
-/// ticket for an order with real pooled proceeds still attached, while the
-/// book is still live, strands those proceeds until the admin retires the
-/// book — a one-way, book-destroying step, not a quick fix. Calling this
-/// function only ever gives up the ticket holder's own convenient
-/// self-service path (`cancel_order`/`claim_proceeds`/
+/// Calling it while the referenced book is still alive is safe for both
+/// the order's escrow and its pooled proceeds, because a ticket has never
+/// been the *only* path back to either. `clob_admin_cancel_order`
+/// force-cancels a still-resting order using just `(side, price, order_id)`
+/// — all public via `OrderPlaced` — with no ticket needed, live book or
+/// not. Pooled proceeds are reachable the same admin-gated way: unlike
+/// `clob_admin_drain_step` (which still requires `book.retiring`),
+/// `push_proceeds` is unconditional on a live book, gated only on the
+/// `ClobAdminCap`, so an admin can always reach an order's pooled proceeds
+/// by `order_id` alone, retiring or not. Destroying a ticket for an order
+/// with real pooled proceeds still attached, while the book is still live,
+/// therefore no longer strands anything — the admin can recover them
+/// immediately via `push_proceeds`, with no need to retire the book first.
+/// Calling this function only ever gives up the ticket holder's own
+/// convenient self-service path (`cancel_order`/`claim_proceeds`/
 /// `destroy_orphaned_ticket`); it never strands anything the book's
-/// admin-gated recovery paths can *currently* reach — but for pooled
-/// proceeds on a live book, that admin-gated path (`push_proceeds`) isn't
-/// reachable yet. And if the book has already been finalized, `clob_admin_finalize`'s
+/// admin-gated recovery paths can reach. And if the book has already been finalized, `clob_admin_finalize`'s
 /// own precondition (zero resting orders, zero pooled proceeds) guarantees
 /// nothing of value was ever left attached to any ticket for it in the
 /// first place -- fee-accumulator funds are unrelated to any individual
@@ -3135,12 +3134,27 @@ public fun claim_proceeds<Base, Quote>(
 /// is always whatever `owner` was recorded against `order_id` in the
 /// proceeds ledger at credit time (see `credit_maker_table`), so even the
 /// admin can only trigger payout to the legitimately recorded owner and can
-/// never redirect funds elsewhere. Only usable as part of the retirement/
-/// drain sequence, same as `drain_proceeds` — requires `book.retiring`, so a
-/// live book's makers can only reach their pooled proceeds through
-/// `claim_proceeds` themselves. An integrator that needs to confirm ahead of
-/// time where this payout will go can check `proceeds_owner`/
-/// `proceeds_owner_by_ticket`.
+/// never redirect funds elsewhere.
+///
+/// Unconditional — gated only on `book`'s version and `cap`, exactly like
+/// `clob_admin_cancel_order`, with no `book.retiring` requirement of its
+/// own. This is deliberate: `clob_admin_cancel_order` already gives the
+/// admin an unconditional rescue path for a still-resting order's escrow
+/// using nothing but `(side, price, order_id)`, no `OrderTicket` needed.
+/// Pooled proceeds deserve the same rescue path, because a ticket can be
+/// destroyed with no checks at all via `destroy_ticket_unconditionally`
+/// (which doesn't even take an `&OrderBook`) while real proceeds are still
+/// pooled against that order's `order_id` — if `push_proceeds` required
+/// `book.retiring`, those proceeds would be stranded on a live book until
+/// the admin performed the one-way, book-destroying retirement sequence
+/// just to reach them. Making this function unconditional closes that gap,
+/// and simply brings it in line with `clob_admin_cancel_order`, which was
+/// already unconditional. This reopens no new risk: the already-accepted
+/// risk of paying a recorded owner that has drifted from the ticket's true
+/// current holder (because `update_resting_order` was never called on a
+/// custody change) is the exact same risk `clob_admin_cancel_order` already
+/// carries today. An integrator that needs to confirm ahead of time where
+/// this payout will go can check `proceeds_owner`/`proceeds_owner_by_ticket`.
 public fun push_proceeds<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
@@ -3149,7 +3163,6 @@ public fun push_proceeds<Base, Quote>(
 ) {
     assert_book_version(book);
     assert_clob_admin(cap, book);
-    assert!(book.retiring, ENotRetiring);
     let ids = book.book_ids();
     let (owner, base, quote) = claim_maker_balance(book, order_id);
     let base_amount = base.value();

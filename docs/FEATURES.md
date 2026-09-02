@@ -555,11 +555,15 @@ called (fully filled and drained, `cancel_order`ed, force-cancelled via
 pooled, unclaimed proceeds entry for its order id is still resynced to
 `new_owner`. The pooled amount is then payable either via `claim_proceeds`
 through the order's own `OrderTicket` (paying the ticket holder/caller
-regardless of the recorded owner — see `claim_proceeds` above), or, once
-the book is retiring, via `push_proceeds` or the internal `drain_proceeds`
-reached through `clob_admin_drain_step` (paying whichever owner was last
-synced, by either this function or the original placement) — whichever
-happens first.
+regardless of the recorded owner — see `claim_proceeds` above), or via the
+admin-gated `push_proceeds` (live book or retiring, unconditionally) or the
+internal `drain_proceeds` reached through `clob_admin_drain_step` (retiring
+only) (paying whichever owner was last synced, by either this function or
+the original placement) — whichever happens first. Because `push_proceeds`
+is unconditional on a live book, the admin can call it at any time to pay
+out an order's pooled proceeds to the recorded owner, including pre-empting
+a ticket holder who has not yet gotten around to calling `claim_proceeds`
+themselves — it is not limited to the retirement/drain sequence.
 
 Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
 whenever the order is found and reassigned — including when `new_owner`
@@ -613,21 +617,21 @@ at all — the only ticket-disposal function that doesn't take one. Always
 succeeds. This is the only disposal path available once the ticket's book
 has already been deleted via `clob_admin_finalize`, since nothing can ever
 prove a deleted book's non-existence to `destroy_orphaned_ticket`'s
-liveness check again. On a still-live book, its safety is qualified by
-which recovery path the ticket's order still needs: escrow on a
-still-resting order is fine, since `clob_admin_cancel_order` reaches it by
-`(side, price, order_id)` alone, no ticket required. Pooled proceeds are a
-different story — `push_proceeds` and `clob_admin_drain_step` both require
-`book.retiring`, so on a live (non-retiring) book neither can reach an
-order's pooled proceeds by `order_id` alone the way `clob_admin_cancel_order`
-reaches escrow. Discarding a ticket for an order with real pooled proceeds
-still attached, while the book is still live, strands those proceeds until
-the admin retires the book — a one-way, book-destroying step, not a quick
-fix. Calling this on an order with no pooled proceeds attached (or once the
-book is already retiring) only ever gives up the ticket holder's own
-convenient self-service disposal path, never the underlying funds.
+liveness check again. On a still-live book, it is safe for both the
+escrow and the pooled proceeds of the ticket's order, because a ticket has
+never been the *only* path back to either: escrow on a still-resting order
+is reachable via `clob_admin_cancel_order` by `(side, price, order_id)`
+alone, no ticket required, and pooled proceeds are reachable the same
+admin-gated way via `push_proceeds`, which (unlike `clob_admin_drain_step`,
+which still requires `book.retiring`) is unconditional on a live book,
+gated only on the `ClobAdminCap`. Discarding a ticket for an order with
+real pooled proceeds still attached, while the book is still live, no
+longer strands anything — the admin can recover them immediately via
+`push_proceeds`, with no need to retire the book first. Calling this
+function only ever gives up the ticket holder's own convenient self-service
+disposal path, never the underlying funds.
 
-## 8. Proceeds — admin retirement payout path
+## 8. Proceeds — admin payout path
 
 ```
 public fun push_proceeds<Base, Quote>(
@@ -644,12 +648,18 @@ order id, so even the admin cannot redirect funds elsewhere. A no-op (no
 event, no transfer) if there is nothing to pay out. Emits `ProceedsClaimed
 { book_id, enclosing_object_id, claimant: owner, base_amount, quote_amount }` when nonzero.
 
-Aborts with `ENotRetiring` (6) unless the book is retiring. This is **not**
-a general live-book rescue path — it is only usable as part of the
-retirement/drain sequence, same as the private `drain_proceeds` helper
-`clob_admin_drain_step` uses internally. On a live (non-retiring) book, a
-maker can only reach their own pooled proceeds through `claim_proceeds`.
-An integrator that needs to confirm ahead of time where this payout will
+Unconditional — gated only on the book's version and `cap`, exactly like
+`clob_admin_cancel_order`, with no `book.retiring` requirement of its own
+(unlike the private `drain_proceeds` helper `clob_admin_drain_step` uses
+internally, which is still only reachable once the book is retiring). This
+is a live-book rescue path, deliberately parallel to
+`clob_admin_cancel_order`'s unconditional escrow rescue: it exists because
+a ticket can be destroyed with no checks at all via
+`destroy_ticket_unconditionally` (which takes no `OrderBook` at all) while
+real proceeds are still pooled against that order's `order_id` — without
+this, those proceeds would be stranded on a live book until the admin ran
+the one-way, book-destroying retirement sequence just to reach them. An
+integrator that needs to confirm ahead of time where this payout will
 go can check `proceeds_owner`/`proceeds_owner_by_ticket` (§12).
 
 ## 9. Admin controls
@@ -769,9 +779,9 @@ which trues up its maker-fee reserve and folds any superadditive slack into
 the escrow refunded here. Does not touch or pay out that order's
 already-pooled proceeds (if any) — those remain claimable separately via
 the order's `OrderTicket`, if the caller who placed it still holds one, or
-payable via `push_proceeds` once the book is retiring (`push_proceeds`
-requires `book.retiring`; on a still-live book, pooled proceeds stay
-pooled until then).
+payable at any time, live book or retiring, via the admin-gated
+`push_proceeds` (§8), which is unconditional in the same way this function
+is.
 
 ### Price band and last-price reset
 
@@ -1178,11 +1188,13 @@ maker fee is actually paid in).
   (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
   while `clob_admin_cancel_order` deliberately does not — it refunds only the
   escrow principal, leaving pooled proceeds recoverable afterward via
-  `claim_proceeds` (through the order's `OrderTicket`, on a live book) or,
-  once the book is retiring, via `push_proceeds` or the internal
-  `drain_proceeds` reached through `clob_admin_drain_step`. `push_proceeds`
-  is not a live-book path — it aborts with `ENotRetiring` unless
-  `book.retiring`.
+  `claim_proceeds` (through the order's `OrderTicket`), the admin-gated
+  `push_proceeds` (live book or retiring, unconditionally), or, once the
+  book is retiring, the internal `drain_proceeds` reached through
+  `clob_admin_drain_step`. `push_proceeds` IS a live-book path — unlike
+  `clob_admin_drain_step`, it carries no `book.retiring` requirement of its
+  own, gated only on the book's version and the `ClobAdminCap`, exactly
+  like `clob_admin_cancel_order`.
 - `push_proceeds`'s payout destination is always the recorded `owner` for
   that order id, never caller-suppliable, even by the admin.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has

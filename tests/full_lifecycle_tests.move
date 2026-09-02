@@ -225,8 +225,9 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
 
     // --- Admin-push bid1's pooled proceeds: pays the REASSIGNED owner ---
     // --- (maker_c()), not the original resting owner (maker_b()).    ---
-    // `push_proceeds` now requires a retiring book; retiring here early is
-    // harmless since none of the remaining steps place new orders.
+    // Retiring here isn't required by push_proceeds itself; it's done early
+    // to set up the drain_step/finalize sequence below, and is harmless
+    // since none of the remaining steps place new orders.
     cap.clob_admin_retire(&mut book);
     cap.push_proceeds(&mut book, bid1_order_id, scenario.ctx());
     scenario.next_tx(maker_c());
@@ -245,8 +246,8 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     // --- Drain (across two calls, proving the incremental-drain story), ---
     // --- then finalize. Only bid2 (maker_c(), untouched) remains. This  ---
     // --- retire call is a harmless no-op repeat -- the book is already  ---
-    // --- retiring from the earlier retire above (needed to unblock the  ---
-    // --- push_proceeds call). ---
+    // --- retiring from the earlier retire above (done there to set up   ---
+    // --- this drain/finalize sequence).                                 ---
     cap.clob_admin_retire(&mut book);
     cap.clob_admin_drain_step(&mut book, 0, scenario.ctx()); // no-op
     assert!(book.bids_size_for_testing() == 1, 46);
