@@ -271,11 +271,42 @@ relocated to any declared-range value in a single transaction, by any
 caller, at no cost beyond gas. This can cause subsequent
 `place_limit_order_bid`/`_ask` calls at the actual market price to abort
 with `EPriceBelowBand`/`EPriceAboveBand` until `last_price` is corrected
-again. Correcting it is equally permissionless, equally low-cost, and can
-be combined with a caller's own order-placement call in a single
-transaction. `set_last_price` never reads or writes any escrow, fee, or
+again. `set_last_price` never reads or writes any escrow, fee, or
 proceeds state, so this has no effect on funds already resting on the book
 or already claimable.
+
+For a simple, ratchet-only griefing round — where no resting order is left
+behind — correcting `last_price` is equally permissionless, equally
+low-cost, and can be combined with a caller's own order-placement call in a
+single transaction: `set_last_price`'s own best-bid/best-ask bound (§5's
+abort table) is unconstrained on an empty book, so any value in range is
+accepted.
+
+This is **not** true in general, however. A griefer can additionally leave
+one `min_size` resting order (a "pin") priced just outside the band around
+the walked `last_price`. Once that pin is resting as the best bid or best
+ask, `set_last_price` itself becomes bounded by
+`EResetPriceBelowBestBid`/`EResetPriceAboveBestAsk` against the pin — no
+value of `new_last_price` can repair the band, since the pin is, by
+construction, priced outside the range any repair could reach. In that
+state, no `set_last_price` call can fix things; the actual escape hatch is
+a **market order** (`place_market_order_bid`/`_ask`) taken against the pin.
+Market orders carry no price-band check at all (§4), and since the pin is
+by construction mispriced relative to fair value — that is what makes it
+function as a pin — consuming it via a market order is profitable for
+whoever does so, including the blocked caller. Removing the pin lifts the
+best-bid/best-ask bound, so `set_last_price` can then repair `last_price`
+to a sane value and normal limit-order placement resumes, all of which can
+be bundled into the blocked caller's own PTB (market order to consume the
+pin, `set_last_price` to a sane value, then the originally intended limit
+order).
+
+This does mean a naive integrator that only ever places limit orders — a
+simple wallet, bot, or keeper unaware of this escape hatch — will just see
+its transactions fail, with no in-protocol signal pointing it toward a
+market order as the fix. That is a discoverability gap, not a fund-safety
+one: no funds already resting on the book or already claimable are put at
+risk by any of this.
 
 ## 6. Order placement
 

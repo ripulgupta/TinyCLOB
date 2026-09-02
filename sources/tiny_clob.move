@@ -1127,12 +1127,34 @@ public struct LastPriceSet has copy, drop {
 /// true price starts aborting on `EPriceBelowBand`/`EPriceAboveBand`. This
 /// is pure griefing, not a fund-loss vector — `last_price` is never read by
 /// any escrow, fee, or proceeds computation, and `cancel_order`/
-/// `clob_admin_cancel_order` are never gated by it — and recovery is just
-/// as cheap and permissionless as the griefing call: any caller can bundle
-/// their own corrective `set_last_price` with their order placement in one
-/// atomic PTB and always succeed. Integrators relying on `price_band_factor`
-/// as protection against a determined, motivated griefer (rather than
-/// purely a fat-finger guard) should account for this.
+/// `clob_admin_cancel_order` are never gated by it.
+///
+/// Recovery from a simple, ratchet-only griefing round (no resting orders
+/// left behind) is just as cheap and permissionless as the griefing call
+/// itself: any caller can bundle their own corrective `set_last_price` with
+/// their order placement in one atomic PTB, and it succeeds, because
+/// `set_last_price`'s own spread-bound check above is unconstrained on an
+/// empty book. This is not true in general, though. A griefer can also
+/// leave one `min_size` resting order (a "pin") priced just outside the
+/// band around the walked `last_price`. Once that pin is resting as the
+/// best bid or best ask, `set_last_price` becomes bounded by
+/// `EResetPriceBelowBestBid`/`EResetPriceAboveBestAsk` against the pin
+/// itself — no value of `new_last_price` can repair the band, since the pin
+/// is, by construction, outside the range any repair could reach. In that
+/// state the actual escape hatch is not another `set_last_price` call but a
+/// market order (`place_market_order_bid`/`_ask`) taken against the pin:
+/// market orders carry no price-band check at all, and since the pin is by
+/// construction mispriced relative to fair value, consuming it is
+/// profitable for whoever does so — including the blocked caller — and
+/// removes the obstruction, after which `set_last_price` can repair
+/// `last_price` and normal limit-order placement resumes, all in one PTB.
+/// This does mean a naive integrator that only ever places limit orders —
+/// a simple wallet, bot, or keeper with no awareness of this escape hatch —
+/// will just see its transactions fail with no in-protocol signal pointing
+/// it toward a market order as the fix; that is a discoverability gap, not
+/// a fund-safety one. Integrators relying on `price_band_factor` as
+/// protection against a determined, motivated griefer (rather than purely
+/// a fat-finger guard) should account for both cases above.
 ///
 /// Since this is permissionless, the emitted `LastPriceSet` event carries
 /// `setter: ctx.sender()` so off-chain indexers can distinguish an
