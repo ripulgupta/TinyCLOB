@@ -1311,7 +1311,7 @@ fun cancel_order_rejects_wrong_cap() {
     let (book2, cap2) = new_book(&mut scenario);
     // book1 has no such resting order at all — the cap check must fire
     // before the (side, price, order_id) lookup is ever attempted.
-    cap2.clob_admin_cancel_order(&mut book1, true, 1, 1, scenario.ctx());
+    cap2.admin_redeem_ticket(&mut book1, true, 1, 1, scenario.ctx());
     unit_test::destroy(book1);
     unit_test::destroy(_cap1);
     destroy_book_and_cap(book2, cap2);
@@ -1348,7 +1348,7 @@ fun retire_rejects_wrong_cap() {
     scenario.end();
 }
 
-// --- `clob_admin_cancel_order` and `push_proceeds` are both documented as
+// --- `admin_redeem_ticket`'s order-cancellation and proceeds-sweep halves are both documented as
 // --- silent no-ops when the given key doesn't correspond to any actual
 // --- entry (a nonexistent resting order for the former, a pooled-proceeds
 // --- entry that was never credited for the latter): no abort, and no
@@ -1362,7 +1362,7 @@ fun cancel_order_on_nonexistent_order_is_silent_noop() {
 
     // Freshly-constructed, empty book: no resting orders exist at all, so
     // this (side, price, order_id) triple cannot match anything.
-    cap.clob_admin_cancel_order(&mut book, true, default_price(), 1, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), 1, scenario.ctx());
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 0, 0);
@@ -1400,7 +1400,7 @@ fun cancel_order_on_nonexistent_order_id_at_live_price_level_is_silent_noop() {
 
     // 9999 is neither `order_id_a` nor `order_id_b`, but `default_price()`
     // is a genuine, live price level.
-    cap.clob_admin_cancel_order(&mut book, true, default_price(), 9999, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), 9999, scenario.ctx());
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 0, 3);
@@ -1420,18 +1420,21 @@ fun cancel_order_on_nonexistent_order_id_at_live_price_level_is_silent_noop() {
 }
 
 #[test]
-fun push_proceeds_with_no_pooled_entry_is_silent_noop() {
+fun admin_redeem_ticket_with_no_pooled_entry_is_silent_noop() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
     // No order has ever been filled/credited on this book, so `order_id = 1`
-    // has no pooled proceeds entry whatsoever. The retire call below is a
-    // harmless no-op setup step, not a requirement of push_proceeds itself.
+    // has no pooled proceeds entry whatsoever, nor any resting order at
+    // `(true, default_price(), 1)`. The retire call below is a harmless
+    // no-op setup step, not a requirement of admin_redeem_ticket itself.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, 1, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), 1, scenario.ctx());
 
     let claimed_events = event::events_by_type<ProceedsClaimed>();
     assert!(claimed_events.length() == 0, 0);
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled_events.length() == 0, 1);
 
     destroy_book_and_cap(book, cap);
     scenario.end();

@@ -815,7 +815,7 @@ fun force_cancel_refunds_owner_not_caller() {
     let order = order::new<BTC, USDC>(order_id, other(), size, option::none(), option::some(escrow), 0);
     book.insert_resting_order_for_testing(true, price, order, scenario.ctx());
 
-    cap.clob_admin_cancel_order(&mut book, true, price, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, price, order_id, scenario.ctx());
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 1, 0);
@@ -840,7 +840,7 @@ fun force_cancel_refunds_owner_not_caller() {
 /// cancels B via the real owner-driven `cancel_order` entry point (using
 /// `new_ticket_for_testing` to mint a ticket for the order seeded through
 /// `insert_resting_order_for_testing`, since that seeding path returns no
-/// ticket of its own) -- this is chosen over `clob_admin_cancel_order`
+/// ticket of its own) -- this is chosen over `admin_redeem_ticket`
 /// because it is the actual public path an ordinary trader uses, and
 /// `force_cancel_refunds_owner_not_caller` above already covers the admin
 /// path once (for head-removal). Confirms: B's escrow (200 base, its full

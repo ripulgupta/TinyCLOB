@@ -276,12 +276,12 @@ fun claim_proceeds_pays_out_and_emits_proceedsclaimed() {
 }
 
 #[test]
-fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
+fun admin_redeem_ticket_matches_claim_proceeds_and_pays_recorded_owner() {
     let mut scenario = ts::begin(admin());
     // Constructed with a deliberately foreign `enclosing_object_id` (same
     // idiom as `claim_proceeds_pays_out_and_emits_proceedsclaimed` above) so
     // this test can assert BOTH `ProceedsClaimed` id fields independently on
-    // the `push_proceeds` emit site too.
+    // the `admin_redeem_ticket` emit site too.
     let wrapper_uid = object::new(scenario.ctx());
     let foreign_id = wrapper_uid.uid_to_inner();
     let (mut book, cap) = tiny_clob::new<BTC, USDC>(min_size(), 0, 0, 0, 17, 1, &wrapper_uid, scenario.ctx());
@@ -301,15 +301,18 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
 
-    // push_proceeds takes the book's ClobAdminCap plus the order_id: called
-    // here from other()'s transaction context (the cap authorizes the call
-    // regardless of tx sender) — the payout still lands on admin(), the
-    // address recorded as owner against this order_id at credit time, never
-    // on the caller or the cap holder. The retire call below is a harmless
-    // no-op setup step, not a requirement of push_proceeds itself.
+    // admin_redeem_ticket takes the book's ClobAdminCap plus (side, price,
+    // order_id): called here from other()'s transaction context (the cap
+    // authorizes the call regardless of tx sender) — the proceeds payout
+    // still lands on admin(), the address recorded as owner against this
+    // order_id at credit time, never on the caller or the cap holder. The
+    // bid is already fully filled (see comment above), so the
+    // cancellation half is a no-op here. The retire call below is a
+    // harmless no-op setup step, not a requirement of admin_redeem_ticket
+    // itself.
     scenario.next_tx(other());
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 0);
@@ -329,14 +332,13 @@ fun push_proceeds_matches_claim_proceeds_and_pays_recorded_owner() {
     scenario.end();
 }
 
-// Mirrors `push_proceeds_matches_claim_proceeds_and_pays_recorded_owner`
+// Mirrors `admin_redeem_ticket_matches_claim_proceeds_and_pays_recorded_owner`
 // above up through creating a genuine, nonzero pooled balance, but never
-// calls `clob_admin_retire`. `push_proceeds` is now an unconditional
-// admin-gated rescue path, parallel to `clob_admin_cancel_order` -- it must
-// succeed on a live, non-retiring book, paying the recorded owner, exactly
-// as it would after retirement.
+// calls `clob_admin_retire`. `admin_redeem_ticket` is an unconditional
+// admin-gated rescue path -- it must succeed on a live, non-retiring book,
+// paying the recorded owner, exactly as it would after retirement.
 #[test]
-fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_succeeds() {
+fun admin_redeem_ticket_on_live_non_retiring_book_with_real_pooled_balance_succeeds() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -351,10 +353,11 @@ fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_succeeds() 
     matched_quote.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 0);
 
-    // `book.retiring` is still false here -- push_proceeds must still
+    // `book.retiring` is still false here -- admin_redeem_ticket must still
     // succeed and pay out to the recorded owner (admin()), same as it would
-    // on a retiring book.
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    // on a retiring book. The bid is already fully filled, so the
+    // cancellation half is a no-op here.
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 1);
@@ -372,6 +375,111 @@ fun push_proceeds_on_live_non_retiring_book_with_real_pooled_balance_succeeds() 
 
     unit_test::destroy(book);
     unit_test::destroy(cap);
+    scenario.end();
+}
+
+// === `EProceedsCoordinateMismatch` ===
+
+// The exact original defect scenario: a bid is partially filled, creating
+// BOTH a still-resting remainder (real Quote escrow locked) AND a pooled
+// proceeds entry recording this order's true `(side, price)` coordinates.
+// Calling `admin_redeem_ticket` with the CORRECT side but a WRONG price must
+// abort before either half takes effect -- otherwise the cancellation half
+// would silently find nothing at the wrong price (no-op) while the proceeds
+// half still swept the pooled Base credit, reproducing the repeatable-
+// exposure risk this function exists to close.
+#[test]
+#[expected_failure(abort_code = 35, location = tiny_clob)] // EProceedsCoordinateMismatch
+fun admin_redeem_ticket_wrong_price_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let size = 300;
+    let fill_size = 100;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    let side = bid_ticket.ticket_side();
+    let price = bid_ticket.ticket_price();
+    unit_test::destroy(bid_ticket);
+
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
+    );
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // Correct side, deliberately wrong price.
+    scenario.next_tx(admin());
+    cap.admin_redeem_ticket(&mut book, side, price + 1, order_id, scenario.ctx());
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// Same defect scenario as `admin_redeem_ticket_wrong_price_aborts` above, but
+// with the correct price and a WRONG side instead.
+#[test]
+#[expected_failure(abort_code = 35, location = tiny_clob)] // EProceedsCoordinateMismatch
+fun admin_redeem_ticket_wrong_side_aborts() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let size = 300;
+    let fill_size = 100;
+    let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    let side = bid_ticket.ticket_side();
+    let price = bid_ticket.ticket_price();
+    unit_test::destroy(bid_ticket);
+
+    scenario.next_tx(taker());
+    let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
+    let (leftover_payment, matched_quote, _) = book.place_market_order_ask(ask_payment, 1_000_000_000, 0, fill_size, scenario.ctx(),
+    );
+    leftover_payment.burn_for_testing();
+    matched_quote.burn_for_testing();
+    assert!(book.proceeds_contains_for_testing(order_id), 0);
+
+    // Correct price, deliberately wrong side (this is a bid, so `side` here
+    // is `true`; pass `false` instead).
+    scenario.next_tx(admin());
+    cap.admin_redeem_ticket(&mut book, !side, price, order_id, scenario.ctx());
+
+    destroy_book_and_cap(book, cap);
+    scenario.end();
+}
+
+// When `order_id` has no pooled proceeds entry at all (never filled, or
+// already fully swept), the `EProceedsCoordinateMismatch` presence check is
+// skipped entirely -- so a caller-supplied `(side, price)` that doesn't
+// match anything real must NOT cause a spurious abort. Here the resting bid
+// never fills, so it never accrues a proceeds entry in the first place; the
+// mismatched `price + 1` passed below only matters for the cancellation
+// half's own lookup (which simply won't find the order, a pre-existing
+// no-op, not a new failure mode).
+#[test]
+fun admin_redeem_ticket_no_pooled_proceeds_does_not_abort_regardless_of_coordinates() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = new_book(&mut scenario);
+
+    let bid_ticket = rest_bid(&mut book, default_price(), default_size(), 1_000_000_000, scenario.ctx());
+    let order_id = bid_ticket.ticket_order_id();
+    unit_test::destroy(bid_ticket);
+    assert!(!book.proceeds_contains_for_testing(order_id), 0);
+
+    // Deliberately mismatched (side, price) relative to the order's actual
+    // resting coordinates -- must not abort, since no pooled proceeds entry
+    // exists to check coordinates against.
+    cap.admin_redeem_ticket(&mut book, false, default_price() + 1, order_id, scenario.ctx());
+
+    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
+    assert!(claimed_events.length() == 0, 1);
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled_events.length() == 0, 2);
+
+    destroy_book_and_cap(book, cap);
     scenario.end();
 }
 
@@ -400,15 +508,16 @@ fun update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push() {
 
     // The proceeds ledger entry is now keyed by order_id, not address, so
     // its existence alone doesn't prove which address it pays out to.
-    // push_proceeds pays whatever address was recorded as `owner` at credit
-    // time (which is the order's live `owner` field at match time, i.e.
-    // other() after reassignment) — proving the owner field was actually
-    // overwritten, not just the ticket's own bookkeeping. Called here with
-    // taker() as the tx sender (authorized via the book's cap, not the
-    // sender) — the payout still lands on other().
+    // admin_redeem_ticket pays whatever address was recorded as `owner` at
+    // credit time (which is the order's live `owner` field at match time,
+    // i.e. other() after reassignment) — proving the owner field was
+    // actually overwritten, not just the ticket's own bookkeeping. Called
+    // here with taker() as the tx sender (authorized via the book's cap,
+    // not the sender) — the payout still lands on other(). The bid is
+    // already fully filled, so the cancellation half is a no-op here.
     assert!(book.proceeds_contains_for_testing(order_id), 1);
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
     let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
@@ -460,12 +569,14 @@ fun update_resting_order_reassignment_straddled_by_fills_credits_new_owner_only(
     leftover_2.burn_for_testing();
     matched_quote_2.burn_for_testing();
 
-    // push_proceeds must pay out to other() — the order's CURRENT owner as
-    // of the most recent credit — not admin(), the address that created the
-    // ledger entry on the first fill. The pooled amount covers both fills.
+    // admin_redeem_ticket must pay out to other() — the order's CURRENT
+    // owner as of the most recent credit — not admin(), the address that
+    // created the ledger entry on the first fill. The pooled amount covers
+    // both fills. The bid is already fully filled (100 + 100 == size), so
+    // the cancellation half is a no-op here.
     scenario.next_tx(taker());
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
     let (_, _, ev_claimant, ev_base, ev_quote) =
@@ -519,12 +630,13 @@ fun update_resting_order_not_found_is_a_noop() {
     matched_quote.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 2);
 
-    // push_proceeds (called here with taker() as tx sender, authorized via the
-    // book's cap) pays whoever is recorded as owner for this order_id —
-    // still admin(), proving the failed reassignment attempts above never
-    // touched the real order.
+    // admin_redeem_ticket (called here with taker() as tx sender, authorized
+    // via the book's cap) pays whoever is recorded as owner for this
+    // order_id — still admin(), proving the failed reassignment attempts
+    // above never touched the real order. The bid is already fully filled,
+    // so the cancellation half is a no-op here.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 3);
     let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
@@ -536,7 +648,7 @@ fun update_resting_order_not_found_is_a_noop() {
 
 #[test]
 #[expected_failure(abort_code = 4, location = tiny_clob)] // tiny_clob::EWrongClobAdminCap
-fun push_proceeds_rejects_wrong_cap() {
+fun admin_redeem_ticket_rejects_wrong_cap() {
     let mut scenario = ts::begin(admin());
     let (mut book1, _cap1) = new_book(&mut scenario);
     let (book2, cap2) = new_book(&mut scenario);
@@ -551,7 +663,7 @@ fun push_proceeds_rejects_wrong_cap() {
     leftover_payment.burn_for_testing();
     matched_quote.burn_for_testing();
 
-    cap2.push_proceeds(&mut book1, order_id, scenario.ctx());
+    cap2.admin_redeem_ticket(&mut book1, true, default_price(), order_id, scenario.ctx());
 
     unit_test::destroy(book1);
     unit_test::destroy(_cap1);
@@ -581,7 +693,7 @@ fun update_resting_order_rejects_ticket_from_wrong_book() {
 // `new_owner == @0x0` must be rejected outright: it would otherwise silently
 // arm a burn on every subsequent recorded-address payout path for this
 // order (escrow refunds via a later force-cancel/drain, pooled proceeds
-// sweeps via `push_proceeds`/`drain_proceeds`).
+// sweeps via `admin_redeem_ticket`/`drain_proceeds`).
 #[test]
 #[expected_failure(abort_code = 33, location = tiny_clob)] // tiny_clob::EInvalidOwner
 fun update_resting_order_rejects_zero_address_new_owner() {
@@ -986,12 +1098,12 @@ fun destroy_ticket_unconditionally_disposes_with_real_escrow_and_proceeds_still_
     bid_ticket.destroy_ticket_unconditionally();
 
     // Neither leg is stranded: the admin can still force-cancel the
-    // still-resting remainder's escrow, and still push out the pooled
-    // proceeds, using only (side, price, order_id) -- no ticket needed.
+    // still-resting remainder's escrow AND sweep the pooled proceeds, in one
+    // single admin_redeem_ticket call, using only (side, price, order_id) --
+    // no ticket needed.
     scenario.next_tx(admin());
-    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, side, price, order_id, scenario.ctx());
 
     let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(cancelled_events.length() == 1, 1);
@@ -1208,7 +1320,7 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
     // order first, then confirm the now-stale ticket disposes cleanly.
     let side2 = returned_ticket2.ticket_side();
     let price2 = returned_ticket2.ticket_price();
-    cap.clob_admin_cancel_order(&mut book, side2, price2, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, side2, price2, order_id, scenario.ctx());
     book.destroy_orphaned_ticket(returned_ticket2); // must NOT abort
 
     destroy_book_and_cap(book, cap);
@@ -1218,7 +1330,7 @@ fun claim_proceeds_still_resting_returns_claimable_ticket_for_reuse() {
 // === Fix 3: `update_resting_order` syncs pooled proceeds owner ===
 
 #[test]
-fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_push() {
+fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_admin_redeem() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -1245,8 +1357,12 @@ fun update_resting_order_reassign_then_no_fill_syncs_proceeds_owner_on_push() {
     assert!(found, 1);
     unit_test::destroy(bid_ticket);
 
+    // The remaining 100 units are still resting, so admin_redeem_ticket's
+    // cancellation half also fires here alongside the proceeds sweep this
+    // test cares about -- that escrow refund also goes to other(), the
+    // synced owner, but this test only asserts the ProceedsClaimed side.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
     let (_, _, ev_claimant, ev_base, ev_quote) =
@@ -1332,7 +1448,7 @@ fun update_resting_order_reassign_with_no_pooled_proceeds_yet_then_fill_credits_
     matched_quote.burn_for_testing();
 
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
     let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
@@ -1384,8 +1500,12 @@ fun update_resting_order_reassign_chain_pays_only_final_owner_with_no_leakage() 
     assert!(book.update_resting_order(&mut bid_ticket, maker_a()), 1); // B -> C
     unit_test::destroy(bid_ticket);
 
+    // 200 of the original 400 units are still resting at this point, so
+    // admin_redeem_ticket's cancellation half also force-cancels that
+    // remainder here (refunding its escrow to maker_a(), the final synced
+    // owner) alongside the proceeds sweep this test cares about.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
 
     // Event-field-shape assertions carried over from the merged-away
     // `update_resting_order_reassigned_twice_final_payout_goes_to_latest_
@@ -1443,9 +1563,14 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
     unit_test::destroy(ticket_hi);
     unit_test::destroy(ticket_lo);
 
+    // The lo order still has 100 units resting at this point (200 - 100
+    // matched above), so admin_redeem_ticket's cancellation half also
+    // force-cancels that remainder here, refunding its escrow to other() (the
+    // synced owner) alongside the proceeds sweep. The hi order is already
+    // fully filled/concluded, so its cancellation half is a no-op.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id_lo, scenario.ctx());
-    cap.push_proceeds(&mut book, order_id_hi, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id_lo, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, price_hi, order_id_hi, scenario.ctx());
 
     scenario.next_tx(other());
     let payout_other = scenario.take_from_address<coin::Coin<BTC>>(other());
@@ -1465,7 +1590,7 @@ fun update_resting_order_reassign_does_not_touch_other_orders_proceeds() {
 // `clob_admin_pause_book` blocks placement/market entry points only (see
 // its doc comment in `sources/tiny_clob.move`) — it must never block
 // `cancel_order`, `claim_proceeds`, `update_resting_order`,
-// `set_last_price`, or `clob_admin_cancel_order`. None of the five checks
+// `set_last_price`, or `admin_redeem_ticket`. None of the five checks
 // `is_paused` at all (confirmed by inspection: the `EBookPaused` guard only
 // appears in the placement/market-order functions), but this was never
 // exercised end-to-end against an actually-paused book. This test pauses a
@@ -1480,7 +1605,7 @@ fun pause_never_blocks_cancel_claim_update_or_admin_recovery_paths() {
     // below: `proceeds_ticket` is partially filled first (while unpaused) to
     // pool real proceeds for `claim_proceeds`; `update_ticket` is reassigned
     // via `update_resting_order`; `admin_cancel_order_id` is force-cancelled
-    // via `clob_admin_cancel_order`; `cancel_ticket` is self-cancelled via
+    // via `admin_redeem_ticket`; `cancel_ticket` is self-cancelled via
     // `cancel_order`.
     let proceeds_size = 200;
     let proceeds_fill_size = 100;
@@ -1533,9 +1658,9 @@ fun pause_never_blocks_cancel_claim_update_or_admin_recovery_paths() {
     assert!(found, 2);
     unit_test::destroy(update_ticket);
 
-    // (3) `clob_admin_cancel_order` still succeeds while paused: force-cancels
+    // (3) `admin_redeem_ticket` still succeeds while paused: force-cancels
     // a resting order and refunds its escrow to the original owner (admin()).
-    cap.clob_admin_cancel_order(&mut book, admin_cancel_side, admin_cancel_price, admin_cancel_order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, admin_cancel_side, admin_cancel_price, admin_cancel_order_id, scenario.ctx());
     let admin_cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
     assert!(admin_cancelled_events.length() == 1, 3);
     scenario.next_tx(admin());
@@ -1575,128 +1700,101 @@ fun pause_never_blocks_cancel_claim_update_or_admin_recovery_paths() {
 // unconditionally, regardless of whether the order it targets is still
 // resting — this is documented on `update_resting_order`'s own doc comment
 // in `sources/tiny_clob.move`. Even once an order has concluded (fully
-// filled, `cancel_order`, `clob_admin_cancel_order`, or
+// filled, `cancel_order`, `admin_redeem_ticket`, or
 // `clob_admin_drain_step`) but still has a pooled, unclaimed proceeds entry,
 // a further `update_resting_order` call still returns `false` (the resting
 // order itself genuinely isn't found), but the pooled entry's recorded
 // `owner` IS resynced to the new target regardless. The pooled amount is
 // never stranded or misdirected either way: it remains fully claimable via
-// `push_proceeds`/`drain_proceeds` (pays the last-recorded `owner`) or via
-// `claim_proceeds` through the `OrderTicket` (pays whoever holds the ticket,
-// regardless of the recorded `owner`). These tests confirm both payout
-// paths and, most importantly (the fourth test below), that ticket
+// `admin_redeem_ticket`/`drain_proceeds` (pays the last-recorded `owner`) or
+// via `claim_proceeds` through the `OrderTicket` (pays whoever holds the
+// ticket, regardless of the recorded `owner`). These tests confirm both
+// payout paths and, most importantly (the last test below), that ticket
 // possession is the actual claim authority even with no force-cancellation
 // involved at all — the recorded `owner` field is merely what
-// `push_proceeds`/`drain_proceeds` happen to pay, not a capability in
+// `admin_redeem_ticket`/`drain_proceeds` happen to pay, not a capability in
 // itself.
+//
+// A former test here, `update_resting_order_after_force_cancel_still_syncs_
+// pooled_proceeds_owner`, covered this same "resting-order-half reports
+// not-found, but the proceeds sync still runs unconditionally" claim via a
+// still-resting-then-force-cancelled order. It is gone now, not merely
+// renamed: `admin_redeem_ticket` (the sole remaining force-cancel path)
+// always also sweeps any pooled proceeds for the same order_id in the same
+// call, so a force-cancelled order can no longer be left with proceeds
+// "surviving untouched" for a later reassignment/push to act on -- the
+// exact setup that test depended on. The "not-found via force-cancel"
+// variant added no coverage over "not-found via full-fill" for this
+// purpose (the resting-order tree lookup that both `update_resting_order`
+// and `claim_proceeds` perform doesn't distinguish why an order is gone),
+// which `update_resting_order_after_full_fill_still_syncs_pooled_proceeds_
+// owner` below already covers, so it is retired as a now-impossible-to-run,
+// fully-subsumed scenario rather than reworked to no purpose.
 
 #[test]
-fun update_resting_order_after_force_cancel_still_syncs_pooled_proceeds_owner() {
-    let mut scenario = ts::begin(admin());
-    let (mut book, cap) = new_book(&mut scenario);
-
-    // maker_a() rests an ask big enough to be partially filled, leaving it
-    // still resting, and pooling proceeds (Quote) under maker_a().
-    let size = 200;
-    let fill_size = 100;
-    scenario.next_tx(maker_a());
-    let mut ask_ticket = rest_ask(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
-    let order_id = ask_ticket.ticket_order_id();
-    let side = ask_ticket.ticket_side();
-    let price = ask_ticket.ticket_price();
-
-    scenario.next_tx(taker());
-    let budget = book.bid_escrow_amount(default_price(), fill_size);
-    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, _) =
-        book.place_market_order_bid(bid_payment, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
-    matched_base.burn_for_testing();
-    leftover_payment.burn_for_testing();
-    assert!(book.proceeds_contains_for_testing(order_id), 0);
-
-    // Reassign to maker_b() while still resting — sync succeeds, proceeds
-    // now recorded under maker_b().
-    scenario.next_tx(maker_a());
-    assert!(book.update_resting_order(&mut ask_ticket, maker_b()), 1);
-
-    // Force-cancel the still-resting remainder: the order is gone from the
-    // book, but the pooled proceeds entry survives untouched.
-    scenario.next_tx(admin());
-    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
-    assert!(book.proceeds_contains_for_testing(order_id), 2);
-
-    // A further reassignment attempt correctly reports not-found for the
-    // resting-order half (the order is no longer resting) -- but the pooled
-    // proceeds sync still runs unconditionally, so it DOES retarget the
-    // pooled entry to maker_c() despite that `false`.
-    assert!(!book.update_resting_order(&mut ask_ticket, maker_c()), 3);
-    unit_test::destroy(ask_ticket);
-
-    // push_proceeds pays maker_c() -- the target of this last reassignment
-    // -- not maker_b(), proving the sync ran even though the call reported
-    // the resting order itself as not-found.
-    cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
-    let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
-    assert!(claimed_events.length() == 1, 4);
-    let (_, _, ev_claimant, ev_base, ev_quote) =
-        claimed_events[0].proceeds_claimed_fields_for_testing();
-    assert!(ev_claimant == maker_c(), 5);
-    assert!(ev_base == 0, 6);
-    assert!(ev_quote == budget, 7);
-    assert!(!book.proceeds_contains_for_testing(order_id), 8);
-
-    destroy_book_and_cap(book, cap);
-    scenario.end();
-}
-
-#[test]
-fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_cancel() {
+fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_full_fill() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
     let book_id = book.book_id();
 
-    // Same setup as above through the force-cancel step: maker_a() rests an
-    // ask, a partial fill pools proceeds under maker_a(), a still-resting
-    // reassignment syncs them to maker_b(), then the remainder is
-    // force-cancelled — leaving a pooled entry recorded against maker_b().
-    // This test never calls `update_resting_order` again, so it's
-    // unaffected by that function's unconditional-sync behavior; it goes
-    // straight to `claim_proceeds` via the ticket instead.
+    // maker_a() rests an ask, a partial fill pools proceeds under maker_a(),
+    // a still-resting reassignment syncs them to maker_b(), then a second
+    // fill fully drains the remainder — leaving a pooled entry recorded
+    // against maker_b() with no resting order behind it anymore. This test
+    // never calls `update_resting_order` again, so it's unaffected by that
+    // function's unconditional-sync behavior; it goes straight to
+    // `claim_proceeds` via the ticket instead.
+    //
+    // Formerly this used a force-cancel to conclude the order instead of a
+    // second fill (see the retired
+    // `claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_
+    // cancel` above) -- but `admin_redeem_ticket` (the only remaining
+    // force-cancel path) now always also sweeps pooled proceeds in the same
+    // call, so a force-cancel can no longer conclude an order while leaving
+    // its proceeds pooled and untouched for this test to act on afterward.
+    // A full-fill conclusion reaches the identical "concluded order, pooled
+    // proceeds recorded against a reassigned owner" state without that
+    // conflict, and `claim_proceeds`'s resting-order lookup doesn't
+    // distinguish why an order is gone, so no coverage is lost.
     let size = 200;
     let fill_size = 100;
     scenario.next_tx(maker_a());
     let mut ask_ticket = rest_ask(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
     let order_id = ask_ticket.ticket_order_id();
-    let side = ask_ticket.ticket_side();
-    let price = ask_ticket.ticket_price();
 
     scenario.next_tx(taker());
     let budget = book.bid_escrow_amount(default_price(), fill_size);
-    let bid_payment = coin::mint_for_testing<USDC>(budget, scenario.ctx());
-    let (matched_base, leftover_payment, _) =
-        book.place_market_order_bid(bid_payment, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
-    matched_base.burn_for_testing();
-    leftover_payment.burn_for_testing();
+    let bid_payment_1 = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base_1, leftover_payment_1, _) =
+        book.place_market_order_bid(bid_payment_1, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
+    matched_base_1.burn_for_testing();
+    leftover_payment_1.burn_for_testing();
 
     scenario.next_tx(maker_a());
     assert!(book.update_resting_order(&mut ask_ticket, maker_b()), 0);
 
-    scenario.next_tx(admin());
-    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+    // Second fill for the remaining 100 units fully drains the ask, removing
+    // it from the book -- crediting the SAME order_id's pooled entry again,
+    // this time under the already-synced owner, maker_b().
+    scenario.next_tx(taker());
+    let bid_payment_2 = coin::mint_for_testing<USDC>(budget, scenario.ctx());
+    let (matched_base_2, leftover_payment_2, _) =
+        book.place_market_order_bid(bid_payment_2, 1_000_000_000, 0, fill_size, u64_max(), scenario.ctx());
+    matched_base_2.burn_for_testing();
+    leftover_payment_2.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 1);
 
     // An unrelated address holding the ticket claims via claim_proceeds —
     // it, not maker_b() (the recorded owner), receives the full pooled
-    // amount. Ticket possession, not the recorded owner field, is what
-    // actually authorizes payout via this path.
+    // amount (both fills' worth). Ticket possession, not the recorded owner
+    // field, is what actually authorizes payout via this path.
     scenario.next_tx(other());
     let (claim_base, claim_quote, returned_ticket_opt) =
         book.claim_proceeds(ask_ticket, scenario.ctx());
     assert!(claim_base.burn_for_testing() == 0, 2);
-    assert!(claim_quote.burn_for_testing() == budget, 3);
-    // The order is no longer resting (force-cancelled above), so the ticket
-    // is auto-destroyed and nothing more can ever be claimed through it.
+    assert!(claim_quote.burn_for_testing() == budget + budget, 3);
+    // The order is no longer resting (fully filled above), so the ticket is
+    // auto-destroyed and nothing more can ever be claimed through it.
     assert!(returned_ticket_opt.is_none(), 4);
     returned_ticket_opt.destroy_none();
 
@@ -1707,15 +1805,17 @@ fun claim_proceeds_via_ticket_pays_caller_not_stale_owner_after_force_cancel() {
     assert!(ev_claimant == other(), 6);
     assert!(ev_book_id == book_id, 7);
     assert!(ev_base == 0, 8);
-    assert!(ev_quote == budget, 9);
+    assert!(ev_quote == budget + budget, 9);
 
-    // The pooled entry is now gone: a subsequent push_proceeds pays nobody
-    // (claim_maker_balance returns zero balances for a missing entry, so no
-    // transfer and no event fire). The retire call below is a harmless
-    // no-op setup step, not a requirement of push_proceeds itself.
+    // The pooled entry is now gone: a subsequent admin_redeem_ticket pays
+    // nobody (claim_maker_balance returns zero balances for a missing
+    // entry, and there is no resting order at this order_id either, so no
+    // transfer and no event fires on either half). The retire call below is
+    // a harmless no-op setup step, not a requirement of admin_redeem_ticket
+    // itself.
     assert!(!book.proceeds_contains_for_testing(order_id), 10);
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, false, default_price(), order_id, scenario.ctx());
     assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 1, 11);
 
     destroy_book_and_cap(book, cap);
@@ -1813,7 +1913,7 @@ fun update_resting_order_after_full_fill_still_syncs_pooled_proceeds_owner() {
 
     // ...but the pooled proceeds ARE retargeted to `other()` regardless.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
     let (_, _, ev_claimant, _, _) = claimed_events[0].proceeds_claimed_fields_for_testing();
@@ -1828,7 +1928,7 @@ fun update_resting_order_after_full_fill_still_syncs_pooled_proceeds_owner() {
 // `resting_order_owner`/`resting_order_owner_by_ticket` and
 // `proceeds_owner`/`proceeds_owner_by_ticket` are so far only exercised in
 // isolation (escrow_value_queries_tests.move), checked against a known
-// address but never against what `drain_side`/`push_proceeds` actually pay
+// address but never against what `drain_side`/`admin_redeem_ticket` actually pay
 // in the SAME test. This closes that gap end-to-end: predict via the
 // getters first, then drain/push and confirm the real payout lands exactly
 // where predicted.
@@ -1913,7 +2013,7 @@ fun resting_order_owner_predicts_stale_payout_when_update_resting_order_is_skipp
     unit_test::destroy(bid_ticket);
 
     scenario.next_tx(admin());
-    cap.clob_admin_cancel_order(&mut book, side, price, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, side, price, order_id, scenario.ctx());
 
     // The force-cancel pays exactly the address the getter predicted --
     // maker_a(), the last address recorded on-chain -- and nothing at all

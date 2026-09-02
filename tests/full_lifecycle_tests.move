@@ -223,13 +223,16 @@ fun full_lifecycle_realistic_btc_usdc_decimals() {
     assert!(ask1_cancel_base.burn_for_testing() == 156, 40); // unfilled remainder refunded
     assert!(ask1_cancel_quote.burn_for_testing() == 0, 41);
 
-    // --- Admin-push bid1's pooled proceeds: pays the REASSIGNED owner ---
-    // --- (maker_c()), not the original resting owner (maker_b()).    ---
-    // Retiring here isn't required by push_proceeds itself; it's done early
-    // to set up the drain_step/finalize sequence below, and is harmless
-    // since none of the remaining steps place new orders.
+    // --- Admin-redeem bid1's pooled proceeds: pays the REASSIGNED owner ---
+    // --- (maker_c()), not the original resting owner (maker_b()). bid1 ---
+    // --- is already fully filled/drained by this point (see assert 24  ---
+    // --- above), so admin_redeem_ticket's cancellation half is a no-op ---
+    // --- here; only the proceeds-sweep half fires.                    ---
+    // Retiring here isn't required by admin_redeem_ticket itself; it's done
+    // early to set up the drain_step/finalize sequence below, and is
+    // harmless since none of the remaining steps place new orders.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, bid1_order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, bid1_price, bid1_order_id, scenario.ctx());
     scenario.next_tx(maker_c());
     let bid1_payout = ts::take_from_address<coin::Coin<BTC>>(&scenario, maker_c());
     assert!(bid1_payout.value() == 214 + 187, 42); // both pre- and post-reassignment fills

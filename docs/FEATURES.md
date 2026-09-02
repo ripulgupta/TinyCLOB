@@ -73,7 +73,7 @@ submitted. It is never re-checked against the size of a resulting
 fill or a partial-fill remainder, so a partial fill can leave a resting
 order's remaining size below `min_size`. Such a remainder persists on the
 book until it is cancelled by its ticket holder, fully consumed by a later
-fill, or removed by `clob_admin_cancel_order`/`clob_admin_drain_step`.
+fill, or removed by `admin_redeem_ticket`/`clob_admin_drain_step`.
 
 Integrators/deployers should ensure `min_size * price / price_scale` (the
 Quote value of the smallest permitted fill) stays well above 1 atom of the
@@ -594,19 +594,21 @@ address of the order's currently-pooled unclaimed proceeds (if any) to
 and any credited afterward, and runs whether or not the order is found
 still resting: even if the order has already concluded by the time this is
 called (fully filled and drained, `cancel_order`ed, force-cancelled via
-`clob_admin_cancel_order`, or removed by `clob_admin_drain_step`), any
+`admin_redeem_ticket`, or removed by `clob_admin_drain_step`), any
 pooled, unclaimed proceeds entry for its order id is still resynced to
 `new_owner`. The pooled amount is then payable either via `claim_proceeds`
 through the order's own `OrderTicket` (paying the ticket holder/caller
 regardless of the recorded owner — see `claim_proceeds` above), or via the
-admin-gated `push_proceeds` (live book or retiring, unconditionally) or the
-internal `drain_proceeds` reached through `clob_admin_drain_step` (retiring
-only) (paying whichever owner was last synced, by either this function or
-the original placement) — whichever happens first. Because `push_proceeds`
-is unconditional on a live book, the admin can call it at any time to pay
-out an order's pooled proceeds to the recorded owner, including pre-empting
-a ticket holder who has not yet gotten around to calling `claim_proceeds`
-themselves — it is not limited to the retirement/drain sequence.
+admin-gated `admin_redeem_ticket` (§8, live book or retiring, unconditionally)
+or the internal `drain_proceeds` reached through `clob_admin_drain_step`
+(retiring only) (paying whichever owner was last synced, by either this
+function or the original placement) — whichever happens first. Because
+`admin_redeem_ticket` is unconditional on a live book, the admin can call it
+at any time to pay out an order's pooled proceeds to the recorded owner
+(force-cancelling the resting order too, if one still exists), including
+pre-empting a ticket holder who has not yet gotten around to calling
+`claim_proceeds` themselves — it is not limited to the retirement/drain
+sequence.
 
 Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
 whenever the order is found and reassigned — including when `new_owner`
@@ -662,48 +664,109 @@ has already been deleted via `clob_admin_finalize`, since nothing can ever
 prove a deleted book's non-existence to `destroy_orphaned_ticket`'s
 liveness check again. On a still-live book, it is safe for both the
 escrow and the pooled proceeds of the ticket's order, because a ticket has
-never been the *only* path back to either: escrow on a still-resting order
-is reachable via `clob_admin_cancel_order` by `(side, price, order_id)`
-alone, no ticket required, and pooled proceeds are reachable the same
-admin-gated way via `push_proceeds`, which (unlike `clob_admin_drain_step`,
-which still requires `book.retiring`) is unconditional on a live book,
-gated only on the `ClobAdminCap`. Discarding a ticket for an order with
-real pooled proceeds still attached, while the book is still live, no
-longer strands anything — the admin can recover them immediately via
-`push_proceeds`, with no need to retire the book first. Calling this
-function only ever gives up the ticket holder's own convenient self-service
-disposal path, never the underlying funds.
+never been the *only* path back to either: both are reachable via
+`admin_redeem_ticket` (§8) by `(side, price, order_id)` alone, no ticket
+required, which (unlike `clob_admin_drain_step`, which still requires
+`book.retiring`) is unconditional on a live book, gated only on the
+`ClobAdminCap`. Discarding a ticket for an order with real escrow or pooled
+proceeds still attached, while the book is still live, no longer strands
+anything — the admin can recover both immediately via `admin_redeem_ticket`,
+with no need to retire the book first. This is, in fact, that function's
+primary purpose. Calling this function only ever gives up the ticket
+holder's own convenient self-service disposal path, never the underlying
+funds.
 
-## 8. Proceeds — admin payout path
+## 8. Force-cancel and proceeds rescue — `admin_redeem_ticket`
 
 ```
-public fun push_proceeds<Base, Quote>(
+public fun admin_redeem_ticket<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
+    side: bool,
+    price: u64,
     order_id: u64,
     ctx: &mut TxContext,
 )
 ```
 
-Pays out a specific order's accumulated proceeds. The destination is never
-caller-supplied — always the `owner` address currently recorded for that
-order id, so even the admin cannot redirect funds elsewhere. A no-op (no
-event, no transfer) if there is nothing to pay out. Emits `ProceedsClaimed
-{ book_id, enclosing_object_id, claimant: owner, base_amount, quote_amount }` when nonzero.
+Combined admin-gated rescue function: force-cancels the resting order at
+`(side, price, order_id)` if one still exists, AND sweeps that same
+`order_id`'s pooled proceeds if any exist — both in one atomic call. Neither
+payout destination is ever caller-supplied: the escrow refund goes to
+whatever `owner` is recorded on the live order, and the proceeds sweep goes
+to whatever `owner` was recorded against `order_id` in the proceeds ledger at
+credit time, so even the admin cannot redirect funds elsewhere. Not gated by
+pause.
 
-Unconditional — gated only on the book's version and `cap`, exactly like
-`clob_admin_cancel_order`, with no `book.retiring` requirement of its own
-(unlike the private `drain_proceeds` helper `clob_admin_drain_step` uses
-internally, which is still only reachable once the book is retiring). This
-is a live-book rescue path, deliberately parallel to
-`clob_admin_cancel_order`'s unconditional escrow rescue: it exists because
-a ticket can be destroyed with no checks at all via
-`destroy_ticket_unconditionally` (which takes no `OrderBook` at all) while
-real proceeds are still pooled against that order's `order_id` — without
-this, those proceeds would be stranded on a live book until the admin ran
-the one-way, book-destroying retirement sequence just to reach them. An
-integrator that needs to confirm ahead of time where this payout will
-go can check `proceeds_owner`/`proceeds_owner_by_ticket` (§12).
+This used to be two separate functions, `clob_admin_cancel_order` (force-
+cancel only) and `push_proceeds` (proceeds sweep only). They are combined
+here, with order-cancellation now mandatory whenever a resting order is
+found, for two reasons. First, a standalone proceeds sweep on a still-
+resting, still-accumulating order was an unbounded, repeatable exposure:
+each new fill pools more proceeds, and each subsequent sweep would pay out
+again, for as long as the order kept resting. Folding in cancellation,
+together with an `EProceedsCoordinateMismatch` check (below) that asserts
+the caller-supplied `(side, price)` actually match the pooled proceeds
+entry's own recorded coordinates before the sweep runs, guarantees that a
+proceeds sweep through this function is only ever possible either together
+with the order's cancellation, or when the order is already definitively
+gone — matching the one-time exposure shape escrow refunds already have.
+This guarantee is specific to `admin_redeem_ticket`; `claim_proceeds` and
+the retirement-gated `drain_proceeds` remain legitimate, already-intentional
+ways to sweep a still-resting order's proceeds elsewhere in the module.
+Without that
+check, a caller could supply a mismatched `(side, price)` so the
+cancellation half silently finds nothing and no-ops while the proceeds
+half still sweeps normally against the true `order_id` — reproducing the
+exact repeatable-exposure risk this function exists to close. Second, a
+standalone proceeds sweep could silently
+pre-empt the true ticket holder's own `claim_proceeds` call on a perfectly
+healthy, still-resting order — a quiet way to skim proceeds off a live
+position. Tying the two together removes the incentive to do so quietly:
+nobody would casually force-cancel a healthy order just to skim proceeds
+off it.
+
+Neither half early-returns on the other's absence: if no resting order is
+found, the proceeds sweep still runs; if no pooled proceeds exist, the
+cancellation still runs. If neither exists, this is a silent no-op (no
+abort, no event) — matching both predecessors' existing no-op-on-not-found
+behavior. If both exist, both are settled in the same call, and events fire
+for both.
+
+Before the proceeds sweep runs, if a pooled proceeds entry exists for
+`order_id`, its recorded `(side, price)` — stamped once when the entry was
+first created and never overwritten afterward, since an order's side and
+price never change over its life — is checked against the caller-supplied
+`(side, price)`; a mismatch aborts with `EProceedsCoordinateMismatch` (35)
+before either half of the call takes effect. No check runs, and no abort is
+possible, when no pooled proceeds entry exists at all (a never-filled order,
+or one whose proceeds were already fully swept) — the caller-supplied
+`(side, price)` are then unconstrained by this check.
+
+Emits `OrderCancelled { book_id, enclosing_object_id, order_id, trader }`
+and `MakerFeeSettled` (§9's Fees section, §13) when an order was actually
+found and removed — the latter is this order's conclusion, which trues up
+its maker-fee reserve and folds any superadditive slack into the escrow
+refunded here. Emits `ProceedsClaimed { book_id, enclosing_object_id,
+claimant: owner, base_amount, quote_amount }` when a nonzero pooled proceeds
+balance was actually paid out. A single call can emit both events at once,
+unlike either predecessor.
+
+Unconditional — gated only on the book's version and `cap`, with no
+`book.retiring` requirement (unlike the private `drain_proceeds`/`drain_side`
+helpers `clob_admin_drain_step` uses internally, which are still only
+reachable once the book is retiring). The real use case for this function is
+recovering a resting order's escrow and/or its pooled proceeds when the
+`OrderTicket` that would otherwise reach them has been destroyed via
+`destroy_ticket_unconditionally` (which takes no `OrderBook` at all and
+performs zero checks — the only function that can strand a resting order or
+pooled proceeds behind a now-nonexistent ticket) while real value is still
+attached to that `order_id`. Requiring `book.retiring` here would leave that
+value stranded on a live book until the admin performed the one-way,
+book-destroying retirement sequence just to reach it. An integrator that
+needs to confirm ahead of time where either payout will go can check
+`resting_order_owner`/`resting_order_owner_by_ticket` and
+`proceeds_owner`/`proceeds_owner_by_ticket` (§12) beforehand.
 
 ## 9. Admin controls
 
@@ -716,7 +779,7 @@ public fun clob_admin_unpause_book<Base, Quote>(cap: &ClobAdminCap, book: &mut O
 
 Pausing blocks all four order-placement/market entry points
 (`EBookPaused`). It does **not** block `cancel_order`, `claim_proceeds`,
-`update_resting_order`, `set_last_price`, or `clob_admin_cancel_order` — a
+`update_resting_order`, `set_last_price`, or `admin_redeem_ticket` — a
 trader can always recover funds already at rest, and the admin can always
 force-cancel or reset the reference price, whether or not the book is
 paused. `clob_admin_unpause_book` aborts with `EBookRetiring` (18) if the
@@ -770,7 +833,7 @@ out of the maker's proceeds for that fill, but instead of crediting the
 book's fee accumulator immediately, that per-fill amount is set aside in a
 reserve private to the resting order itself. Only when the order
 *concludes* — fully filled (drained by a fill), cancelled by its own ticket
-holder (`cancel_order`), force-cancelled (`clob_admin_cancel_order`), or
+holder (`cancel_order`), force-cancelled (`admin_redeem_ticket`), or
 swept up by `clob_admin_drain_step` — is the CORRECT aggregate fee actually
 computed (from the order's own running total of fill basis across its
 entire lifetime) and transferred into the book's fee accumulator; any
@@ -800,31 +863,11 @@ only if a nonzero amount was actually claimed. Readable without withdrawing
 via `fee_accumulator_balances<Base, Quote>(book): (u64, u64)`; current rates
 readable via `fee_config<Base, Quote>(book): (u64, u64)` (taker, maker).
 
-### Force-cancel
+### Force-cancel and proceeds rescue
 
-```
-public fun clob_admin_cancel_order<Base, Quote>(
-    cap: &ClobAdminCap,
-    book: &mut OrderBook<Base, Quote>,
-    side: bool,
-    price: u64,
-    order_id: u64,
-    ctx: &mut TxContext,
-)
-```
-
-Removes a specific resting order by side/price/order id and refunds its
-escrow to its owner. A no-op (no abort, no event) if no such order exists.
-Not gated by pause. Emits `OrderCancelled { book_id, enclosing_object_id,
-order_id, trader }` and `MakerFeeSettled` (§9's Fees section, §13) only when an order
-was actually found and removed — the latter is this order's conclusion,
-which trues up its maker-fee reserve and folds any superadditive slack into
-the escrow refunded here. Does not touch or pay out that order's
-already-pooled proceeds (if any) — those remain claimable separately via
-the order's `OrderTicket`, if the caller who placed it still holds one, or
-payable at any time, live book or retiring, via the admin-gated
-`push_proceeds` (§8), which is unconditional in the same way this function
-is.
+See §8: `admin_redeem_ticket` force-cancels a resting order by
+side/price/order id, refunding its escrow to its owner, AND sweeps that same
+order id's pooled proceeds, in one call. Not gated by pause.
 
 ### Price band and last-price reset
 
@@ -860,7 +903,7 @@ Emits `OrderCancelled` **and** `MakerFeeSettled` (§13) for every resting
 order it force-cancels — the latter from the same centralized maker-fee
 true-up that runs at every order conclusion — and `ProceedsClaimed` for
 every nonzero pooled-proceeds entry it pays out (a zero-valued entry is
-skipped, matching `claim_proceeds`/`push_proceeds`'s own skip-on-zero
+skipped, matching `claim_proceeds`/`admin_redeem_ticket`'s own skip-on-zero
 convention). That is up to **two** events per drained resting order, plus
 one per nonzero proceeds entry. Sui enforces a hard cap of 1024 events
 emitted per transaction, so an admin's `max_items` choice should stay
@@ -963,9 +1006,9 @@ unchanged, with no explicit migration step required.
 | `resting_order_escrow<Base, Quote>(book, side, price, order_id): Option<RestingOrderEscrow>` | the live state of one resting order, or `None` if that price level doesn't exist or holds no such order (fully filled, cancelled, or never placed). Never aborts, for any input. |
 | `resting_order_escrow_by_ticket<Base, Quote>(book, ticket): Option<RestingOrderEscrow>` | `resting_order_escrow` for the order `ticket` was minted for. Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. |
 | `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows). `remaining_size` is ALSO denominated in Quote for a bid, Base for an ask — NOT always Base regardless of side. For a bid, `escrow` and `remaining_size` are therefore always equal (both are just the live Quote escrow value); for an ask they were already equal. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. For an ask, `escrow`/`remaining_size` can never reach `0` while still resting (draining to `0` is the same fill that stops it from resting). For a bid, under the telescoping proportional-ceiling escrow-charging scheme, `(escrow: 0, remaining_size: 0)` for a live, still-resting, still-fillable order IS a real, reachable state whenever the order's resting price is below `price_scale` — the Quote escrow can hit exactly `0` strictly before the order's Base side is exhausted. `None` (not resting at all) remains the only other state for either side. |
-| `resting_order_owner<Base, Quote>(book, side: bool, price: u64, order_id: u64): Option<address>` | the recorded `owner` address of the resting order at `(side, price, order_id)` — i.e. the address `clob_admin_cancel_order`/`clob_admin_drain_step` will pay if it is force-cancelled/drained. `None` if the order is not resting. Lets an integrator confirm ahead of time where an admin bulk-payout path will route before relying on it. |
+| `resting_order_owner<Base, Quote>(book, side: bool, price: u64, order_id: u64): Option<address>` | the recorded `owner` address of the resting order at `(side, price, order_id)` — i.e. the address `admin_redeem_ticket`/`clob_admin_drain_step` will pay if it is force-cancelled/drained. `None` if the order is not resting. Lets an integrator confirm ahead of time where an admin bulk-payout path will route before relying on it. |
 | `resting_order_owner_by_ticket<Base, Quote>(book, ticket: &OrderTicket): Option<address>` | `resting_order_owner` for the order `ticket` was minted for. Aborts with `EWrongBook` if `ticket` was not minted by `book`. |
-| `proceeds_owner<Base, Quote>(book, order_id: u64): Option<address>` | the recorded `owner` address of the pooled proceeds entry for `order_id`, if one exists — i.e. the address `push_proceeds`/the internal `drain_proceeds` (reached via `clob_admin_drain_step`) will pay out to. `None` if no pooled entry exists. Lets an integrator confirm ahead of time where `push_proceeds`/`drain_side`/`drain_proceeds` will route before relying on that admin path to pay the right address. |
+| `proceeds_owner<Base, Quote>(book, order_id: u64): Option<address>` | the recorded `owner` address of the pooled proceeds entry for `order_id`, if one exists — i.e. the address `admin_redeem_ticket`/the internal `drain_proceeds` (reached via `clob_admin_drain_step`) will pay out to. `None` if no pooled entry exists. Lets an integrator confirm ahead of time where `admin_redeem_ticket`/`drain_side`/`drain_proceeds` will route before relying on that admin path to pay the right address. |
 | `proceeds_owner_by_ticket<Base, Quote>(book, ticket: &OrderTicket): Option<address>` | `proceeds_owner` for the order `ticket` was minted for. Aborts with `EWrongBook` if `ticket` was not minted by `book`. |
 
 ## 13. Events reference
@@ -1061,7 +1104,7 @@ reserved for it if the order is filled to completion, with zero residual
 dust, no matter how many separate fills or transactions it was drained
 across. If the order is only partially filled, the sum is strictly less than
 the original reservation, and the exact difference is what `cancel_order`
-(or `clob_admin_cancel_order` / `clob_admin_drain_step`) refunds.
+(or `admin_redeem_ticket` / `clob_admin_drain_step`) refunds.
 
 `OrderExecuted` is emitted exactly once, unconditionally, as the last event
 of every call to `place_limit_order_bid` / `place_limit_order_ask` /
@@ -1145,6 +1188,7 @@ maker fee is actually paid in).
 | 32 | `EEnclosingIsSelf` |
 | 33 | `EInvalidOwner` |
 | 34 | `EMinSizeExceedsReachableRange` |
+| 35 | `EProceedsCoordinateMismatch` |
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 
@@ -1215,32 +1259,41 @@ maker fee is actually paid in).
   ticket without hitting `EProceedsNotEmpty`.
 - Pausing blocks all order-placement/market entry points but never
   `cancel_order`, `claim_proceeds`, `update_resting_order`, `set_last_price`,
-  or `clob_admin_cancel_order`.
+  or `admin_redeem_ticket`.
 - `clob_admin_unpause_book` always aborts on a retiring book; once
   `clob_admin_retire` has been called, the book can never be unpaused again.
-- `clob_admin_cancel_order` and `clob_admin_finalize`'s emptiness checks are
+- `admin_redeem_ticket` and `clob_admin_finalize`'s emptiness checks are
   independent of any pooled proceeds for the removed/remaining orders —
-  proceeds are refunded/paid separately from escrow.
+  proceeds are refunded/paid separately from escrow, though a single
+  `admin_redeem_ticket` call settles both for the same `order_id` together.
 - `update_resting_order`'s pooled-proceeds owner sync runs unconditionally,
   regardless of whether it finds the order still resting — even if the
   order has already concluded (fill-drained, `cancel_order`ed,
-  `clob_admin_cancel_order`ed, or `clob_admin_drain_step`-removed), a
+  `admin_redeem_ticket`ed, or `clob_admin_drain_step`-removed), a
   pooled, unclaimed proceeds entry for it is still resynced to `new_owner`;
   the `bool` return reflects only whether the resting order itself was
   found and reassigned. Relatedly, `cancel_order` sweeps and pays out
   any pooled proceeds as part of the same call — to the caller
   (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
-  while `clob_admin_cancel_order` deliberately does not — it refunds only the
-  escrow principal, leaving pooled proceeds recoverable afterward via
-  `claim_proceeds` (through the order's `OrderTicket`), the admin-gated
-  `push_proceeds` (live book or retiring, unconditionally), or, once the
-  book is retiring, the internal `drain_proceeds` reached through
-  `clob_admin_drain_step`. `push_proceeds` IS a live-book path — unlike
-  `clob_admin_drain_step`, it carries no `book.retiring` requirement of its
-  own, gated only on the book's version and the `ClobAdminCap`, exactly
-  like `clob_admin_cancel_order`.
-- `push_proceeds`'s payout destination is always the recorded `owner` for
-  that order id, never caller-suppliable, even by the admin.
+  while `admin_redeem_ticket` also sweeps any pooled proceeds as part of the
+  same call (alongside force-cancelling the resting order, if one exists),
+  but always to the recorded `owner`, never to the admin's own
+  `ctx.sender()`: an admin force-cancel/sweep can never redirect a maker's
+  proceeds to anyone but whoever is currently stamped as owner. Because a
+  force-cancel now always also sweeps proceeds, and the
+  `EProceedsCoordinateMismatch` check (§8) ensures a mismatched
+  caller-supplied `(side, price)` cannot make the cancel half silently
+  no-op while the sweep half still fires, a proceeds sweep via
+  `admin_redeem_ticket` is only ever possible either together with the
+  order's cancellation, or when the order is already definitively gone —
+  a one-time exposure, not a repeatable one. `admin_redeem_ticket` IS a
+  live-book path — unlike `clob_admin_drain_step`, it carries no
+  `book.retiring` requirement of its own, gated only on the book's version
+  and the `ClobAdminCap`.
+- `admin_redeem_ticket`'s proceeds-sweep payout destination is always the
+  recorded `owner` for that order id, never caller-suppliable, even by the
+  admin; likewise its escrow-refund destination is always the `owner`
+  recorded on the live order.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has
   pooled, unclaimed proceeds attached to its order id, or whose order is
   still resting on the book.

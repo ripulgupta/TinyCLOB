@@ -850,7 +850,7 @@ fun proceeds_owner_none_before_credit_some_after_and_synced_by_update_resting_or
     // Reassign ownership via update_resting_order -- this must immediately
     // resync the already-pooled proceeds entry's recorded owner, which is
     // exactly the scenario resting_order_owner/proceeds_owner exist to let
-    // an integrator verify ahead of relying on push_proceeds/drain_proceeds.
+    // an integrator verify ahead of relying on admin_redeem_ticket/drain_proceeds.
     let found = book.update_resting_order(&mut bid_ticket, other());
     assert!(found, 4);
     assert!(book.proceeds_owner(order_id).destroy_some() == other(), 5);

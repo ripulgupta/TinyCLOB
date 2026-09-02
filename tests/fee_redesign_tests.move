@@ -135,9 +135,12 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     // quote_cost(10) - fee(1) = 9, plus the 1-unit slack folded in at
     // conclusion) = 20, not 19 (which is what over-collecting the naive
     // per-fill sum would have left). The retire call below is a harmless
-    // no-op setup step, not a requirement of push_proceeds itself.
+    // no-op setup step, not a requirement of admin_redeem_ticket itself.
+    // The order is already fully filled and drained, so the
+    // order-cancellation half of admin_redeem_ticket is a no-op here; only
+    // the proceeds-sweep half fires.
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, false, REALISTIC_PRICE, order_id, scenario.ctx());
     scenario.next_tx(other());
     let payout = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
     assert!(payout.value() == 20, 10);
@@ -207,7 +210,7 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
     scenario.end();
 }
 
-/// Category (c): `clob_admin_cancel_order` -- an ask-side maker (fee
+/// Category (c): `admin_redeem_ticket` -- an ask-side maker (fee
 /// denominated in Quote), mirroring the fill-drain scenario's numbers but
 /// force-cancelled instead of drained, while still holding 1 unit
 /// unfilled. The slack refund folds into `escrow_quote`, which starts as
@@ -219,7 +222,7 @@ fun maker_fee_reserve_trues_up_on_cancel_order_with_nonzero_slack() {
 /// the two 1-unit fills' `quote_cost` (`11` each) is itself genuinely
 /// ceiling-rounded.
 #[test]
-fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
+fun maker_fee_reserve_trues_up_on_admin_redeem_ticket_with_nonzero_slack() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = realistic_decimals_book<BTC, USDC>(1, &mut scenario);
     cap.clob_admin_set_maker_fee(&mut book, MAKER_FEE_BPS);
@@ -248,7 +251,9 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
         i = i + 1;
     };
 
-    cap.clob_admin_cancel_order(&mut book, false, REALISTIC_PRICE, order_id, scenario.ctx());
+    // admin_redeem_ticket force-cancels the still-resting order AND sweeps
+    // its pooled proceeds in the same call.
+    cap.admin_redeem_ticket(&mut book, false, REALISTIC_PRICE, order_id, scenario.ctx());
 
     let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
     assert!(settled.length() == 1, 0);
@@ -261,27 +266,23 @@ fun maker_fee_reserve_trues_up_on_clob_admin_cancel_order_with_nonzero_slack() {
     assert!(fee_base_after == 0, 4);
     assert!(fee_quote_after == 1, 5);
 
-    // Force-cancel refunds only the order's own escrow legs (never touches
-    // already-pooled proceeds): 1 unmatched Base unit, and the 1-unit Quote
-    // slack (folded into what was previously an empty `escrow_quote`).
+    // Force-cancel refunds the order's own escrow legs: 1 unmatched Base
+    // unit, and the 1-unit Quote slack (folded into what was previously an
+    // empty `escrow_quote`). In the SAME call, the 20 units of Quote
+    // proceeds pooled by the two fills (10 each, net of their own per-fill
+    // dust fee) are also swept out to the recorded owner -- two separate
+    // Quote coins land at other(): take the most-recently-transferred one
+    // first (the proceeds sweep, which runs after the escrow refund).
     scenario.next_tx(other());
     let base_refund = ts::take_from_address<coin::Coin<BTC>>(&scenario, other());
     assert!(base_refund.value() == 1, 6);
     base_refund.burn_for_testing();
-    let quote_refund = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
-    assert!(quote_refund.value() == 1, 7);
-    quote_refund.burn_for_testing();
-
-    // The 20 units of Quote proceeds pooled by the two fills (10 each, net
-    // of their own per-fill dust fee) are untouched by the force-cancel and
-    // remain separately claimable. The retire call below is a harmless
-    // no-op setup step, not a requirement of push_proceeds itself.
-    cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
-    scenario.next_tx(other());
     let proceeds_payout = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
     assert!(proceeds_payout.value() == 20, 8);
     proceeds_payout.burn_for_testing();
+    let quote_refund = ts::take_from_address<coin::Coin<USDC>>(&scenario, other());
+    assert!(quote_refund.value() == 1, 7);
+    quote_refund.burn_for_testing();
 
     destroy_book_and_cap(book, cap);
     scenario.end();

@@ -119,6 +119,16 @@ const EInvalidOwner: u64 = 33;
 /// someone-tries construction defect. `new` catches this immediately instead.
 const EMinSizeExceedsReachableRange: u64 = 34;
 
+/// Fires when `admin_redeem_ticket`'s caller-supplied `(side, price)` don't
+/// match the recorded coordinates of `order_id`'s pooled proceeds entry, if
+/// one exists. Without this check, a coordinate mismatch (deliberate or
+/// accidental) would let the proceeds-sweep half of `admin_redeem_ticket`
+/// fire against `order_id` while the cancellation half silently finds
+/// nothing at the wrong `(side, price)` and no-ops -- defeating the very
+/// guarantee `admin_redeem_ticket` exists to provide: that a proceeds sweep
+/// only ever happens together with genuine order termination.
+const EProceedsCoordinateMismatch: u64 = 35;
+
 /// These caps must stay low enough that `ceil(x * bps / 10_000) < x` for
 /// every `x > 1` — i.e. a leg worth more than 1 atom must never be fully
 /// consumed by its own fee (see `fee_amount`'s doc comment, and the project's
@@ -195,6 +205,14 @@ public fun ask(): bool { false }
 /// A maker's claimable-but-unclaimed proceeds ledger entry.
 public struct MakerBalance<phantom Base, phantom Quote> has store {
     owner: address,
+    // Stamped once, only when this entry is first created in
+    // `credit_maker_table`, and never overwritten afterward: an order's
+    // side and price never change over its life. Lets `admin_redeem_ticket`
+    // verify its caller-supplied `(side, price)` actually correspond to
+    // where this pooled proceeds entry's order truly rests (or rested)
+    // before sweeping it -- see `EProceedsCoordinateMismatch`.
+    side: bool,
+    price: u64,
     base: Balance<Base>,
     quote: Balance<Quote>,
 }
@@ -209,6 +227,8 @@ fun credit_maker_table<Base, Quote>(
     proceeds: &mut LinkedTable<u64, MakerBalance<Base, Quote>>,
     order_id: u64,
     owner: address,
+    side: bool,
+    price: u64,
     base: Balance<Base>,
     quote: Balance<Quote>,
 ) {
@@ -227,7 +247,7 @@ fun credit_maker_table<Base, Quote>(
         return
     };
     if (!already_exists) {
-        proceeds.push_back(order_id, MakerBalance { owner, base: balance::zero(), quote: balance::zero() });
+        proceeds.push_back(order_id, MakerBalance { owner, side, price, base: balance::zero(), quote: balance::zero() });
     };
     let mb = proceeds.borrow_mut(order_id);
     mb.owner = owner;
@@ -254,7 +274,7 @@ fun sync_maker_balance_owner<Base, Quote>(
 fun destroy_maker_balance<Base, Quote>(
     mb: MakerBalance<Base, Quote>,
 ): (address, Balance<Base>, Balance<Quote>) {
-    let MakerBalance { owner, base, quote } = mb;
+    let MakerBalance { owner, side: _, price: _, base, quote } = mb;
     (owner, base, quote)
 }
 
@@ -912,9 +932,9 @@ public fun resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64) {
 }
 
 /// The recorded `owner` address of the resting order at `(side, price, order_id)`
-/// — i.e. the address `clob_admin_cancel_order`/`drain_side` will pay if this
+/// — i.e. the address `admin_redeem_ticket`/`drain_side` will pay if this
 /// order is force-cancelled/drained, and (once pooled) the address
-/// `drain_proceeds`/`push_proceeds` will pay for its proceeds. This is NOT
+/// `drain_proceeds`/`admin_redeem_ticket` will pay for its proceeds. This is NOT
 /// necessarily the current `OrderTicket` holder: it is whoever `ctx.sender()`
 /// was at placement time, only updated afterward by an explicit
 /// `update_resting_order` call. An integrator whose ticket custody can change
@@ -954,7 +974,7 @@ public fun resting_order_owner_by_ticket<Base, Quote>(
 }
 
 /// The recorded `owner` address of the pooled proceeds entry for `order_id`,
-/// if one exists — i.e. the address `drain_proceeds`/`push_proceeds` will pay
+/// if one exists — i.e. the address `drain_proceeds`/`admin_redeem_ticket` will pay
 /// out to. Same staleness caveat as `resting_order_owner`: this is whoever was
 /// last stamped via `credit_maker_table`/`update_resting_order`'s
 /// `sync_maker_balance_owner` call, not necessarily the current `OrderTicket`
@@ -1127,7 +1147,7 @@ public struct LastPriceSet has copy, drop {
 /// true price starts aborting on `EPriceBelowBand`/`EPriceAboveBand`. This
 /// is pure griefing, not a fund-loss vector — `last_price` is never read by
 /// any escrow, fee, or proceeds computation, and `cancel_order`/
-/// `clob_admin_cancel_order` are never gated by it.
+/// `admin_redeem_ticket` are never gated by it.
 ///
 /// Recovery from a simple, ratchet-only griefing round (no resting orders
 /// left behind) is just as cheap and permissionless as the griefing call
@@ -1229,7 +1249,63 @@ public struct OrderCancelled has copy, drop {
     trader: address,
 }
 
-public fun clob_admin_cancel_order<Base, Quote>(
+/// Admin-gated combined rescue function: force-cancels the resting order at
+/// `(side, price, order_id)` if one still exists, AND sweeps that same
+/// `order_id`'s pooled proceeds if any exist — both in one atomic call.
+/// Requires the book's `ClobAdminCap`. As defense-in-depth, neither payout
+/// destination is ever caller-supplied — the escrow refund goes to whatever
+/// `owner` is recorded on the live order, and the proceeds sweep goes to
+/// whatever `owner` was recorded against `order_id` in the proceeds ledger at
+/// credit time (see `credit_maker_table`), so even the admin can only trigger
+/// payout to the legitimately recorded owner and can never redirect funds
+/// elsewhere.
+///
+/// This used to be two separate functions, `clob_admin_cancel_order` and
+/// `push_proceeds`. They are combined here, with order-cancellation now
+/// mandatory whenever a resting order is found, for two reasons. First,
+/// a standalone proceeds-sweep on a still-resting, still-accumulating order
+/// was an unbounded, repeatable exposure: each new fill pools more proceeds,
+/// and each subsequent sweep would pay out again, for as long as the order
+/// kept resting. Folding in cancellation, together with the
+/// `EProceedsCoordinateMismatch` check below (which ensures the cancellation
+/// half is actually attempted against the order's true coordinates rather
+/// than silently no-op'ing at a mismatched `(side, price)`), guarantees that
+/// a proceeds sweep is only ever possible either together with the order's
+/// cancellation, or when the order is already definitively gone — matching
+/// the one-time exposure shape escrow refunds already have. Second, a
+/// standalone proceeds-sweep could silently pre-empt the true
+/// ticket holder's own `claim_proceeds` call on a perfectly healthy, still-
+/// resting order — a quiet way to skim proceeds off a live position. Nobody
+/// would casually force-cancel a healthy order just to skim proceeds off it,
+/// so tying the two together removes the incentive to do so quietly.
+///
+/// Neither half early-returns on the other's absence: if no resting order is
+/// found at `(side, price, order_id)`, this function still attempts the
+/// proceeds sweep; if no pooled proceeds exist, it still attempts the
+/// cancellation. If neither exists, this is a silent no-op, matching both
+/// predecessors' existing no-op-on-not-found behavior. If both exist, both
+/// are settled in the same call, and both `OrderCancelled` and
+/// `ProceedsClaimed` are emitted.
+///
+/// Unconditional — gated only on `book`'s version and `cap`, with no
+/// `book.retiring` requirement, exactly like both predecessors were. The
+/// real use case for this function is recovering a resting order's escrow
+/// and/or its pooled proceeds when the `OrderTicket` that would otherwise
+/// reach them has been destroyed via `destroy_ticket_unconditionally` —
+/// which takes no `OrderBook` reference and performs zero checks, and is
+/// the only function that can strand a resting order or pooled proceeds
+/// behind a now-nonexistent ticket — while real value is still attached to
+/// that `order_id`. Requiring `book.retiring` here would leave that value
+/// stranded on a live book until the admin performed the one-way,
+/// book-destroying retirement sequence just to reach it. This reopens no
+/// new risk beyond what each predecessor already carried on its own: the
+/// already-accepted risk of paying a recorded owner that has drifted from
+/// the ticket's true current holder (because `update_resting_order` was
+/// never called on a custody change) is unchanged. An integrator that needs
+/// to confirm ahead of time where either payout will go can check
+/// `resting_order_owner`/`resting_order_owner_by_ticket` and
+/// `proceeds_owner`/`proceeds_owner_by_ticket` beforehand.
+public fun admin_redeem_ticket<Base, Quote>(
     cap: &ClobAdminCap,
     book: &mut OrderBook<Base, Quote>,
     side: bool,
@@ -1240,26 +1316,53 @@ public fun clob_admin_cancel_order<Base, Quote>(
     assert_book_version(book);
     assert_clob_admin(cap, book);
     let ids = book.book_ids();
+
+    if (book.proceeds.contains(order_id)) {
+        let mb = book.proceeds.borrow(order_id);
+        assert!(mb.side == side && mb.price == price, EProceedsCoordinateMismatch);
+    };
+
     let tree: &mut PriceTree<PriceLevel<Base, Quote>> =
         if (side) &mut book.bids else &mut book.asks;
     let order_opt = tree.find_and_remove_order(price, order_id);
-    if (order_opt.is_none()) { order_opt.destroy_none(); return };
-    let live_order = order_opt.destroy_some();
-    let owner = live_order.owner();
-    let fee_basis = live_order.fee_basis_accumulated();
-    let mfee_bps = live_order.maker_fee_bps();
-    let (escrow_base, escrow_quote, frb, frq) = live_order.destroy();
-    let (escrow_base, escrow_quote) = fold_maker_fee_slack(
-        escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, ids, owner,
-        &mut book.fee_accumulator,
-    );
-    refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
-    event::emit(OrderCancelled {
-        book_id: ids.book_id,
-        enclosing_object_id: ids.enclosing_object_id,
-        order_id,
-        trader: owner,
-    });
+    if (order_opt.is_some()) {
+        let live_order = order_opt.destroy_some();
+        let owner = live_order.owner();
+        let fee_basis = live_order.fee_basis_accumulated();
+        let mfee_bps = live_order.maker_fee_bps();
+        let (escrow_base, escrow_quote, frb, frq) = live_order.destroy();
+        let (escrow_base, escrow_quote) = fold_maker_fee_slack(
+            escrow_base, escrow_quote, frb, frq, fee_basis, mfee_bps, order_id, ids, owner,
+            &mut book.fee_accumulator,
+        );
+        refund_order_escrow(owner, escrow_base, escrow_quote, ctx);
+        event::emit(OrderCancelled {
+            book_id: ids.book_id,
+            enclosing_object_id: ids.enclosing_object_id,
+            order_id,
+            trader: owner,
+        });
+    } else {
+        order_opt.destroy_none();
+    };
+
+    let (proceeds_owner, base, quote) = claim_maker_balance(book, order_id);
+    let base_amount = base.value();
+    let quote_amount = quote.value();
+    if (base_amount == 0 && quote_amount == 0) {
+        base.destroy_zero();
+        quote.destroy_zero();
+    } else {
+        transfer_or_destroy_zero(base, proceeds_owner, ctx);
+        transfer_or_destroy_zero(quote, proceeds_owner, ctx);
+        event::emit(ProceedsClaimed {
+            book_id: ids.book_id,
+            enclosing_object_id: ids.enclosing_object_id,
+            claimant: proceeds_owner,
+            base_amount,
+            quote_amount,
+        });
+    };
 }
 
 // === Deletion lifecycle: clob_admin_retire/clob_admin_drain_step/clob_admin_finalize ===
@@ -1309,7 +1412,7 @@ public fun clob_admin_retire<Base, Quote>(cap: &ClobAdminCap, book: &mut OrderBo
 /// Force-cancelling a partially-filled resting order routes that order's
 /// maker-fee reserve into `book.fee_accumulator` through the very same
 /// `conclude_order_fee` conclusion path every other order conclusion uses
-/// (fill-drain, `cancel_order`, `clob_admin_cancel_order`) — this function
+/// (fill-drain, `cancel_order`, `admin_redeem_ticket`) — this function
 /// is not special-cased to skip it. Consequently, if `clob_admin_claim_fees`
 /// is called before every `clob_admin_drain_step` call has finished, a
 /// later drain step on a still-resting, previously-partially-filled order
@@ -1562,7 +1665,7 @@ public struct OrderFilled has copy, drop {
 
 /// Emitted exactly once for every order that concludes — fully filled
 /// (drained by a fill), cancelled by its own ticket holder
-/// (`cancel_order`), force-cancelled (`clob_admin_cancel_order`), or drained
+/// (`cancel_order`), force-cancelled (`admin_redeem_ticket`), or drained
 /// (`clob_admin_drain_step`) — alongside whatever conclusion event that
 /// site already emits (e.g. `OrderCancelled`). `amount` is the CORRECT
 /// aggregate maker fee actually owed across the order's entire fill
@@ -1647,7 +1750,7 @@ fun gross_size_bound_for_net_cap(net_cap: u64, rate_bps: u64): u64 {
 /// leave a resting order's `remaining_size` below `min_size` ("dust"); that
 /// dust persists on the book — untouched by any automatic mechanism — until
 /// it is cancelled by its ticket holder, fully consumed by a later fill, or
-/// removed by an admin via `clob_admin_cancel_order` / `clob_admin_drain_step`.
+/// removed by an admin via `admin_redeem_ticket` / `clob_admin_drain_step`.
 /// Each resting order, dust-sized or not, consumes exactly one `max_fills`
 /// slot when a taker's sweep reaches it (see `fills_consumed` in
 /// `fill_level_bid`/`fill_level_ask`, incremented unconditionally per
@@ -1761,7 +1864,7 @@ fun extract_drained_bid_fee_reserve<Base, Quote>(
 }
 
 /// The side-generic version of `extract_drained_*_fee_reserve` above, used
-/// by the 3 conclusion call sites (`cancel_order`, `clob_admin_cancel_order`,
+/// by the 3 conclusion call sites (`cancel_order`, `admin_redeem_ticket`,
 /// `drain_side`) that handle a resting order of either side: runs
 /// `conclude_order_fee` against whichever one of `fee_reserve_base`/
 /// `fee_reserve_quote` this order actually populated (exactly one, per
@@ -1947,9 +2050,9 @@ fun fill_level_bid<Base, Quote>(
                 );
                 quote_payment.join(slack_quote);
                 book.fee_accumulator.quote.join(fee_quote_collected);
-                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
+                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, false, best_price, balance::zero<Base>(), quote_payment);
             } else {
-                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, balance::zero<Base>(), quote_payment);
+                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, false, best_price, balance::zero<Base>(), quote_payment);
                 level.level_insert_order_front(head_key, maker_order);
             };
 
@@ -2169,9 +2272,9 @@ fun fill_level_ask<Base, Quote>(
                 );
                 base_payment.join(slack_base);
                 book.fee_accumulator.base.join(fee_base_collected);
-                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
+                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, true, best_price, base_payment, balance::zero<Quote>());
             } else {
-                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, base_payment, balance::zero<Quote>());
+                credit_maker_table(&mut book.proceeds, maker_order_id, maker_addr, true, best_price, base_payment, balance::zero<Quote>());
                 level.level_insert_order_front(head_key, maker_order);
             };
         };
@@ -2312,17 +2415,21 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 ///
 /// Calling it while the referenced book is still alive is safe for both
 /// the order's escrow and its pooled proceeds, because a ticket has never
-/// been the *only* path back to either. `clob_admin_cancel_order`
+/// been the *only* path back to either. `admin_redeem_ticket`
 /// force-cancels a still-resting order using just `(side, price, order_id)`
 /// — all public via `OrderPlaced` — with no ticket needed, live book or
-/// not. Pooled proceeds are reachable the same admin-gated way: unlike
-/// `clob_admin_drain_step` (which still requires `book.retiring`),
-/// `push_proceeds` is unconditional on a live book, gated only on the
-/// `ClobAdminCap`, so an admin can always reach an order's pooled proceeds
-/// by `order_id` alone, retiring or not. Destroying a ticket for an order
-/// with real pooled proceeds still attached, while the book is still live,
-/// therefore no longer strands anything — the admin can recover them
-/// immediately via `push_proceeds`, with no need to retire the book first.
+/// not, AND sweeps that same `order_id`'s pooled proceeds in the same call.
+/// Unlike `clob_admin_drain_step` (which still requires `book.retiring`),
+/// `admin_redeem_ticket` is unconditional on a live book, gated only on the
+/// `ClobAdminCap`, so an admin can always reach an order's escrow and its
+/// pooled proceeds by `(side, price, order_id)` alone, retiring or not.
+/// Destroying a ticket for an order with real escrow or pooled proceeds
+/// still attached, while the book is still live, therefore no longer
+/// strands anything — the admin can recover both immediately via
+/// `admin_redeem_ticket`, with no need to retire the book first. This is,
+/// in fact, `admin_redeem_ticket`'s primary purpose: recovering value
+/// stranded behind a ticket destroyed by this very function while real
+/// value was still attached to its `order_id`.
 /// Calling this function only ever gives up the ticket holder's own
 /// convenient self-service path (`cancel_order`/`claim_proceeds`/
 /// `destroy_orphaned_ticket`); it never strands anything the book's
@@ -3007,11 +3114,11 @@ public struct OrderOwnerUpdated has copy, drop {
 /// Both authorities now live in the same place — whoever holds the ticket —
 /// so there is no split-authority footgun between "who can cancel" and "who
 /// can redirect proceeds." `owner` is also the refund destination
-/// `clob_admin_cancel_order` and the `clob_admin_drain_step` retirement
+/// `admin_redeem_ticket` and the `clob_admin_drain_step` retirement
 /// drain send the order's *escrow principal* to (not merely future fill
 /// proceeds via `credit_maker_table`), so reassigning it is a real
 /// redirection of that order's funds, not just a bookkeeping label — treat
-/// it with the same care as `push_proceeds`. Proceeds are pooled per
+/// it with the same care as `admin_redeem_ticket`. Proceeds are pooled per
 /// `order_id` in a single maker-table ledger entry, and `credit_maker_table`
 /// re-stamps that entry's payout `owner` on every credit, not just the
 /// first. This function ALWAYS immediately and unconditionally syncs the
@@ -3027,26 +3134,27 @@ public struct OrderOwnerUpdated has copy, drop {
 /// any credited afterward — immediately, whether or not the order is ever
 /// filled again, and whether or not the order has already concluded by the
 /// time this is called (fully filled and drained, `cancel_order`ed,
-/// force-cancelled via `clob_admin_cancel_order`, or removed by
-/// `clob_admin_drain_step`): `push_proceeds` / `drain_proceeds` always pay
-/// whoever is currently stamped as owner, which this function keeps
+/// force-cancelled via `admin_redeem_ticket`, or removed by
+/// `clob_admin_drain_step`): `admin_redeem_ticket` / `drain_proceeds` always
+/// pay whoever is currently stamped as owner, which this function keeps
 /// current either way. This is intentional, since it remains the ticket
 /// holder's own choice about their own order's funds. There is also a
 /// secondary asymmetry worth noting here: `cancel_order` sweeps and pays
 /// out any pooled proceeds as part of the same call — to the caller
 /// (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
-/// while `clob_admin_cancel_order` deliberately does not — it refunds only the
-/// order's escrow principal and leaves any pooled proceeds entry untouched
-/// (so that an admin force-cancel can never redirect a maker's proceeds),
-/// recoverable afterward only via `push_proceeds`/`drain_proceeds`/
-/// `claim_proceeds`.
+/// while `admin_redeem_ticket` also sweeps any pooled proceeds as part of
+/// the same call (alongside force-cancelling the resting order, if one
+/// exists), but always to the recorded `owner`, never to the admin's own
+/// `ctx.sender()` — an admin force-cancel/sweep can never redirect a
+/// maker's proceeds to anyone but whoever is currently stamped as owner,
+/// recoverable via `admin_redeem_ticket`/`drain_proceeds`/`claim_proceeds`.
 ///
 /// Note: a bare `transfer::public_transfer` of the `OrderTicket` object
 /// itself (bypassing this function) cannot be observed or synced by any
 /// on-chain code — `OrderTicket` has no `key` ability and is never an owned
 /// object in the usual sense, but if a wrapping integrator type does make
 /// ticket custody transferable outside of calling this function, this
-/// module has no way to know. `push_proceeds`/`drain_proceeds` therefore
+/// module has no way to know. `admin_redeem_ticket`/`drain_proceeds` therefore
 /// remain a best-effort payout to the last address recorded via
 /// `update_resting_order`, not a guarantee of payment to the ticket's true
 /// current holder if custody changed by other means.
@@ -3057,8 +3165,8 @@ public struct OrderOwnerUpdated has copy, drop {
 /// holding the ticket internally, and later moves that ticket (and the
 /// beneficial ownership it represents) to a new custodian. Skipping this call
 /// on such a change leaves the ledger's recorded `owner` stale: a later
-/// `clob_admin_cancel_order`/`drain_side` (escrow principal) or
-/// `drain_proceeds`/`push_proceeds` (pooled proceeds) will pay the OLD,
+/// `admin_redeem_ticket`/`drain_side` (escrow principal) or
+/// `drain_proceeds`/`admin_redeem_ticket` (pooled proceeds) will pay the OLD,
 /// stale address instead of the current beneficiary, and this module has no
 /// way to detect or flag that drift on its own — see the note above about a
 /// bare ticket transfer being invisible to on-chain code. Use
@@ -3180,61 +3288,6 @@ public fun claim_proceeds<Base, Quote>(
         destroy_orphaned_ticket_unchecked(ticket);
         (base_coin, quote_coin, option::none())
     }
-}
-
-/// Admin-gated convenience/rescue function: pays out a specific order's
-/// accumulated proceeds. Requires the book's `ClobAdminCap`. As
-/// defense-in-depth, the destination address is never caller-supplied — it
-/// is always whatever `owner` was recorded against `order_id` in the
-/// proceeds ledger at credit time (see `credit_maker_table`), so even the
-/// admin can only trigger payout to the legitimately recorded owner and can
-/// never redirect funds elsewhere.
-///
-/// Unconditional — gated only on `book`'s version and `cap`, exactly like
-/// `clob_admin_cancel_order`, with no `book.retiring` requirement of its
-/// own. This is deliberate: `clob_admin_cancel_order` already gives the
-/// admin an unconditional rescue path for a still-resting order's escrow
-/// using nothing but `(side, price, order_id)`, no `OrderTicket` needed.
-/// Pooled proceeds deserve the same rescue path, because a ticket can be
-/// destroyed with no checks at all via `destroy_ticket_unconditionally`
-/// (which doesn't even take an `&OrderBook`) while real proceeds are still
-/// pooled against that order's `order_id` — if `push_proceeds` required
-/// `book.retiring`, those proceeds would be stranded on a live book until
-/// the admin performed the one-way, book-destroying retirement sequence
-/// just to reach them. Making this function unconditional closes that gap,
-/// and simply brings it in line with `clob_admin_cancel_order`, which was
-/// already unconditional. This reopens no new risk: the already-accepted
-/// risk of paying a recorded owner that has drifted from the ticket's true
-/// current holder (because `update_resting_order` was never called on a
-/// custody change) is the exact same risk `clob_admin_cancel_order` already
-/// carries today. An integrator that needs to confirm ahead of time where
-/// this payout will go can check `proceeds_owner`/`proceeds_owner_by_ticket`.
-public fun push_proceeds<Base, Quote>(
-    cap: &ClobAdminCap,
-    book: &mut OrderBook<Base, Quote>,
-    order_id: u64,
-    ctx: &mut TxContext,
-) {
-    assert_book_version(book);
-    assert_clob_admin(cap, book);
-    let ids = book.book_ids();
-    let (owner, base, quote) = claim_maker_balance(book, order_id);
-    let base_amount = base.value();
-    let quote_amount = quote.value();
-    if (base_amount == 0 && quote_amount == 0) {
-        base.destroy_zero();
-        quote.destroy_zero();
-        return
-    };
-    transfer_or_destroy_zero(base, owner, ctx);
-    transfer_or_destroy_zero(quote, owner, ctx);
-    event::emit(ProceedsClaimed {
-        book_id: ids.book_id,
-        enclosing_object_id: ids.enclosing_object_id,
-        claimant: owner,
-        base_amount,
-        quote_amount,
-    });
 }
 
 // === Test-only accessors ===

@@ -107,7 +107,7 @@ fun update_resting_order_not_found_paths_emit_no_event() {
 // `enclosing_object_id`, which this test only ever asserted a subset of)
 // and `update_resting_order_found_reassigns_owner_and_credits_new_owner_on_push`
 // in `cancellation_and_proceeds_tests.move` (the identical rest-bid ->
-// reassign -> cross -> retire -> push_proceeds -> assert-claimant-is-new-
+// reassign -> cross -> retire -> admin_redeem_ticket -> assert-claimant-is-new-
 // owner sequence). It added no assertion neither of those two already made
 // together, so it was removed as a strict subset rather than kept as a
 // third near-duplicate.
@@ -523,20 +523,26 @@ fun clob_admin_drain_step_maker_fee_settled_events_sum_matches_accumulator_delta
     scenario.end();
 }
 
-// === `push_proceeds` on an already-claimed entry ===
+// === `admin_redeem_ticket` on an already-claimed entry ===
 
-// Distinct from `push_proceeds_with_no_pooled_entry_is_silent_noop` in
+// Distinct from `admin_redeem_ticket_with_no_pooled_entry_is_silent_noop` in
 // `construction_and_admin_tests.move` (an order_id for which no pooled
-// entry was EVER created): here the order genuinely earns pooled proceeds
-// via a real partial fill, those proceeds are claimed once via
-// `push_proceeds` (removing the entry -- see `claim_maker_balance`), and
-// `push_proceeds` is then called AGAIN on the same, now-empty order_id.
-// `claim_maker_balance` returns zero balances for a missing entry, so the
-// second call must be an equally silent no-op: no abort, no second
-// `ProceedsClaimed` event, and (checked concretely, not just via event
-// absence) no second payment actually reaching the claimant.
+// entry was EVER created, and no resting order either): here the order
+// genuinely earns pooled proceeds via a real partial fill and is still
+// resting with the remainder. The FIRST `admin_redeem_ticket` call
+// therefore does real work on BOTH halves at once -- it force-cancels the
+// still-resting remainder (emitting `OrderCancelled` and refunding its
+// Quote escrow) AND claims the pooled Base credit (emitting
+// `ProceedsClaimed`) -- which leaves nothing behind for either half.
+// `admin_redeem_ticket` is then called AGAIN on the same, now-fully-
+// concluded order_id. `find_and_remove_order` finds no resting order and
+// `claim_maker_balance` returns zero balances for the missing entry, so the
+// second call must be an equally silent no-op on both halves: no abort, no
+// second `OrderCancelled`/`ProceedsClaimed` event, and (checked concretely,
+// not just via event absence) no second payment actually reaching the
+// claimant.
 #[test]
-fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
+fun admin_redeem_ticket_on_already_claimed_entry_is_silent_noop() {
     let mut scenario = ts::begin(admin());
     let (mut book, cap) = new_book(&mut scenario);
 
@@ -545,7 +551,8 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
     let bid_ticket = rest_bid(&mut book, default_price(), size, 1_000_000_000, scenario.ctx());
     let order_id = bid_ticket.ticket_order_id();
 
-    // Partially fill so the order earns a real, nonzero pooled Base credit.
+    // Partially fill so the order earns a real, nonzero pooled Base credit,
+    // while 200 units remain resting.
     scenario.next_tx(taker());
     let ask_payment = coin::mint_for_testing<BTC>(fill_size, scenario.ctx());
     let (leftover_payment, matched_quote, _) =
@@ -554,13 +561,18 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
     matched_quote.burn_for_testing();
     assert!(book.proceeds_contains_for_testing(order_id), 0);
 
-    // First push_proceeds: genuinely claims the pooled credit. The retire
-    // call below is a harmless no-op setup step, not a requirement of
-    // push_proceeds itself.
+    // First admin_redeem_ticket: genuinely force-cancels the still-resting
+    // 200-unit remainder AND claims the pooled Base credit, in one call. The
+    // retire call below is a harmless no-op setup step, not a requirement of
+    // admin_redeem_ticket itself.
     scenario.next_tx(admin());
     cap.clob_admin_retire(&mut book);
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
     assert!(!book.proceeds_contains_for_testing(order_id), 1);
+    assert!(book.resting_order_escrow(true, default_price(), order_id).is_none(), 9);
+
+    let cancelled_events = event::events_by_type<tiny_clob::OrderCancelled>();
+    assert!(cancelled_events.length() == 1, 10);
 
     let claimed_events = event::events_by_type<tiny_clob::ProceedsClaimed>();
     assert!(claimed_events.length() == 1, 2);
@@ -569,20 +581,21 @@ fun push_proceeds_on_already_claimed_entry_is_silent_noop() {
     assert!(ev_base == fill_size, 4);
     assert!(ev_quote == 0, 5);
 
-    // Second push_proceeds on the same, now-empty order_id, still in the
-    // same transaction: a genuine no-op must NOT add a second event to the
-    // event log accumulated so far this tx (`event::events_by_type` is
-    // scoped per-transaction in this test framework -- it resets across
-    // `scenario.next_tx`, but accumulates within one, exactly like the
-    // multi-call drain tests elsewhere in this file), so the count must stay
-    // at 1, not grow to 2.
-    cap.push_proceeds(&mut book, order_id, scenario.ctx());
+    // Second admin_redeem_ticket on the same, now-fully-concluded order_id,
+    // still in the same transaction: a genuine no-op must NOT add a second
+    // event of either kind to the event log accumulated so far this tx
+    // (`event::events_by_type` is scoped per-transaction in this test
+    // framework -- it resets across `scenario.next_tx`, but accumulates
+    // within one, exactly like the multi-call drain tests elsewhere in this
+    // file), so both counts must stay at 1, not grow to 2.
+    cap.admin_redeem_ticket(&mut book, true, default_price(), order_id, scenario.ctx());
+    assert!(event::events_by_type<tiny_clob::OrderCancelled>().length() == 1, 11);
     assert!(event::events_by_type<tiny_clob::ProceedsClaimed>().length() == 1, 6);
 
-    // Confirm exactly ONE payment ever reached the claimant -- not a silent
-    // second transfer that merely skipped the event. take_from_address
-    // consumes the single Coin<BTC> object created by the first (real) push;
-    // if the second push had transferred anything at all, a second object
+    // Confirm exactly ONE proceeds payment ever reached the claimant -- not a
+    // silent second transfer that merely skipped the event. take_from_address
+    // consumes the single Coin<BTC> object created by the first (real) call;
+    // if the second call had transferred anything at all, a second object
     // would still be sitting in admin()'s inventory afterward.
     scenario.next_tx(admin());
     let paid_base = scenario.take_from_address<coin::Coin<BTC>>(admin());
