@@ -126,7 +126,7 @@ fun match_bid_produces_expected_fill_and_fee_amounts() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 10);
-    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
 
     assert!(matched_base_val == expected_matched_base, 0);
     // Full fill consumes the whole budget exactly; the real pinning of the
@@ -207,7 +207,7 @@ fun match_ask_produces_expected_fill_and_fee_amounts() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 10);
-    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, taker_fee_amount) = executed[0].order_executed_fields_for_testing();
 
     assert!(matched_quote_val == expected_matched_quote, 0);
     assert!(remaining_escrow_val == 0, 1);
@@ -244,7 +244,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 10);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 11);
     let (fee_base_after_1, _) = book.fee_accumulator_balances();
     assert!(fee_base_after_1 == 1, 1);
@@ -260,7 +260,7 @@ fun fee_amount_ceiling_rounds_up_dust_and_stays_exact_on_exact_division() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 12);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 13);
     let (fee_base_after_2, _) = book.fee_accumulator_balances();
     assert!(fee_base_after_2 == 2, 3);
@@ -309,7 +309,7 @@ fun repeated_dust_sized_fills_now_collect_nonzero_total_fee() {
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 102);
-        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 103);
         i = i + 1;
     };
@@ -356,7 +356,7 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 8);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 9);
     assert!(book.ask_base_escrow_at_price(FILL_INPLACE_PRICE) == 400, 1); // 200 (A left) + 200 (B)
 
@@ -371,7 +371,7 @@ fun fill_in_place_partial_fill_preserves_fifo_order() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 10);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 11);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
@@ -410,7 +410,7 @@ fun fill_in_place_full_drain_removes_order_and_frees_level() {
     ticket_opt.destroy_none();
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 6);
-    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[0].order_executed_fields_for_testing();
     assert!(unmatched_size == 0, 7);
 
     // Level is now empty and must have been removed from the tree entirely.
@@ -475,7 +475,7 @@ fun fill_in_place_multi_order_sweep_total_size_matches_running_total_per_step() 
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 300 + i);
-        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 400 + i);
 
         expected_total = expected_total - fill_size;
@@ -546,7 +546,7 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 12);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 13);
 
     // Second taker buys 500 more: must drain A's remaining 200 first, then
@@ -559,7 +559,7 @@ fun ask_side_partial_fill_keeps_fifo_priority() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 14);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 15);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
@@ -621,7 +621,7 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 12);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 13);
 
     // Second taker sells 500 more: must drain A's remaining 200 first, then
@@ -635,7 +635,7 @@ fun bid_side_partial_fill_keeps_fifo_priority() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 14);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 15);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
@@ -693,7 +693,7 @@ fun repeated_partial_fills_of_head_never_reorder() {
         ticket_opt.destroy_none();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 70 + i);
-        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 80 + i);
         assert!(book.ask_base_escrow_at_price(price) == 500 - (i + 1) * 100 + 100, 20 + i);
         i = i + 1;
@@ -708,7 +708,7 @@ fun repeated_partial_fills_of_head_never_reorder() {
     ticket_opt6.destroy_none();
     let executed6 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed6.length() == 6, 90);
-    let (_, _, _, _, _, _, _, unmatched_size6, _, _, _, _) = executed6[5].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size6, _, _, _, _, _) = executed6[5].order_executed_fields_for_testing();
     assert!(unmatched_size6 == 0, 91);
     assert!(book.ask_base_escrow_at_price(price) == 0, 11);
 
@@ -755,7 +755,7 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     ticket_opt1.destroy_none();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 7);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 8);
 
     // A brand-new maker rests at the same price via the ordinary placement
@@ -778,7 +778,7 @@ fun new_order_at_same_price_goes_behind_partially_filled_one() {
     ticket_opt2.destroy_none();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 1, 9);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[0].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 10);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
@@ -915,7 +915,7 @@ fun cancelling_middle_of_fifo_queue_preserves_neighbours_order() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 11);
-    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[0].order_executed_fields_for_testing();
     assert!(unmatched_size == 0, 12);
 
     let fills = event::events_by_type<tiny_clob::OrderFilled>();
@@ -1302,13 +1302,17 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 4);
-    let (_, _, _, _, _, _, requested_size1, unmatched_size1, rested_size1, rested_order_id1, exec_stopped1, _) =
+    let (_, _, _, _, _, _, requested_size1, unmatched_size1, escrow_clamped_size1, rested_size1, rested_order_id1, exec_stopped1, _) =
         executed1[0].order_executed_fields_for_testing();
     assert!(requested_size1 == first_call_size, 5);
     assert!(unmatched_size1 == first_call_size - 200, 6); // 50
     assert!(rested_size1 == 0, 7);
     assert!(rested_order_id1.is_none(), 8);
     assert!(exec_stopped1 == true, 9);
+    // `new_book`'s `price_scale == 1` makes the escrow-backing max exact
+    // (no rounding loss), so nothing was clamped here -- `rested_size1 == 0`
+    // is entirely due to `stopped_on_max_fills_while_crossing`, not this.
+    assert!(escrow_clamped_size1 == 0, 23);
 
     // Only A and B were touched; C is completely untouched by the first
     // call.
@@ -1337,13 +1341,14 @@ fun stopped_on_max_fills_sweep_is_correctly_resumed_by_a_second_call() {
 
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 17);
-    let (_, _, _, _, _, _, requested_size2, unmatched_size2, rested_size2, rested_order_id2, exec_stopped2, _) =
+    let (_, _, _, _, _, _, requested_size2, unmatched_size2, escrow_clamped_size2, rested_size2, rested_order_id2, exec_stopped2, _) =
         executed2[1].order_executed_fields_for_testing();
     assert!(requested_size2 == second_call_size, 18);
     assert!(unmatched_size2 == 0, 19);
     assert!(rested_size2 == 0, 20);
     assert!(rested_order_id2.is_none(), 21);
     assert!(exec_stopped2 == false, 22);
+    assert!(escrow_clamped_size2 == 0, 24);
 
     // End-to-end across the two-call boundary: the sum of matched amounts
     // equals the taker's originally-intended total, exactly -- no

@@ -691,7 +691,7 @@ fun every_event_type_stamps_true_book_id_and_foreign_enclosing_object_id_indepen
     assert!(ple == foreign_id, 12);
 
     let executed_events = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (exb, exe, _, _, _, _, _, _, _, _, _, _) = executed_events[0].order_executed_fields_for_testing();
+    let (exb, exe, _, _, _, _, _, _, _, _, _, _, _) = executed_events[0].order_executed_fields_for_testing();
     assert!(exb == true_book_id, 13);
     assert!(exe == foreign_id, 14);
 

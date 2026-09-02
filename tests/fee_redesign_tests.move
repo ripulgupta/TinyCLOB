@@ -98,7 +98,7 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     mq1.burn_for_testing();
     let executed1 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed1.length() == 1, 12);
-    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size1, _, _, _, _, _) = executed1[0].order_executed_fields_for_testing();
     assert!(unmatched_size1 == 0, 13);
     let (fee_base_mid, fee_quote_mid) = book.fee_accumulator_balances();
     assert!(fee_base_mid == 0 && fee_quote_mid == 0, 0); // still resting: fee only reserved, not collected
@@ -114,7 +114,7 @@ fun maker_fee_reserve_trues_up_on_fill_drain_with_nonzero_slack() {
     mq2.burn_for_testing();
     let executed2 = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed2.length() == 2, 14);
-    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
+    let (_, _, _, _, _, _, _, unmatched_size2, _, _, _, _, _) = executed2[1].order_executed_fields_for_testing();
     assert!(unmatched_size2 == 0, 15);
 
     let settled = event::events_by_type<tiny_clob::MakerFeeSettled>();
@@ -246,7 +246,7 @@ fun maker_fee_reserve_trues_up_on_admin_redeem_ticket_with_nonzero_slack() {
         mq.burn_for_testing();
         let executed = event::events_by_type<tiny_clob::OrderExecuted>();
         assert!(executed.length() == i + 1, 102);
-        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _) = executed[i].order_executed_fields_for_testing();
+        let (_, _, _, _, _, _, _, unmatched_size, _, _, _, _, _) = executed[i].order_executed_fields_for_testing();
         assert!(unmatched_size == 0, 103);
         i = i + 1;
     };
@@ -380,7 +380,7 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 102);
-    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, _requested_size, unmatched_size, _escrow_clamped_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(unmatched_size == 0, 103);
 
@@ -440,7 +440,7 @@ fun order_executed_taker_fee_amount_matches_aggregate_across_many_small_fills() 
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 1);
-    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _escrow_clamped_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(requested_size == num_fills, 2);
     // `max_base_out` (== `num_fills` == 10) is a NET cap: delivering a net of
@@ -505,7 +505,7 @@ fun place_market_order_bid_net_cap_binds_with_ample_liquidity_and_equal_min_max(
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 1);
-    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _escrow_clamped_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(requested_size == net_cap, 2);
     // `gross_size_bound_for_net_cap(10, 10) == ceil(10 * 10_000 / 9_990) ==
@@ -595,7 +595,7 @@ fun place_market_order_bid_larger_net_cap_at_max_taker_fee_bps() {
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 1);
-    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _escrow_clamped_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(requested_size == net_cap, 2);
     assert!(taker_fee_amount == 2, 3);
@@ -667,7 +667,7 @@ fun taker_aggregate_fee_strictly_less_than_naive_per_fill_sum_across_many_small_
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
     assert!(executed.length() == 1, 3);
-    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
+    let (_book_id, _enclosing_id, _taker, _taker_side, _entry_point, _limit_price, requested_size, unmatched_size, _escrow_clamped_size, _rested_size, _rested_order_id, _stopped_flag, taker_fee_amount) =
         executed[0].order_executed_fields_for_testing();
     assert!(requested_size == num_fills, 4);
     assert!(unmatched_size == 0, 5);

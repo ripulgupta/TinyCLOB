@@ -59,6 +59,23 @@ fun partial_cross_then_rest_clamps_resting_escrow_to_available() {
     assert!(leftover_quote.burn_for_testing() == 0, 5);
     let bid_ticket = ticket_opt.destroy_some();
 
+    // `OrderExecuted.escrow_clamped_size` makes the clamp explicit: the
+    // sweep leaves `remaining_size = 10 - 1 = 9` (Base) unmatched, but the
+    // leftover escrow (4 Quote, per the asserts above/below) can only back
+    // `floor(4 * 10 / 5) = 8` of it, so `actual_resting_size = 8` and
+    // `escrow_clamped_size = 9 - 8 = 1`. `stopped_on_max_fills_while_crossing`
+    // is `false` here (`max_fills = 10` is never remotely approached), so
+    // this is a PURE escrow-clamp case, independent of max_fills.
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 8);
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, stopped_flag, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(!stopped_flag, 9);
+    assert!(unmatched_size == 9, 10);
+    assert!(escrow_clamped_size == 1, 11);
+    assert!(rested_size == 8, 12);
+    assert!(rested_size == unmatched_size - escrow_clamped_size, 13);
+
     // Prove the clamp directly: nothing has been charged against the
     // resting order yet, so cancelling now must refund exactly the
     // clamped 4, not the fresh target of 5.
@@ -169,6 +186,17 @@ fun partial_cross_then_rest_full_drain_across_multiple_fills_is_zero_dust() {
     matched_base.burn_for_testing();
     leftover_quote.burn_for_testing();
     let bid_ticket = ticket_opt.destroy_some();
+
+    // Same escrow-clamp derivation as
+    // `partial_cross_then_rest_clamps_resting_escrow_to_available`:
+    // `remaining_size = 9`, `escrow_clamped_size = 1`, `rested_size = 8`.
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 20);
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, _, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(unmatched_size == 9, 21);
+    assert!(escrow_clamped_size == 1, 22);
+    assert!(rested_size == 8, 23);
 
     // Drain the resting 8-unit remainder across TWO separate transactions
     // (separate ask takers), summing exactly to 8. Uses
@@ -330,6 +358,17 @@ fun tiny_fill_charges_nonzero_quote_and_forfeits_escrow_on_cancel() {
     let bid_ticket = ticket_opt.destroy_some();
     // Resting remainder: original_size=8, total_reserved=4 (clamped, per the
     // shortfall derivation above).
+
+    // Same escrow-clamp derivation as
+    // `partial_cross_then_rest_clamps_resting_escrow_to_available`:
+    // `remaining_size = 9`, `escrow_clamped_size = 1`, `rested_size = 8`.
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 20);
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, _, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(unmatched_size == 9, 21);
+    assert!(escrow_clamped_size == 1, 22);
+    assert!(rested_size == 8, 23);
 
     // A tiny 1-unit ask fills the resting bid's front (only) order by 1 --
     // small enough that `4*1/8` floors to 0 under the old scheme, but
@@ -715,5 +754,86 @@ fun new_at_max_decimals_boundary_succeeds() {
     assert!(book.price_scale() == 1, 0);
     destroy_book_and_cap(book, cap);
     wrapper_uid.delete();
+    scenario.end();
+}
+
+// === `OrderExecuted.escrow_clamped_size` and                              ===
+// === `stopped_on_max_fills_while_crossing` are independent mechanisms     ===
+//
+// `partial_cross_then_rest_clamps_resting_escrow_to_available` above
+// already shows a pure escrow-clamp case, but does not itself directly pin
+// down the reconciliation identity `rested_size == unmatched_size -
+// escrow_clamped_size` from a from-scratch derivation with its own numbers,
+// nor accumulate the rounding loss across MULTIPLE separate fills within
+// the same call (the earlier test derives its single unit of clamp from one
+// pre-drained maker order). This test does both: two separate 1-unit
+// resting asks at `shortfall_book`'s `price = 5`, `price_scale = 10`, each
+// contributing its own `ceil` rounding loss to the taker's leftover escrow.
+//
+// Setup: two resting asks of size 1 each at price 5 (FIFO: A then B).
+// Taker bid: `size = 20`, `payment = 10` (`escrow_amount =
+// bid_escrow_amount(5, 20) = ceil(5*20/10) = 10`, so the whole payment is
+// escrowed, none returned up front).
+//
+// Crossing sweep (`max_fills = 1_000_000`, nowhere near binding):
+//   fill A: qty=1, quote_cost = ceil(5*1/10) = 1
+//   fill B: qty=1, quote_cost = ceil(5*1/10) = 1
+//   matched_base = 2, escrow spent = 2, leftover escrow = 10 - 2 = 8
+//   remaining_size (Base) = 20 - 2 = 18
+//   max_size_available_can_back = floor(8 * 10 / 5) = 16
+//   actual_resting_size = min(18, 16) = 16
+//   escrow_clamped_size = 18 - 16 = 2
+//
+// `stopped_on_max_fills_while_crossing` is `false` (max_fills is never
+// remotely approached) -- so `escrow_clamped_size > 0` here has NOTHING to
+// do with max_fills, proving the two mechanisms are independent, and the
+// identity `rested_size == unmatched_size - escrow_clamped_size` holds
+// exactly (16 == 18 - 2).
+#[test]
+fun escrow_clamp_and_max_fills_stop_are_independent_mechanisms() {
+    let mut scenario = ts::begin(admin());
+    let (mut book, cap) = shortfall_book(&mut scenario);
+
+    scenario.next_tx(maker_a());
+    let order_id_a = book.next_order_id();
+    let escrow_a = balance::create_for_testing<BTC>(1);
+    let ask_a = order::new<BTC, USDC>(order_id_a, maker_a(), 1, option::some(escrow_a), option::none(), 0);
+    book.insert_resting_order_for_testing(false, shortfall_price(), ask_a, scenario.ctx());
+
+    let order_id_b = book.next_order_id();
+    let escrow_b = balance::create_for_testing<BTC>(1);
+    let ask_b = order::new<BTC, USDC>(order_id_b, maker_a(), 1, option::some(escrow_b), option::none(), 0);
+    book.insert_resting_order_for_testing(false, shortfall_price(), ask_b, scenario.ctx());
+
+    scenario.next_tx(taker());
+    let payment = coin::mint_for_testing<USDC>(10, scenario.ctx());
+    let (ticket_opt, matched_base, leftover_quote, stopped) =
+        book.place_limit_order_bid(payment, 20, 1_000_000, scenario.ctx());
+    assert!(!stopped, 0);
+    assert!(matched_base.burn_for_testing() == 2, 1);
+    assert!(leftover_quote.burn_for_testing() == 0, 2);
+    assert!(ticket_opt.is_some(), 3);
+    let bid_ticket = ticket_opt.destroy_some();
+
+    let executed = event::events_by_type<tiny_clob::OrderExecuted>();
+    assert!(executed.length() == 1, 4);
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, rested_order_id, stopped_flag, _) =
+        executed[0].order_executed_fields_for_testing();
+    assert!(!stopped_flag, 5);
+    assert!(unmatched_size == 18, 6);
+    assert!(escrow_clamped_size == 2, 7);
+    assert!(rested_size == 16, 8);
+    assert!(rested_size == unmatched_size - escrow_clamped_size, 9);
+    assert!(rested_order_id.is_some(), 10);
+
+    // Confirm the resting order's real escrow directly: `bid_escrow_amount(5,
+    // 16) = ceil(80/10) = 8`, exactly the leftover computed above.
+    assert!(book.bid_quote_escrow_at_price(shortfall_price()) == 8, 11);
+
+    let (cb, cq) = book.cancel_order(bid_ticket, scenario.ctx());
+    assert!(cq.burn_for_testing() == 8, 12);
+    assert!(cb.burn_for_testing() == 0, 13);
+
+    destroy_book_and_cap(book, cap);
     scenario.end();
 }

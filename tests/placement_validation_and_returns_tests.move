@@ -580,11 +580,13 @@ fun place_limit_order_bid_max_fills_exact_match_does_not_falsely_report_stopped(
     assert!(book.ask_base_escrow_at_price(OPT_PRICE) == 0, 4);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 5);
     assert!(unmatched_size == 100, 6);
     assert!(rested_size == 100, 7);
+    // No escrow clamp: `rested_size` already equals the full `unmatched_size`.
+    assert!(escrow_clamped_size == 0, 10);
 
     // The resting order's escrow is exactly the leftover 100's worth of
     // quote, and can be cancelled cleanly.
@@ -633,11 +635,13 @@ fun place_limit_order_bid_max_fills_one_more_than_needed_does_not_report_stopped
     assert!(book.ask_base_escrow_at_price(OPT_PRICE) == 0, 6);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 7);
     assert!(unmatched_size == 100, 8);
     assert!(rested_size == 100, 9);
+    // No escrow clamp: `rested_size` already equals the full `unmatched_size`.
+    assert!(escrow_clamped_size == 0, 10);
 
     unit_test::destroy(ask_a);
     unit_test::destroy(ask_b);
@@ -794,11 +798,13 @@ fun place_limit_order_ask_max_fills_exact_match_does_not_falsely_report_stopped(
     assert!(book.bid_quote_escrow_at_price(OPT_PRICE) == 0, 4);
 
     let executed = event::events_by_type<tiny_clob::OrderExecuted>();
-    let (_, _, _, _, _, _, _, unmatched_size, rested_size, _, event_stopped, _) =
+    let (_, _, _, _, _, _, _, unmatched_size, escrow_clamped_size, rested_size, _, event_stopped, _) =
         executed[0].order_executed_fields_for_testing();
     assert!(!event_stopped, 5);
     assert!(unmatched_size == 100, 6);
     assert!(rested_size == 100, 7);
+    // `place_limit_order_ask` never has an escrow-backing clamp of this kind.
+    assert!(escrow_clamped_size == 0, 10);
 
     // The resting order's escrow is exactly the leftover 100 base, and can
     // be cancelled cleanly.

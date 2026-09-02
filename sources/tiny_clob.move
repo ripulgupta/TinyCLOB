@@ -2509,6 +2509,19 @@ public struct OrderExecuted has copy, drop {
     /// so for that one entry point too, `requested_size - unmatched_size`
     /// equals the base actually delivered to the taker.
     unmatched_size: u64,
+    /// How much of `unmatched_size` was clamped away specifically because
+    /// the leftover escrow couldn't back it at the resting price -- always
+    /// `0` for every entry point except `place_limit_order_bid` (the only
+    /// one with an escrow-backing clamp; `place_limit_order_ask`'s escrow is
+    /// Base, 1:1 with size, needing no clamp, and market orders never rest
+    /// at all). Computed as `remaining_size - actual_resting_size`
+    /// regardless of whether `stopped_on_max_fills_while_crossing` also
+    /// applies -- the two mechanisms are independent and can co-occur; when
+    /// `stopped_on_max_fills_while_crossing` is `true`, nothing rests
+    /// regardless of what this field says, so check that flag first when
+    /// reconciling `unmatched_size`, `escrow_clamped_size`, and
+    /// `rested_size`.
+    escrow_clamped_size: u64,
     /// 0 if nothing ends up resting. On the bid limit path this can be LESS
     /// than `unmatched_size` even when something rests, because
     /// `place_limit_order_bid` clamps the resting size to what leftover
@@ -2690,6 +2703,7 @@ public fun place_limit_order_bid<Base, Quote>(
         limit_price: option::some(price),
         requested_size: size,
         unmatched_size: remaining_size,
+        escrow_clamped_size: remaining_size - actual_resting_size,
         rested_size,
         rested_order_id,
         stopped_on_max_fills_while_crossing,
@@ -2823,6 +2837,7 @@ public fun place_limit_order_ask<Base, Quote>(
         limit_price: option::some(price),
         requested_size: size,
         unmatched_size: remaining_size,
+        escrow_clamped_size: 0,
         rested_size,
         rested_order_id,
         stopped_on_max_fills_while_crossing,
@@ -2936,6 +2951,7 @@ public fun place_market_order_bid<Base, Quote>(
         limit_price: option::none(),
         requested_size: max_base_out,
         unmatched_size: base_unmatched,
+        escrow_clamped_size: 0,
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
@@ -2998,6 +3014,7 @@ public fun place_market_order_ask<Base, Quote>(
         limit_price: option::none(),
         requested_size: size,
         unmatched_size: remaining_size,
+        escrow_clamped_size: 0,
         rested_size: 0,
         rested_order_id: option::none(),
         stopped_on_max_fills_while_crossing,
@@ -3447,8 +3464,8 @@ public fun order_filled_side_and_quote_fields_for_testing(e: &OrderFilled): (boo
 }
 
 #[test_only]
-public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, ID, address, bool, u8, Option<u64>, u64, u64, u64, Option<u64>, bool, u64) {
-    (e.book_id, e.enclosing_object_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing, e.taker_fee_amount)
+public fun order_executed_fields_for_testing(e: &OrderExecuted): (ID, ID, address, bool, u8, Option<u64>, u64, u64, u64, u64, Option<u64>, bool, u64) {
+    (e.book_id, e.enclosing_object_id, e.taker, e.taker_side, e.entry_point, e.limit_price, e.requested_size, e.unmatched_size, e.escrow_clamped_size, e.rested_size, e.rested_order_id, e.stopped_on_max_fills_while_crossing, e.taker_fee_amount)
 }
 
 #[test_only]

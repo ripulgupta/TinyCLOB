@@ -1054,7 +1054,7 @@ against the book's unforgeable one, closing the spoofing gap a
 | `ClobAdminCapDiscarded` | `book_id: ID`, `enclosing_object_id: ID`, `cap_id: ID` |
 | `OrderPlaced` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `side: bool`, `price: u64`, `size: u64`, `trader: address`, `maker_fee_bps: u64` |
 | `OrderFilled` | `book_id: ID`, `enclosing_object_id: ID`, `maker_order_id: u64`, `price: u64`, `size: u64`, `maker: address`, `taker: address`, `maker_side: bool`, `quote_amount: u64` |
-| `OrderExecuted` | `book_id: ID`, `enclosing_object_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool`, `taker_fee_amount: u64` |
+| `OrderExecuted` | `book_id: ID`, `enclosing_object_id: ID`, `taker: address`, `taker_side: bool`, `entry_point: u8`, `limit_price: Option<u64>`, `requested_size: u64`, `unmatched_size: u64`, `escrow_clamped_size: u64`, `rested_size: u64`, `rested_order_id: Option<u64>`, `stopped_on_max_fills_while_crossing: bool`, `taker_fee_amount: u64` |
 | `MakerFeeSettled` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `maker: address`, `amount: u64` |
 | `ProceedsClaimed` | `book_id: ID`, `enclosing_object_id: ID`, `claimant: address`, `base_amount: u64`, `quote_amount: u64` |
 | `OrderOwnerUpdated` | `book_id: ID`, `enclosing_object_id: ID`, `order_id: u64`, `old_owner: address`, `new_owner: address` |
@@ -1135,6 +1135,17 @@ sold. For `entry_point` 2 (`place_market_order_bid`) specifically,
 `unmatched_size` is the NET shortfall against the caller's own NET
 `max_base_out` request, so for that entry point too `requested_size -
 unmatched_size` equals the base actually delivered to the taker.
+`escrow_clamped_size` is how much of `unmatched_size` was clamped away
+specifically because the leftover escrow couldn't back it at the resting
+price — always `0` for every entry point except `place_limit_order_bid`
+(the only one with an escrow-backing clamp; `place_limit_order_ask`'s
+escrow is Base, 1:1 with size, needing no clamp, and market orders never
+rest at all). It is computed as `remaining_size - actual_resting_size`
+regardless of whether `stopped_on_max_fills_while_crossing` also applies —
+the two mechanisms are independent and can co-occur; when
+`stopped_on_max_fills_while_crossing` is `true`, nothing rests regardless of
+what this field says, so check that flag first when reconciling
+`unmatched_size`, `escrow_clamped_size`, and `rested_size`.
 `rested_size` is `0` if nothing rests;
 on the bid limit path it can be less than `unmatched_size` even when
 something rests, because `place_limit_order_bid` clamps the resting size to
