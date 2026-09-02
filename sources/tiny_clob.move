@@ -2256,20 +2256,29 @@ public fun destroy_orphaned_ticket<Base, Quote>(
 /// does) therefore has no answer once the book is genuinely gone — this
 /// function exists specifically to dispose of a ticket in that situation.
 ///
-/// It is safe to call even while the referenced book is still alive,
-/// including when its order might still hold real escrow or pooled
-/// proceeds: a ticket has never been the *only* path back to either.
+/// Calling it while the referenced book is still alive is safe for the
+/// order's escrow, but not unconditionally safe for its pooled proceeds.
+/// A ticket has never been the *only* path back to escrow:
 /// `clob_admin_cancel_order` force-cancels a still-resting order using
 /// just `(side, price, order_id)` — all public via `OrderPlaced` — with no
-/// ticket needed, and `push_proceeds`/`clob_admin_drain_step` reach pooled
-/// proceeds by `order_id` alone. Calling this function only ever gives up
-/// the ticket holder's own convenient self-service path
-/// (`cancel_order`/`claim_proceeds`/`destroy_orphaned_ticket`); it never
-/// strands anything the book's admin-gated recovery paths can't still
-/// reach. And if the book has already been finalized, `clob_admin_finalize`'s
-/// own precondition (zero resting orders, zero pooled proceeds, zero fee
-/// balances) guarantees nothing of value was ever left attached to any
-/// ticket for it in the first place.
+/// ticket needed, live book or not. Pooled proceeds are different:
+/// `push_proceeds` and `clob_admin_drain_step` both require
+/// `book.retiring`, so on a still-live (non-retiring) book neither can
+/// reach an order's pooled proceeds by `order_id` alone. Destroying a
+/// ticket for an order with real pooled proceeds still attached, while the
+/// book is still live, strands those proceeds until the admin retires the
+/// book — a one-way, book-destroying step, not a quick fix. Calling this
+/// function only ever gives up the ticket holder's own convenient
+/// self-service path (`cancel_order`/`claim_proceeds`/
+/// `destroy_orphaned_ticket`); it never strands anything the book's
+/// admin-gated recovery paths can *currently* reach — but for pooled
+/// proceeds on a live book, that admin-gated path (`push_proceeds`) isn't
+/// reachable yet. And if the book has already been finalized, `clob_admin_finalize`'s
+/// own precondition (zero resting orders, zero pooled proceeds) guarantees
+/// nothing of value was ever left attached to any ticket for it in the
+/// first place -- fee-accumulator funds are unrelated to any individual
+/// ticket/order in any case, so `clob_admin_finalize`'s automatic sweep of
+/// whatever remains there doesn't change that conclusion.
 public fun destroy_ticket_unconditionally(ticket: OrderTicket) {
     destroy_orphaned_ticket_unchecked(ticket);
 }

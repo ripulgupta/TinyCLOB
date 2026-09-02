@@ -80,7 +80,7 @@ Quote value of the smallest permitted fill) stays well above 1 atom of the
 escrowed currency. A leg worth exactly 1 atom is the one case where a
 nonzero fee rate necessarily either consumes the entire leg or collects no
 fee at all — this is an accepted, unavoidable tradeoff of integer fee math,
-not a bug (see §11, Fees). This guidance only bounds *initial placement*
+not a bug (see §9, Fees). This guidance only bounds *initial placement*
 size, however — it does nothing to bound a post-fill dust remainder, which
 can still end up arbitrarily small regardless of `min_size`, per the
 dust-remainder behavior described above.
@@ -100,6 +100,7 @@ See §3 (price representation).
 | no valid `price_scale` exists for the declared inputs (§3) | `EPriceRangeInfeasible` (20) |
 | `initial_last_price == 0` | `EZeroPrice` (14) |
 | `initial_last_price` outside the book's declared representable range (§3) | `EPriceBelowDeclaredMin` (21) / `EPriceAboveDeclaredMax` (22) |
+| `enclosing_object_id` refers to the book's own `UID` (structurally unreachable — defensive-only, see the `EEnclosingIsSelf` constant doc comment) | `EEnclosingIsSelf` (32) |
 
 ## 3. Price representation and validation
 
@@ -200,9 +201,10 @@ book already has — there is no no-op skip on this event.
 
 ## 5. `last_price`
 
-`last_price` is a per-book reference point with no public getter of its own
-(other than a test-only accessor); it is observable only through its effect
-on `price_band_factor` (§4). It is seeded to `initial_last_price` at
+`last_price` is a per-book reference point, readable directly via the
+public getter `last_price<Base, Quote>(book): u64` (§12); it is also
+observable indirectly through its effect on `price_band_factor` (§4). It is
+seeded to `initial_last_price` at
 construction and can subsequently change in two ways:
 
 **Automatically, on a real fill.** Whenever a match against a resting order
@@ -440,13 +442,13 @@ declared-range or price-band checks.
 - `max_base_in` caps how much Base this call sells: `size =
   min(payment.value(), max_base_in)`. `0` is a real, literal zero cap — the
   call immediately no-ops with nothing matched and `payment` returned
-  untouched (this size-zero case deliberately skips the `min_size` check
-  below, since it isn't placing any order at all). `u64::MAX` means
-  unbounded (`size` is then simply `payment.value()`). Any of `payment`
-  beyond the resulting `size` is returned unspent.
-- When the resulting `size` is nonzero, it must satisfy `size >= min_size`
-  (aborts with `ESizeBelowMinSize` (12) otherwise) — this check does not
-  apply to the `size == 0` no-op case above.
+  untouched. `u64::MAX` means unbounded (`size` is then simply
+  `payment.value()`). Any of `payment` beyond the resulting `size` is
+  returned unspent. Like `place_market_order_bid`, there is deliberately no
+  `min_size` check against the resulting `size` here (`ESizeBelowMinSize`
+  is never raised by this function): a market order never rests, so it can
+  never leave a sub-`min_size` dust order on the book — the check only
+  matters for an order that might rest.
 - `min_quote_out` is the slippage floor: aborts with `ESlippageExceeded`
   (17) if the quote actually received is below it. `0` means "not
   applicable".
@@ -470,15 +472,18 @@ a redesign, not a positional drop-in.
 | `place_market_order_bid` | none | — | — | No |
 | `place_market_order_ask` | none | — | — | No |
 
-Both of `place_market_order_bid`/`place_market_order_ask` return three
-values: a matched-side coin, a single merged leftover coin, and the
-`stopped_on_max_fills_while_crossing` flag — but the order differs by side.
-`place_market_order_bid` returns `(Coin<Base>, Coin<Quote>, bool)`: matched
-base first, merged leftover quote second. `place_market_order_ask` returns
-`(Coin<Base>, Coin<Quote>, bool)` too, but the first position is the
-leftover (unmatched) base returned to the caller and the second is the
-matched quote received — see each function's own signature for which is
-which. On the bid side, whatever internally-escrowed Quote goes unspent by
+Both of `place_market_order_bid`/`place_market_order_ask` return the same
+tuple shape, `(Coin<Base>, Coin<Quote>, bool)` — a `Coin<Base>`, a
+`Coin<Quote>`, and the `stopped_on_max_fills_while_crossing` flag, in that
+position order for both functions. What differs by side is not the tuple
+shape but which currency plays the "matched" role and which plays the
+"leftover" role: `place_market_order_bid` returns matched Base first and
+merged leftover Quote second, while `place_market_order_ask` returns merged
+leftover Base first and matched Quote second — distinguished by which coin
+is which currency, not by position, since both functions place `Coin<Base>`
+first and `Coin<Quote>` second regardless of which one is "matched". See
+each function's own signature for which is which. On the bid side, whatever
+internally-escrowed Quote goes unspent by
 matching, together with the portion of `payment` never escrowed for
 matching in the first place (e.g. capped out by `max_quote_in` on
 `place_market_order_bid`), are joined into that one leftover `Coin<Quote>`
@@ -525,17 +530,20 @@ quote_amount }` only if nonzero pooled proceeds were paid out alongside.
 ```
 public fun update_resting_order<Base, Quote>(
     book: &mut OrderBook<Base, Quote>,
-    ticket: &OrderTicket,
+    ticket: &mut OrderTicket,
     new_owner: address,
 ): bool
 ```
 
 Reassigns the resting order's payout destination to `new_owner`. Takes
-`ticket` by reference, so the caller retains it. Returns `true` if the order
-was found *still resting* and updated, `false` if not (a no-op on the
-resting-order half; not an abort). Authority follows ticket possession,
+`ticket` by mutable reference, so the caller retains it. Returns `true` if
+the order was found *still resting* and updated, `false` if not (a no-op on
+the resting-order half; not an abort). Authority follows ticket possession,
 exactly like `cancel_order`. Aborts with `EWrongBook` if `ticket` was not
-minted by `book`.
+minted by `book`, or with `EInvalidOwner` (33) if `new_owner == @0x0` —
+both `resting_order_owner`-style escrow refunds and pooled-proceeds sweeps
+route through this recorded address, so a zero address would otherwise
+silently burn funds.
 
 Independently of that `bool`, this ALWAYS immediately syncs the payout
 address of the order's currently-pooled unclaimed proceeds (if any) to
@@ -545,11 +553,12 @@ still resting: even if the order has already concluded by the time this is
 called (fully filled and drained, `cancel_order`ed, force-cancelled via
 `clob_admin_cancel_order`, or removed by `clob_admin_drain_step`), any
 pooled, unclaimed proceeds entry for its order id is still resynced to
-`new_owner`. The pooled amount is then payable either via
-`push_proceeds`/`drain_proceeds` (paying whichever owner was last synced,
-by either this function or the original placement) or via `claim_proceeds`
+`new_owner`. The pooled amount is then payable either via `claim_proceeds`
 through the order's own `OrderTicket` (paying the ticket holder/caller
-regardless of the recorded owner — see `claim_proceeds` above), whichever
+regardless of the recorded owner — see `claim_proceeds` above), or, once
+the book is retiring, via `push_proceeds` or the internal `drain_proceeds`
+reached through `clob_admin_drain_step` (paying whichever owner was last
+synced, by either this function or the original placement) — whichever
 happens first.
 
 Emits `OrderOwnerUpdated { book_id, enclosing_object_id, order_id, old_owner, new_owner }`
@@ -604,16 +613,21 @@ at all — the only ticket-disposal function that doesn't take one. Always
 succeeds. This is the only disposal path available once the ticket's book
 has already been deleted via `clob_admin_finalize`, since nothing can ever
 prove a deleted book's non-existence to `destroy_orphaned_ticket`'s
-liveness check again. It is equally safe to call while the book is still
-alive, even if the ticket's order still has real escrow or pooled
-proceeds attached: neither is exclusively reachable through the ticket —
-`clob_admin_cancel_order` reaches a still-resting order's escrow by
-`(side, price, order_id)` alone, and `push_proceeds`/`clob_admin_drain_step`
-reach pooled proceeds by `order_id` alone, neither requiring a ticket.
-Calling this only ever gives up the ticket holder's own convenient
-self-service disposal path, never the underlying funds.
+liveness check again. On a still-live book, its safety is qualified by
+which recovery path the ticket's order still needs: escrow on a
+still-resting order is fine, since `clob_admin_cancel_order` reaches it by
+`(side, price, order_id)` alone, no ticket required. Pooled proceeds are a
+different story — `push_proceeds` and `clob_admin_drain_step` both require
+`book.retiring`, so on a live (non-retiring) book neither can reach an
+order's pooled proceeds by `order_id` alone the way `clob_admin_cancel_order`
+reaches escrow. Discarding a ticket for an order with real pooled proceeds
+still attached, while the book is still live, strands those proceeds until
+the admin retires the book — a one-way, book-destroying step, not a quick
+fix. Calling this on an order with no pooled proceeds attached (or once the
+book is already retiring) only ever gives up the ticket holder's own
+convenient self-service disposal path, never the underlying funds.
 
-## 8. Proceeds — admin rescue path
+## 8. Proceeds — admin retirement payout path
 
 ```
 public fun push_proceeds<Base, Quote>(
@@ -629,6 +643,14 @@ caller-supplied — always the `owner` address currently recorded for that
 order id, so even the admin cannot redirect funds elsewhere. A no-op (no
 event, no transfer) if there is nothing to pay out. Emits `ProceedsClaimed
 { book_id, enclosing_object_id, claimant: owner, base_amount, quote_amount }` when nonzero.
+
+Aborts with `ENotRetiring` (6) unless the book is retiring. This is **not**
+a general live-book rescue path — it is only usable as part of the
+retirement/drain sequence, same as the private `drain_proceeds` helper
+`clob_admin_drain_step` uses internally. On a live (non-retiring) book, a
+maker can only reach their own pooled proceeds through `claim_proceeds`.
+An integrator that needs to confirm ahead of time where this payout will
+go can check `proceeds_owner`/`proceeds_owner_by_ticket` (§12).
 
 ## 9. Admin controls
 
@@ -676,14 +698,18 @@ order-placement/market entry points computes its own taker fee exactly
 once, after its entire matching sweep completes (across every price level it
 touched), from the aggregate raw (pre-fee) quantity the taker filled that
 call — never per individual fill. This aggregate fee is deducted from the
-taker's matched proceeds *before* any slippage checks (`max_quote_in`/
-`min_base_out` on the bid side, `max_base_in`/`min_quote_out` on the ask
-side) and before the coin(s) returned to the taker, and is reported via
-`OrderExecuted.taker_fee_amount` (§13). Because ceiling division is
+taker's matched proceeds *before* the post-match slippage floor is checked
+(`min_base_out` on the bid side, `min_quote_out` on the ask side) and before
+the coin(s) returned to the taker, and is reported via
+`OrderExecuted.taker_fee_amount` (§13). (`max_quote_in`/`max_base_in` are a
+different mechanism — an up-front spend/escrow clamp applied *before*
+matching even starts, via `std::u64::min(payment.value(), cap)`, not a
+post-match assert — so the fee deduction does not interact with them the
+way it does with the slippage floors.) Because ceiling division is
 superadditive, this once-per-call aggregate is always less than or equal to
 what summing each individual fill's own independently-ceiling-rounded fee
-would have charged — it can never make a slippage check that would have
-passed under the old per-fill model fail, only the reverse.
+would have charged — it can never make a slippage-floor check that would
+have passed under the old per-fill model fail, only the reverse.
 
 **Maker fee — set aside per-fill, collected once at conclusion.** Each fill
 still computes its own ceiling-rounded maker fee and immediately splits it
@@ -743,7 +769,9 @@ which trues up its maker-fee reserve and folds any superadditive slack into
 the escrow refunded here. Does not touch or pay out that order's
 already-pooled proceeds (if any) — those remain claimable separately via
 the order's `OrderTicket`, if the caller who placed it still holds one, or
-payable via `push_proceeds`.
+payable via `push_proceeds` once the book is retiring (`push_proceeds`
+requires `book.retiring`; on a still-live book, pooled proceeds stay
+pooled until then).
 
 ### Price band and last-price reset
 
@@ -800,28 +828,39 @@ afterward, since a later drain step can re-credit the accumulator with a
 nonzero amount. See below for the recommended ordering.
 
 ```
-public fun clob_admin_finalize<Base, Quote>(cap: ClobAdminCap, book: OrderBook<Base, Quote>): ID
+public fun clob_admin_finalize<Base, Quote>(
+    cap: ClobAdminCap,
+    book: OrderBook<Base, Quote>,
+    ctx: &mut TxContext,
+): (ID, Coin<Base>, Coin<Quote>)
 ```
 
 Consumes the `ClobAdminCap` and the `OrderBook` by value, permanently
 deleting both. Aborts with `ENotRetiring` unless the book is retiring, and
-with `ENotFullyDrained` (7) unless the book has zero resting bids, zero
-resting asks, zero pooled proceeds entries, and a zero fee-accumulator
-balance on both legs — i.e. `clob_admin_drain_step` and
-`clob_admin_claim_fees` must have fully emptied the book first. Emits
-`OrderBookDeleted { book_id, enclosing_object_id, base: TypeName, quote: TypeName }` (using
-the book's `Base`/`Quote` type names) and `ClobAdminCapDiscarded { book_id,
-enclosing_object_id, cap_id }`. Returns the book's true, unforgeable object
-id — the same value both events' `book_id` field carries.
+with `ENotFullyDrained` (7) unless `bids.size() == 0 && asks.size() == 0 &&
+proceeds.is_empty()` — i.e. `clob_admin_drain_step` must have fully drained
+every resting order and pooled-proceeds entry first. The fee accumulator is
+**not** part of this precondition: whatever remains in it at call time
+(from either leg) is swept automatically and returned to the caller as the
+second and third elements of the return tuple (`Coin<Base>`, `Coin<Quote>`,
+either possibly zero-valued) — it does not need to be pre-emptied by
+`clob_admin_claim_fees` first. Emits `OrderBookDeleted { book_id,
+enclosing_object_id, base: TypeName, quote: TypeName }` (using the book's
+`Base`/`Quote` type names) and `ClobAdminCapDiscarded { book_id,
+enclosing_object_id, cap_id }` unconditionally, plus `FeesClaimed { book_id,
+enclosing_object_id, claimant, base_amount, quote_amount }` whenever the
+swept fee amount is nonzero on either leg. Returns the book's true,
+unforgeable object id as the first tuple element — the same value both of
+the unconditional events' `book_id` field carries.
 
 **Recommended ordering.** To guarantee this function succeeds on the first
 attempt: `clob_admin_retire` -> all `clob_admin_drain_step` calls (drain
-every resting order and pooled-proceeds entry) -> `clob_admin_claim_fees`
-LAST -> `clob_admin_finalize`. Claiming fees earlier in the sequence is not
-wrong, but if a later `clob_admin_drain_step` re-credits the accumulator
-(per the note above) after an earlier claim already emptied it, this
-function aborts with `ENotFullyDrained` — not a silent failure — until
-`clob_admin_claim_fees` is called again.
+every resting order and pooled-proceeds entry) -> `clob_admin_finalize`.
+Calling `clob_admin_claim_fees` at any point before, during, or after that
+sequence — or not at all — is purely optional cashflow timing, never a
+correctness requirement: `clob_admin_finalize` sweeps whatever fee balance
+remains and returns it as coins rather than requiring it to already be
+zero.
 
 ## 11. Version guard
 
@@ -871,6 +910,10 @@ unchanged, with no explicit migration step required.
 | `resting_order_escrow<Base, Quote>(book, side, price, order_id): Option<RestingOrderEscrow>` | the live state of one resting order, or `None` if that price level doesn't exist or holds no such order (fully filled, cancelled, or never placed). Never aborts, for any input. |
 | `resting_order_escrow_by_ticket<Base, Quote>(book, ticket): Option<RestingOrderEscrow>` | `resting_order_escrow` for the order `ticket` was minted for. Aborts with `EWrongBook` (16) if `ticket` was not minted by `book`. |
 | `resting_order_escrow_fields(e: &RestingOrderEscrow): (u64, u64)` | `(escrow, remaining_size)` — `escrow` is Quote for a bid, Base for an ask (the currency that side actually escrows). `remaining_size` is ALSO denominated in Quote for a bid, Base for an ask — NOT always Base regardless of side. For a bid, `escrow` and `remaining_size` are therefore always equal (both are just the live Quote escrow value); for an ask they were already equal. `escrow` is the order's remaining escrowed *principal* only — `cancel_order` may additionally pay out pooled proceeds in the opposite currency, which this value does not include. For an ask, `escrow`/`remaining_size` can never reach `0` while still resting (draining to `0` is the same fill that stops it from resting). For a bid, under the telescoping proportional-ceiling escrow-charging scheme, `(escrow: 0, remaining_size: 0)` for a live, still-resting, still-fillable order IS a real, reachable state whenever the order's resting price is below `price_scale` — the Quote escrow can hit exactly `0` strictly before the order's Base side is exhausted. `None` (not resting at all) remains the only other state for either side. |
+| `resting_order_owner<Base, Quote>(book, side: bool, price: u64, order_id: u64): Option<address>` | the recorded `owner` address of the resting order at `(side, price, order_id)` — i.e. the address `clob_admin_cancel_order`/`clob_admin_drain_step` will pay if it is force-cancelled/drained. `None` if the order is not resting. Lets an integrator confirm ahead of time where an admin bulk-payout path will route before relying on it. |
+| `resting_order_owner_by_ticket<Base, Quote>(book, ticket: &OrderTicket): Option<address>` | `resting_order_owner` for the order `ticket` was minted for. Aborts with `EWrongBook` if `ticket` was not minted by `book`. |
+| `proceeds_owner<Base, Quote>(book, order_id: u64): Option<address>` | the recorded `owner` address of the pooled proceeds entry for `order_id`, if one exists — i.e. the address `push_proceeds`/the internal `drain_proceeds` (reached via `clob_admin_drain_step`) will pay out to. `None` if no pooled entry exists. Lets an integrator confirm ahead of time where `push_proceeds`/`drain_side`/`drain_proceeds` will route before relying on that admin path to pay the right address. |
+| `proceeds_owner_by_ticket<Base, Quote>(book, ticket: &OrderTicket): Option<address>` | `proceeds_owner` for the order `ticket` was minted for. Aborts with `EWrongBook` if `ticket` was not minted by `book`. |
 
 ## 13. Events reference
 
@@ -1046,6 +1089,8 @@ maker fee is actually paid in).
 | 29 | `EPriceOverflow` |
 | 30 | `EMinExceedsMaxBaseOut` |
 | 31 | `EOrderStillResting` |
+| 32 | `EEnclosingIsSelf` |
+| 33 | `EInvalidOwner` |
 
 (Codes 2, 10, 11, 13 are not currently in use.)
 
@@ -1132,8 +1177,12 @@ maker fee is actually paid in).
   any pooled proceeds as part of the same call — to the caller
   (`ctx.sender()`), same as `claim_proceeds`, not the recorded `owner` —
   while `clob_admin_cancel_order` deliberately does not — it refunds only the
-  escrow principal, leaving pooled proceeds recoverable afterward only via
-  `push_proceeds`/`drain_proceeds`/`claim_proceeds`.
+  escrow principal, leaving pooled proceeds recoverable afterward via
+  `claim_proceeds` (through the order's `OrderTicket`, on a live book) or,
+  once the book is retiring, via `push_proceeds` or the internal
+  `drain_proceeds` reached through `clob_admin_drain_step`. `push_proceeds`
+  is not a live-book path — it aborts with `ENotRetiring` unless
+  `book.retiring`.
 - `push_proceeds`'s payout destination is always the recorded `owner` for
   that order id, never caller-suppliable, even by the admin.
 - `destroy_orphaned_ticket` refuses to discard a ticket that still has
@@ -1142,17 +1191,19 @@ maker fee is actually paid in).
   `destroy_ticket_unconditionally` has no such restriction and takes no
   `OrderBook` parameter — it is the only disposal path left once a
   ticket's book has already been deleted.
-- `clob_admin_finalize` requires zero resting orders on both sides, zero
-  pooled proceeds entries, and a zero fee-accumulator balance on both legs
-  simultaneously before it will succeed.
+- `clob_admin_finalize` requires zero resting orders on both sides and zero
+  pooled proceeds entries before it will succeed — the fee-accumulator
+  balance is not part of this precondition. Whatever remains in it (on
+  either leg) is swept automatically and returned to the caller as coins.
 - Fee rate changes apply to fills from that point forward only; an
   already-resting order keeps the maker-fee rate that was in effect when it
   was placed.
 - Every fee computation rounds up: any nonzero receive amount at a nonzero
   fee rate always pays at least 1 atomic unit of fee.
-- Calling `clob_admin_claim_fees` before all `clob_admin_drain_step` calls
-  finish is not wrong, but a later drain step can re-credit the fee
-  accumulator (force-cancelling a partially-filled resting order settles
-  its maker-fee reserve the same as any other order conclusion), so the
-  claim may need to be repeated afterward; the safe ordering is retire ->
-  drain everything -> claim fees last -> finalize.
+- Calling `clob_admin_claim_fees` before, during, or after
+  `clob_admin_drain_step`/`clob_admin_finalize` — or not at all — is purely
+  optional cashflow timing, never a correctness requirement: a later drain
+  step can re-credit the fee accumulator (force-cancelling a
+  partially-filled resting order settles its maker-fee reserve the same as
+  any other order conclusion), but `clob_admin_finalize` simply sweeps
+  whatever is left rather than requiring it to already be zero.
