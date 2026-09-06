@@ -1,0 +1,4 @@
+build/
+traces/
+.coverage_map.mvcov
+.claude/
