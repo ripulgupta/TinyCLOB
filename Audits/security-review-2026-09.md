@@ -1,6 +1,6 @@
 # TinyCLOB — Security Review
 
-Went through the full codebase: `tiny_clob.move` (4,600+ lines), `order.move`, `price_tree.move`, and all 19 test files. Focused on fund-extraction paths from an unprivileged attacker.
+Went through the full codebase: `tiny_clob.move` (3,451 lines), `order.move`, `price_tree.move`, and all 19 test files. Focused on fund-extraction paths from an unprivileged attacker.
 
 No critical or high-severity issues found. The code is unusually well-defended — rounding direction choices, fee-settlement logic, and the escrow model all hold up under adversarial analysis. Details below.
 
@@ -8,7 +8,7 @@ No critical or high-severity issues found. The code is unusually well-defended �
 
 ## What I checked
 
-Traced every path where money enters or leaves the protocol. 14 exit points total — 8 return to the caller, 4 transfer to the stored owner, 2 return to admin (ClobAdminCap required). Every balance movement uses `split`/`join` only — no minting, no raw arithmetic on amounts.
+Traced every path where money enters or leaves the protocol. 10 exit functions total — 4 return matched/change coins to the caller (limit/market bid/ask), 2 return escrow/proceeds via OrderTicket (cancel, claim), 1 returns accumulated fees to admin (claim_fees), 1 transfers escrow to the recorded owner on admin rescue (redeem_ticket), and 1 loops through all resting orders and pooled proceeds returning each to its recorded owner during book retirement (drain_step — unbounded, controlled by a caller-supplied max_items parameter). Every balance movement uses `split`/`join` only — no minting, no raw arithmetic on amounts.
 
 Attack angles tested:
 
@@ -19,7 +19,7 @@ Attack angles tested:
 | Fee rounding creates extractable surplus | Theoretically yes (ceil superadditivity), economically no — max fee is 10 bps, surplus per fill is < 1 atom, gas cost exceeds any possible extraction |
 | Self-cross to generate money | No — just swaps base↔quote and pays fees |
 | set_last_price manipulation for fund theft | No — bounded by best_bid/best_ask when orders exist, griefing only (already documented in your comments) |
-| Admin drain_step steals user funds | No — escrow goes to order.owner(), admin only gets fee_accumulator |
+| Admin drain_step steals user funds | No — escrow goes to order.owner(), proceeds go to recorded proceeds_owner, admin only gets fee_accumulator via separate claim_fees |
 | Destroy orphaned ticket for double claim | No — aborts if proceeds exist or order still resting |
 | Market order at any price | By design — budget constraint and min_base_out/min_quote_out prevent overspending |
 | Race condition between update_resting_order and fill | No — Sui's &mut borrow rules prevent same-PTB overlap |
